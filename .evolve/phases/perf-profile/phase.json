@@ -1,0 +1,41 @@
+{
+  "name": "perf-profile",
+  "catalog": "on-demand",
+  "archetype": "evaluate",
+  "agent": "evolve-perf-profile",
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/build-report.md"
+    ],
+    "signals": [
+      "build.diff_loc",
+      "build.files_touched"
+    ]
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/perf-profile-report.md"
+    ],
+    "signals": [
+      "perf.regression_pct",
+      "perf.hotpath_touched"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Benchmarks",
+      "Findings",
+      "Verdict"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "build.diff_loc",
+        "op": "gte",
+        "value": 200
+      }
+    ]
+  },
+  "after": "build"
+}

@@ -1,0 +1,203 @@
+{
+  "schema_version": 1,
+  "cli": "codex-tmux",
+  "binary": "codex",
+  "probe_unsandboxed_reason": "A version or doctor probe of codex reads its sign-in and writes its state under CODEX_HOME (~/.codex by default). The phase sandbox grants no write outside the cell, so the probe runs outside it.",
+  "install_roots": ["/opt/homebrew/Caskroom/codex"],
+  "env_passthrough": ["CODEX_HOME", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "no_proxy", "all_proxy", "SSL_CERT_FILE"],
+  "model_family": "gpt",
+  "parsers": {"pane": "codex-repl-v1"},
+  "capabilities": ["tools", "edit"],
+  "home_reads": ["~/.codex"],
+  "context_window": 200000,
+  "binary_min_version": "0.13.0",
+  "transport": "tmux",
+  "default_tier": "hybrid",
+  "tier_dependencies": {
+    "full": [
+      "codex",
+      "tmux"
+    ],
+    "hybrid": [
+      "codex",
+      "tmux"
+    ],
+    "degraded": [
+      "codex"
+    ]
+  },
+  "prompt_marker": "›",
+  "transient_regex": "(?i)(stream error|server_error|\\b5\\d{2}\\b\\s*(bad gateway|service unavailable|internal server error)|the server had an error)",
+  "default_model": "",
+  "default_args": [
+    "--yolo",
+    "-c",
+    "check_for_update_on_startup=false"
+  ],
+  "params": {
+    "model_tier": {
+      "channel": "flag",
+      "flag": "-m",
+      "from": "model_tier_map"
+    },
+    "effort": {
+      "note": "Each tier emits TWO -c overrides. Codex's plan mode does not inherit model_reasoning_effort: its config reference calls plan_mode_reasoning_effort a plan-mode-specific override and says an unset value falls back to codex's OWN built-in preset, not to the general key. Observed live on 0.147.0 launched as the loop launches it: the status bar read 'gpt-5.6-sol xhigh' before /plan and 'gpt-5.6-sol medium' after; adding the override held xhigh. There is no plan-mode MODEL key - 'model' applies across modes, so -m needs no counterpart. The two keys must move together (codex_plan_effort_test.go). Safe on codex builds predating the key: unknown -c keys are tolerated by default - --strict-config exists precisely to opt INTO erroring on unrecognised fields, and the loop never passes it (verified: 'codex doctor -c definitely_bogus_key_xyz=1' exits 0).",
+      "channel": "flag",
+      "values": {
+        "low": [
+          "-c",
+          "model_reasoning_effort=low",
+          "-c",
+          "plan_mode_reasoning_effort=low"
+        ],
+        "medium": [
+          "-c",
+          "model_reasoning_effort=medium",
+          "-c",
+          "plan_mode_reasoning_effort=medium"
+        ],
+        "high": [
+          "-c",
+          "model_reasoning_effort=high",
+          "-c",
+          "plan_mode_reasoning_effort=high"
+        ],
+        "xhigh": [
+          "-c",
+          "model_reasoning_effort=xhigh",
+          "-c",
+          "plan_mode_reasoning_effort=xhigh"
+        ],
+        "max": [
+          "-c",
+          "model_reasoning_effort=max",
+          "-c",
+          "plan_mode_reasoning_effort=max"
+        ],
+        "ultra": [
+          "-c",
+          "model_reasoning_effort=ultra",
+          "-c",
+          "plan_mode_reasoning_effort=ultra"
+        ]
+      }
+    },
+    "permission": {
+      "channel": "controller"
+    },
+    "settings_scope": {
+      "channel": "noop"
+    },
+    "session_mode": {
+      "channel": "controller"
+    }
+  },
+  "controls": {
+    "usage": {
+      "send": "/status",
+      "await": "prompt_marker",
+      "exhausted_regex": "(?i)(usage limit reached|hit your (usage|weekly) limit|\\b0%\\s*left|out of (usage|credits))",
+      "drift_probe_regex": "(?i)(limit reached|usage limit|weekly limit|(?:reached|hit) your|\\b0%\\s*(left|remaining)|out of (usage|credits|tokens)|rate.?limit|too many requests|quota (exceeded|reached)|upgrade to (a paid plan|continue))"
+    },
+    "status": {
+      "send": "/status",
+      "await": "prompt_marker"
+    },
+    "clean_ctx": {
+      "send": "/clear"
+    },
+    "compact": {
+      "send": "/compact"
+    },
+    "model": {
+      "send": "/model"
+    },
+    "exit": {
+      "send": "/quit"
+    }
+  },
+  "interactive_prompts": [
+    {
+      "name": "update_menu_cursor_off_skip",
+      "regex": "(?sm)^[ \\t]*› (?:1\\. Update now|3\\. Skip until next version).{0,200}^[ \\t]*Press enter to continue\\s*\\z",
+      "response_keys": "Down",
+      "tail_lines": 8,
+      "policy": "auto_respond",
+      "note": "codex's startup update menu ('Update available!'; options 1. Update now (runs brew upgrade), 2. Skip, 3. Skip until next version; footer 'Press enter to continue'), cursor on any option but Skip. The launch's default_args carry -c check_for_update_on_startup=false, so codex does not show this menu; this rule and update_menu_cursor_on_skip are the defence when it shows anyway. NAVIGATION ONLY: one Down per tick, never Enter, so a lost keystroke costs a repeat instead of a brew upgrade that exits codex to the shell. The live menu's Down wraps (1 -> 2 -> 3 -> 1, verified on 0.153.4 on 2026-10-05), so a cursor on option 3 reaches Skip in two Downs. Repeats while the cursor is seen off Skip; the loop guard bounds it, and a boot wait that trips the guard ends at once as a boot timeout (ExitREPLBootTimeout, a bench strike) rather than sending Enter. BOTTOM-ANCHORED (footer + \\z + tail_lines 8 + distance bound): an answered menu stays in the scrollback above the composer, and the old bespoke check that matched it there typed its key into the composer on every boot pass. PERMISSIVE ON PURPOSE: any frame with a cursor on Update now or on option 3, a torn redraw that shows two cursors included, gets a Down and never an Enter. MUST PRECEDE update_menu_cursor_on_skip: the two are disjoint on every frame the menu renders, and first-match order resolves text no build renders to navigation. Replaces the bespoke boot path that sent the hotkey 2 with Enter on any pane quoting the menu. Source: docs/incidents/2026-10-05-codex-update-menu.md"
+    },
+    {
+      "name": "update_menu_cursor_on_skip",
+      "regex": "(?m)^[ \\t]*1\\. Update now[^\\n]*\\n[ \\t]*› 2\\. Skip[ \\t]*\\n[ \\t]*3\\. Skip until next version[ \\t]*\\n(?:[ \\t]*\\n)*[ \\t]*Press enter to continue\\s*\\z",
+      "response_keys": "Enter",
+      "tail_lines": 8,
+      "policy": "auto_respond",
+      "note": "codex's startup update menu with the cursor verifiably on '› 2. Skip' (after update_menu_cursor_off_skip's Down landed). The only rule that confirms this menu, so Enter is sent only on a capture that shows the cursor on Skip; an Enter can therefore never confirm Update now, and repeating it on a lost Enter is safe (the loop guard bounds it). Live on 0.153.4 the composer is drawn below the menu within a second of the Enter. STRICT ON PURPOSE: it requires the cursorless '1. Update now' line directly above '› 2. Skip' and a cursorless '3. Skip until next version' directly below, so a torn redraw with two cursors is left to the navigation rule's Down. BOTTOM-ANCHORED like its sibling. Source: docs/incidents/2026-10-05-codex-update-menu.md"
+    },
+    {
+      "name": "trust_prompt",
+      "regex": "Do you trust the contents of this directory|Trust this directory|Working with untrusted contents|This folder has not been trusted|Yes, continue",
+      "response_keys": "1,Enter",
+      "policy": "auto_respond",
+      "once": true,
+      "note": "codex 0.134+ asks to trust dir on first launch; '1' = yes/trust. Regex broadened per cycle-121 research dossier (codex-cli-0.134-repl-boot-timeout-2026-05-28.md) to also catch the 'Working with untrusted contents' / 'Yes, continue' phrasings emitted on worktree paths not pre-trusted in ~/.codex/config.toml. `once`: a one-time boot dialog — after a single auto-response it must not re-fire, since its dismissed text lingers in the bootScrollback=200 capture during the artifact-wait loop and would otherwise re-match every poll and trip the loop guard (the codex-tmux abandon observed 2026-06-03)."
+    },
+    {
+      "name": "per_edit_approval",
+      "regex": "Would you like to make the following edits|Press enter to confirm or esc to cancel|Yes, proceed",
+      "response_keys": "1,Enter",
+      "policy": "auto_respond",
+      "note": "Cycle-124 G1b (defense-in-depth for G1a's `--yolo`): codex per-edit-approval modal that hung cycle-123 tdd. The modal lists 3 numbered options ('1. Yes, proceed' / '2. Yes, and don't ask again' / '3. No, and tell Codex what to do differently'); response_keys '1,Enter' selects 'Yes, proceed' explicitly (the default highlight is option 1 so a bare 'Enter' would also work, but the explicit '1' is robust to future UX shifts in default selection). With G1a's `--yolo` in default_args, this modal should not fire — it's the regex backstop for the case where `--yolo` regresses (codex renames the flag, operator overrides default_args, OR the modal appears via a different code path codex's approval=never doesn't cover). Source: docs/incidents/cycle-123-codex-edit-approval-modal-and-empty-fallback-chain.md."
+    },
+    {
+      "name": "auth_recheck",
+      "regex": "Please log in|sign in to ChatGPT|Authentication required",
+      "response_keys": null,
+      "policy": "escalate",
+      "note": "Bridge cannot complete OAuth; escalate"
+    },
+    {
+      "name": "rate_limit",
+      "regex": "(usage|rate)[ -]limit (reached|exceeded|hit)|hit your (usage|rate) limit|too many requests|quota exceeded",
+      "response_keys": null,
+      "policy": "escalate"
+    },
+    {
+      "name": "model_unsupported",
+      "regex": "\"status\":4\\d\\d,\"error\":\\{\"type\":\"invalid_request_error\"|The '[^']+' model is not supported when using Codex",
+      "response_keys": null,
+      "tail_lines": 30,
+      "policy": "escalate",
+      "note": "Lane 1676 (2026-09-14): the ChatGPT account rejected the pinned deep-tier model (gpt-5.6-sol) with a 400 invalid_request_error; codex printed it and sat idle for the full 20-minute artifact window before the runner fell back to claude (exit 81). A dead model is a wall like a quota wall: escalate at once (exit 85) so the family fallback runs in seconds. tail_lines keeps the rule to the live screen; the busy gate keeps an agent quoting the JSON from firing it. Not a rate_limit pattern, so clihealth does not bench the family — the other tiers still work."
+    },
+    {
+      "name": "plan_question",
+      "regex": "(?s)Question \\d+/\\d+ \\(\\d+ unanswered\\).{0,900}enter to submit answer[^\\n]*\\s*\\z",
+      "response_keys": "Enter",
+      "tail_lines": 14,
+      "policy": "auto_respond",
+      "note": "Codex plan-mode clarifying-question picker (collaboration_modes is graduated-on in 0.147.0; entry is /plan or Shift+Tab, in-session). Enter submits the pre-selected '(Recommended)' option; a bare Enter is correct here because the right answer is the pre-selection, not a fixed index. BOTTOM-ANCHORED (\\z) for the same reasons as claude's plan_approval - critically including the answered-picker re-fire, which matters more on this CLI because codex-tmux captures bootScrollback=200 lines, the depth that produced the 2026-06-03 trust-dialog loop-guard abandon. The picker is multi-question, so the rule must stay multi-fire (NOT once:true) and answer each live question while never re-firing on a dismissed one. Span bound 900 (live: 464-494, sampled on a single 4-option form, so the bound carries slack for longer forms; 900 not 1200 because Go RE2 caps repeat counts at 1000 and an over-large bound makes the rule SILENTLY INERT - decideAutoRespond swallows the compile error); tail is the remainder of the footer line only (live: 47 chars, no newline). tail_lines 14 leaves three rows of slack over the largest fixture picker (11 rows: five options, wrapped question and options at a narrow pane); 9 left one row over an 8-row picker, so a five-option or wrapped picker moved the anchor out of the window and the rule went silently inert. Source: docs/incidents/2026-08-27-plan-mode-dialog-blind-spot.md."
+    },
+    {
+      "name": "update_menu_unparsed",
+      "regex": "(?m)^[ \\t]*(?:✨\\W{0,3})?Update available![^›]*(?:›[^›]*)?\\z",
+      "response_keys": null,
+      "tail_lines": 24,
+      "policy": "hold",
+      "note": "FAIL CLOSED on an update menu the two shaped rules above cannot parse (a reworded footer, an extra line, options that moved). The menu's cursor glyph › is also the codex-tmux prompt marker, so without this rule a boot would declare the REPL ready on the menu's own cursor and the prompt's submit Enter would confirm Update now. HOLD sends nothing and tells a boot wait not to judge readiness on this frame; it repeats until the loop guard ends the boot as ExitREPLBootTimeout (a bench strike) with a FAIL line naming this rule, and a busy pane skips it as it skips an escalate rule. It matches the menu's header at the start of a line in the last 24 lines with at most one › after it: once Skip is confirmed codex draws its composer, with its own ›, below the answered menu, so the hold lets go; a torn redraw with two cursors is the navigation rule's. BOOT-ONLY: the responder drops every hold rule once boot readiness is declared (autoResponder.endBoot, at the tmux boot and the recipe boot, including a resumed or attached session), so an idle run-phase pane whose agent quotes the header, with the composer's › below it, is never held and never spends the loop guard. LAST IN THE MANIFEST: a menu the shaped rules parse is answered, never held, and the hold shadows no rule that can answer a frame it also matches (a cursorless menu above the trust dialog gets trust_prompt). Source: docs/incidents/2026-10-05-codex-update-menu.md"
+    }
+  ],
+  "stub": false,
+  "model_tier_map": {
+    "fast": "gpt-5.6-luna",
+    "balanced": "gpt-5.6-terra",
+    "deep": "gpt-5.6-sol",
+    "top": "gpt-5.6-sol"
+  },
+  "chatgpt_safe_models": [
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna"
+  ],
+  "chatgpt_default_model": "gpt-5.6-sol",
+  "note": "Interactive codex via tmux. Preserves ChatGPT-account subscription billing (vs codex exec, which may meter differently). model_tier_map is the codex FAMILY's single tier table: the tmux realization, the headless driver (codex.json declares no map; it resolves through this one via the shared bridge.resolveTierModel ladder), setup's presets, the advisor clamp probe and the live-catalog overlay all read it — a model-family cutover is ONE edit here (values: see CHANGELOG, the value record; 2026-09-10 cost directive: deep/top = gpt-5.6-sol at the high reasoning rung — the 2026-09-09 gpt-6-astra cutover was withdrawn for token cost, and astra is deliberately outside the safe set so a stray pin is clamped to the default). chatgpt_safe_models/chatgpt_default_model (cycle-142 mechanism): on subscription auth a realized model outside the safe set is clamped to the default, so the deep model MUST be listed here or every deep launch is silently rewritten. API-key auth bypasses the clamp entirely. default_args: --yolo short-circuits the per-edit-approval modal; -c check_for_update_on_startup=false (a top-level codex config key) stops codex showing its startup update menu, whose default choice runs `brew upgrade --cask codex` and exits codex to the shell when the upgrade fails (wave 59, 2026-10-05: 16 of 16 codex dispatches lost to it). Verified live on 0.153.4: the same ~/.codex/version.json shows the menu without the override and never with it. The override is per launch, so no host-global file is written; update_menu_cursor_off_skip / update_menu_cursor_on_skip answer the menu if it shows anyway. Source: docs/incidents/2026-10-05-codex-update-menu.md."
+}

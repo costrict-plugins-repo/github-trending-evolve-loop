@@ -1,0 +1,129 @@
+package main
+
+import (
+	"bytes"
+	"strings"
+	"testing"
+)
+
+func TestRegistry_UniqueNames(t *testing.T) {
+	t.Parallel()
+	seen := make(map[string]string) // key → "name" or alias-of-name
+	for _, c := range commands {
+		if prev, ok := seen[c.Name]; ok {
+			t.Errorf("duplicate command name %q: previously registered via %q", c.Name, prev)
+		}
+		seen[c.Name] = "name"
+		for _, a := range c.Aliases {
+			if prev, ok := seen[a]; ok {
+				t.Errorf("alias %q for %q collides with previously registered %q",
+					a, c.Name, prev)
+			}
+			seen[a] = "alias-of-" + c.Name
+		}
+	}
+}
+
+func TestRegistry_RunNotNil(t *testing.T) {
+	t.Parallel()
+	for _, c := range commands {
+		if c.Run == nil {
+			t.Errorf("command %q has nil Run", c.Name)
+		}
+	}
+}
+
+func TestRegistry_SummaryNonEmpty(t *testing.T) {
+	t.Parallel()
+	for _, c := range commands {
+		if c.Summary == "" {
+			t.Errorf("command %q has empty Summary", c.Name)
+		}
+	}
+}
+
+func TestRegistry_LookupResolvesAliases(t *testing.T) {
+	t.Parallel()
+	for _, c := range commands {
+		got := lookupCommand(c.Name)
+		if got == nil {
+			t.Errorf("lookupCommand(%q) = nil", c.Name)
+			continue
+		}
+		if got.Name != c.Name {
+			t.Errorf("lookupCommand(%q).Name = %q, want %q", c.Name, got.Name, c.Name)
+		}
+		for _, alias := range c.Aliases {
+			aliasGot := lookupCommand(alias)
+			if aliasGot == nil {
+				t.Errorf("lookupCommand(%q) = nil for alias of %q", alias, c.Name)
+				continue
+			}
+			if aliasGot.Name != c.Name {
+				t.Errorf("alias %q routes to %q, want %q",
+					alias, aliasGot.Name, c.Name)
+			}
+		}
+	}
+}
+
+func TestRegistry_LookupUnknownReturnsNil(t *testing.T) {
+	t.Parallel()
+	if got := lookupCommand("definitely-not-a-real-subcommand-xyz"); got != nil {
+		t.Errorf("lookupCommand(unknown) = %+v, want nil", got)
+	}
+}
+
+func TestRegistry_VersionAndHelpAliases(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		alias string
+		want  string
+	}{
+		{"--version", "version"},
+		{"-v", "version"},
+		{"--help", "help"},
+		{"-h", "help"},
+	}
+	for _, tc := range cases {
+		if c := lookupCommand(tc.alias); c == nil || c.Name != tc.want {
+			t.Errorf("alias %q should resolve to %q, got %+v", tc.alias, tc.want, c)
+		}
+	}
+}
+
+func TestRegistry_VersionRun(t *testing.T) {
+	t.Parallel()
+	var stdout, stderr bytes.Buffer
+	rc := runVersion(nil, nil, &stdout, &stderr)
+	if rc != 0 {
+		t.Errorf("runVersion rc=%d, want 0", rc)
+	}
+	if stdout.Len() == 0 {
+		t.Errorf("runVersion stdout empty")
+	}
+}
+
+func TestRegistry_HelpRun(t *testing.T) {
+	t.Parallel()
+	var stdout, stderr bytes.Buffer
+	rc := runHelp(nil, nil, &stdout, &stderr)
+	if rc != 0 {
+		t.Errorf("runHelp rc=%d, want 0", rc)
+	}
+	if !bytes.Contains(stdout.Bytes(), []byte("evolve — autonomous improvement loop")) {
+		t.Errorf("runHelp output missing usage banner: %s", stdout.String())
+	}
+}
+
+func TestRegistry_AgentRunsTheStandaloneAgentCommand(t *testing.T) {
+	t.Parallel()
+	cmd := lookupCommand("agent")
+	if cmd == nil {
+		t.Fatal(`lookupCommand("agent") = nil`)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := cmd.Run([]string{"help"}, nil, &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "evolve agent run <profile>") {
+		t.Errorf("agent help: exit %d stdout %q", code, stdout.String())
+	}
+}

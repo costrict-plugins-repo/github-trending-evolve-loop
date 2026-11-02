@@ -1,0 +1,338 @@
+package deliverable
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/phasecontract"
+)
+
+func writeFile(t *testing.T, dir, name, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", name, err)
+	}
+}
+
+func TestVerify_UnknownPhase_FailsOpen(t *testing.T) {
+	_, err := Verify("nope", phasecontract.Roots{Workspace: t.TempDir()})
+	if err == nil {
+		t.Fatal("unknown phase: want error (fail-open signal), got nil")
+	}
+}
+
+func TestVerify_ValidMarkdown_OK(t *testing.T) {
+	ws := t.TempDir()
+	writeFile(t, ws, "build-report.md", "# Build Report\n\n## Changes\n- foo.go\n\nVerdict: PASS\n")
+	res, err := Verify("build", phasecontract.Roots{Workspace: ws})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.OK {
+		t.Errorf("want OK, got violations: %+v", res.Violations)
+	}
+}
+
+func TestVerify_MissingArtifact_ConfirmedViolation(t *testing.T) {
+	ws := t.TempDir()
+	res, err := Verify("build", phasecontract.Roots{Workspace: ws})
+	if err != nil {
+		t.Fatalf("missing file is a confirmed violation, not ambiguity; got err=%v", err)
+	}
+	if res.OK {
+		t.Fatal("want !OK for missing artifact")
+	}
+	if !hasCode(res, "missing_artifact") {
+		t.Errorf("want missing_artifact violation, got %+v", res.Violations)
+	}
+	if msg := firstMsg(res, "missing_artifact"); msg == "" ||
+		!filepathContains(msg, filepath.Join(ws, "build-report.md")) {
+		t.Errorf("missing_artifact message must name the expected path; got %q", msg)
+	}
+}
+
+func TestVerify_MissingSection_NamesIt(t *testing.T) {
+	ws := t.TempDir()
+	writeFile(t, ws, "build-report.md", "# Build Report\n\nno changes section here\nVerdict: PASS\n")
+	res, _ := Verify("build", phasecontract.Roots{Workspace: ws})
+	if res.OK {
+		t.Fatal("want !OK when required section absent")
+	}
+	if !hasCode(res, "missing_section") {
+		t.Errorf("want missing_section, got %+v", res.Violations)
+	}
+}
+
+func TestVerify_WarnOrFailSentinel_StillRequiresSections(t *testing.T) {
+	for _, verdict := range []string{"FAIL", "WARN"} {
+		sentinel := `<!-- evolve-verdict: {"phase":"build","verdict":"` + verdict + `"} -->` + "\n"
+
+		ws := t.TempDir()
+		writeFile(t, ws, "build-report.md", sentinel)
+		res, err := Verify("build", phasecontract.Roots{Workspace: ws})
+		if err != nil {
+			t.Fatalf("verdict %s: unexpected error: %v", verdict, err)
+		}
+		if res.OK {
+			t.Errorf("verdict %s: sentinel-only report accepted as well-formed; a %s verdict must not waive the report body", verdict, verdict)
+		} else if !hasCode(res, CodeMissingSection) {
+			t.Errorf("verdict %s: want %s, got %+v", verdict, CodeMissingSection, res.Violations)
+		}
+
+		ws2 := t.TempDir()
+		writeFile(t, ws2, "build-report.md", sentinel+"\n# Build Report\n\n## Changes\n- foo.go\n")
+		res2, err := Verify("build", phasecontract.Roots{Workspace: ws2})
+		if err != nil {
+			t.Fatalf("verdict %s (control): unexpected error: %v", verdict, err)
+		}
+		if hasCode(res2, CodeMissingSection) {
+			t.Errorf("verdict %s: report WITH its required section must not be flagged %s; got %+v", verdict, CodeMissingSection, res2.Violations)
+		}
+	}
+}
+
+func TestVerify_StrayInWorktree(t *testing.T) {
+	ws, wt := t.TempDir(), t.TempDir()
+	writeFile(t, wt, "build-report.md", "## Changes\n- x\nVerdict: PASS\n")
+	res, _ := Verify("build", phasecontract.Roots{Workspace: ws, Worktree: wt})
+	if res.OK {
+		t.Fatal("want !OK: report is stray in worktree, missing from workspace")
+	}
+	if !hasCode(res, "stray_in_worktree") {
+		t.Errorf("want stray_in_worktree, got %+v", res.Violations)
+	}
+}
+
+func TestVerify_EmptyArtifact(t *testing.T) {
+	ws := t.TempDir()
+	writeFile(t, ws, "build-report.md", "   \n\t\n")
+	res, _ := Verify("build", phasecontract.Roots{Workspace: ws})
+	if res.OK || !hasCode(res, CodeEmptyArtifact) {
+		t.Errorf("want empty_artifact, got %+v", res.Violations)
+	}
+}
+
+func TestVerify_BadVerdict(t *testing.T) {
+	ws := t.TempDir()
+	writeFile(t, ws, "audit-report.md", "## Verdict\ninconclusive musings, no token\n")
+	res, _ := Verify("audit", phasecontract.Roots{Workspace: ws})
+	if res.OK || !hasCode(res, CodeBadVerdict) {
+		t.Errorf("want bad_verdict, got %+v", res.Violations)
+	}
+}
+
+func TestCheckStray_SkipsNonWorkspaceTarget(t *testing.T) {
+	var res Result
+	c := phasecontract.Contract{ArtifactName: "x.json", WriteTarget: phasecontract.TargetEvolveDir}
+	checkStray(&res, c, phasecontract.Roots{Workspace: "/ws", Worktree: "/wt"})
+	if len(res.Violations) != 0 {
+		t.Errorf("want no violations for non-workspace target, got %+v", res.Violations)
+	}
+}
+
+func TestVerify_ValidJSON_OK(t *testing.T) {
+	ws := t.TempDir()
+	writeFile(t, ws, "cycle-state.json", `{"cycle_id":213,"phase":"build","extra":"ignored"}`)
+	res, err := Verify("orchestrator", phasecontract.Roots{EvolveDir: ws})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.OK {
+		t.Errorf("want OK (tolerant reader ignores unknown 'extra'), got %+v", res.Violations)
+	}
+}
+
+func TestVerify_RouterContractsRequireTheirDeclaredJSONShape(t *testing.T) {
+	tests := []struct {
+		name     string
+		contract string
+		content  string
+		wantOK   bool
+	}{
+		{name: "plan array", contract: "router", content: `[{"phase":"build"}]`, wantOK: true},
+		{name: "plan object", contract: "router", content: `{"phase":"build"}`},
+		{name: "plan null", contract: "router", content: `null`},
+		{name: "replan array", contract: "router-replan", content: `[{"phase":"audit"}]`, wantOK: true},
+		{name: "replan scalar", contract: "router-replan", content: `"audit"`},
+		{name: "proposal object", contract: "router-proposal", content: `{"phase":"audit","run":true}`, wantOK: true},
+		{name: "proposal array", contract: "router-proposal", content: `[{"phase":"audit"}]`},
+		{name: "proposal null", contract: "router-proposal", content: `null`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ws := t.TempDir()
+			c, ok := phasecontract.For(tt.contract)
+			if !ok {
+				t.Fatalf("contract %q is not registered", tt.contract)
+			}
+			writeFile(t, ws, c.ArtifactName, tt.content)
+			res, err := Verify(tt.contract, phasecontract.Roots{Workspace: ws})
+			if err != nil {
+				t.Fatalf("Verify(%q): %v", tt.contract, err)
+			}
+			if res.OK != tt.wantOK {
+				t.Errorf("Verify(%q) OK=%v, want %v; violations=%+v", tt.contract, res.OK, tt.wantOK, res.Violations)
+			}
+			if !tt.wantOK && !hasCode(res, CodeInvalidJSON) {
+				t.Errorf("wrong top-level shape must report %q; got %+v", CodeInvalidJSON, res.Violations)
+			}
+		})
+	}
+}
+
+func TestVerify_RouterContractDoesNotAcceptSiblingArtifact(t *testing.T) {
+	ws := t.TempDir()
+	writeFile(t, ws, "routing-plan.json", `[{"phase":"audit"}]`)
+
+	res, err := Verify("router-proposal", phasecontract.Roots{Workspace: ws})
+	if err != nil {
+		t.Fatalf("Verify(router-proposal): %v", err)
+	}
+	if res.OK || !hasCode(res, CodeMissingArtifact) {
+		t.Errorf("a valid routing-plan.json must not satisfy routing-proposal.json; got %+v", res.Violations)
+	}
+}
+
+func TestVerifyJSON_UnspecifiedShapePreservesAnyValidValue(t *testing.T) {
+	contract := phasecontract.Contract{Kind: phasecontract.KindJSON}
+	for _, content := range []string{`null`, `"value"`, `7`, `[]`, `{}`} {
+		var res Result
+		verifyJSON(&res, contract, content)
+		if len(res.Violations) != 0 {
+			t.Errorf("legacy unspecified shape rejected %s: %+v", content, res.Violations)
+		}
+	}
+}
+
+func TestVerify_InvalidJSON(t *testing.T) {
+	ws := t.TempDir()
+	writeFile(t, ws, "routing-plan.json", `{not json`)
+	res, _ := Verify("advisor", phasecontract.Roots{Workspace: ws})
+	if res.OK || !hasCode(res, "invalid_json") {
+		t.Errorf("want invalid_json violation, got %+v", res.Violations)
+	}
+}
+
+func TestVerify_MissingJSONKey(t *testing.T) {
+	ws := t.TempDir()
+	writeFile(t, ws, "cycle-state.json", `{"phase":"build"}`)
+	res, _ := Verify("orchestrator", phasecontract.Roots{EvolveDir: ws})
+	if res.OK {
+		t.Fatal("want !OK: orchestrator cycle-state.json missing required cycle_id")
+	}
+	if !hasCode(res, "missing_key") {
+		t.Errorf("want missing_key, got %+v", res.Violations)
+	}
+}
+
+func TestVerify_Orchestrator_EvolveDir(t *testing.T) {
+	ev := t.TempDir()
+	writeFile(t, ev, "cycle-state.json", `{"cycle_id":213,"phase":"tdd"}`)
+	res, err := Verify("orchestrator", phasecontract.Roots{EvolveDir: ev})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.OK {
+		t.Errorf("want OK for valid cycle-state.json, got %+v", res.Violations)
+	}
+}
+
+func hasCode(r Result, code string) bool {
+	for _, v := range r.Violations {
+		if v.Code == code {
+			return true
+		}
+	}
+	return false
+}
+
+func firstMsg(r Result, code string) string {
+	for _, v := range r.Violations {
+		if v.Code == code {
+			return v.Message
+		}
+	}
+	return ""
+}
+
+func filepathContains(haystack, needle string) bool {
+	return len(haystack) > 0 && len(needle) > 0 &&
+		(haystack == needle || contains(haystack, needle))
+}
+
+func contains(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
+func TestVerify_AuditFailWithoutFailureBlock_Violation(t *testing.T) {
+	ws := t.TempDir()
+	writeFile(t, ws, "audit-report.md",
+		"## Verdict\nFAIL\n"+phasecontract.RenderVerdictSentinel("audit", "FAIL")+"\n")
+	res, err := Verify("audit", phasecontract.Roots{Workspace: ws})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.OK || !hasCode(res, "failure_context_missing") {
+		t.Fatalf("want failure_context_missing violation, got %+v", res.Violations)
+	}
+	for _, v := range res.Violations {
+		if v.Code == "failure_context_missing" &&
+			(!contains(v.Message, "failure") || !contains(v.Message, "schema_version")) {
+			t.Errorf("violation message must tell the agent HOW to fix (failure block, schema_version 2); got %q", v.Message)
+		}
+	}
+}
+
+func TestVerify_AuditFailWithFailureBlock_OK(t *testing.T) {
+	ws := t.TempDir()
+	line := phasecontract.RenderVerdictSentinelWithFailure("audit", "FAIL",
+		&phasecontract.FailureBlock{Class: "code-audit-fail", Defects: []string{"d1"}})
+	writeFile(t, ws, "audit-report.md", "## Verdict\nFAIL\n"+line+"\n")
+	res, err := Verify("audit", phasecontract.Roots{Workspace: ws})
+	if err != nil || !res.OK {
+		t.Fatalf("structured FAIL must verify clean; err=%v violations=%+v", err, res.Violations)
+	}
+}
+
+func TestVerify_FailureContextNotRequiredOnPassOrLegacy(t *testing.T) {
+	for name, content := range map[string]string{
+		"pass":   "## Verdict\nPASS\n" + phasecontract.RenderVerdictSentinel("audit", "PASS") + "\n",
+		"legacy": "## Verdict\nFAIL\n",
+	} {
+		ws := t.TempDir()
+		writeFile(t, ws, "audit-report.md", content)
+		res, err := Verify("audit", phasecontract.Roots{Workspace: ws})
+		if err != nil || !res.OK {
+			t.Errorf("%s: must verify clean; err=%v violations=%+v", name, err, res.Violations)
+		}
+	}
+}
+
+func TestVerify_RouterBareArray_OK(t *testing.T) {
+	ws := t.TempDir()
+	writeFile(t, ws, "routing-plan.json", `[{"phase":"build"},{"phase":"audit"}]`)
+	res, err := Verify("router", phasecontract.Roots{Workspace: ws})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.OK {
+		t.Errorf("router bare-array routing-plan.json must verify OK; got %+v", res.Violations)
+	}
+}
+
+func TestVerify_NoArtifactContract_OK(t *testing.T) {
+	res, err := Verify("ship", phasecontract.Roots{Workspace: t.TempDir()})
+	if err != nil {
+		t.Fatalf("ship verify: must not fail-open on a registered no-artifact phase: %v", err)
+	}
+	if !res.OK {
+		t.Errorf("ship NoArtifact contract: want OK=true, got violations %+v", res.Violations)
+	}
+}

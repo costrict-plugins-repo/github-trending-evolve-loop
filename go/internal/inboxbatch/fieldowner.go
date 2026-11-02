@@ -1,0 +1,125 @@
+package inboxbatch
+
+import (
+	"maps"
+	"slices"
+)
+
+type FieldOwner string
+
+const (
+	AuthorOwned        FieldOwner = "author"
+	CuratorOwned       FieldOwner = "curator"
+	LoopStampOwned     FieldOwner = "loop-stamp"
+	OperatorStampOwned FieldOwner = "operator-stamp"
+)
+
+type ValueShape string
+
+const (
+	TextValue    ValueShape = "text"
+	NumberValue  ValueShape = "number"
+	ListValue    ValueShape = "list"
+	CounterValue ValueShape = "counter"
+	GrowOnlyList ValueShape = "grow-only-list"
+)
+
+type FieldRole struct {
+	Owner FieldOwner
+	Shape ValueShape
+}
+
+func (r FieldRole) IsCounter() bool {
+	return r.Shape == CounterValue
+}
+
+func (r FieldRole) IsGrowOnly() bool {
+	return r.Shape == GrowOnlyList
+}
+
+func (r FieldRole) IsStamp() bool {
+	return r.Owner == LoopStampOwned || r.Owner == OperatorStampOwned
+}
+
+const (
+	RouteField                   = "route"
+	RoutedReasonField            = "routed_reason"
+	RoutedCycleField             = "routed_cycle"
+	RoutedAtField                = "routed_at"
+	FailureCountField            = "failure_count"
+	LastFailureReasonField       = "last_failure_reason"
+	LastFailureClassField        = "last_failure_class"
+	LastFailureFingerprintField  = "last_failure_fingerprint"
+	ContinuationField            = "continuation"
+	ReleasedContinuationsField   = "released_continuations"
+	ConsumedField                = "consumed"
+	UnbackedField                = "unbacked"
+	RetiredReasonField           = "retired_reason"
+	RetiredCycleField            = "retired_cycle"
+	GitSHAField                  = "git_sha"
+	ProtectedFilesField          = "protected_files"
+	PremiseVerifiedAtField       = "premise_verified_at"
+	PremiseVerifiedSHAField      = "premise_verified_sha"
+	PremiseVerifiedEvidenceField = "premise_verified_evidence"
+	IntakeOverrideField          = "intake_override"
+)
+
+var (
+	curated       = func(shape ValueShape) FieldRole { return FieldRole{Owner: CuratorOwned, Shape: shape} }
+	loopStamp     = FieldRole{Owner: LoopStampOwned}
+	loopCounter   = FieldRole{Owner: LoopStampOwned, Shape: CounterValue}
+	loopGrowOnly  = FieldRole{Owner: LoopStampOwned, Shape: GrowOnlyList}
+	operatorStamp = FieldRole{Owner: OperatorStampOwned}
+)
+
+var fieldRoles = map[string]FieldRole{
+	"id":             curated(TextValue),
+	"title":          curated(TextValue),
+	"summary":        curated(TextValue),
+	"fix":            curated(TextValue),
+	"priority_class": curated(TextValue),
+	"weight":         curated(NumberValue),
+	"acceptance":     curated(ListValue),
+	"files":          curated(ListValue),
+	"deps":           curated(ListValue),
+	"connects_to":    curated(ListValue),
+
+	RouteField:                  loopStamp,
+	RoutedReasonField:           loopStamp,
+	RoutedCycleField:            loopStamp,
+	RoutedAtField:               loopStamp,
+	FailureCountField:           loopCounter,
+	LastFailureReasonField:      loopStamp,
+	LastFailureClassField:       loopStamp,
+	LastFailureFingerprintField: loopStamp,
+	ContinuationField:           loopStamp,
+	ReleasedContinuationsField:  loopStamp,
+	ConsumedField:               loopStamp,
+	UnbackedField:               loopStamp,
+	RetiredReasonField:          loopStamp,
+	RetiredCycleField:           loopStamp,
+	GitSHAField:                 loopStamp,
+	ProtectedFilesField:         loopGrowOnly,
+
+	PremiseVerifiedAtField:       operatorStamp,
+	PremiseVerifiedSHAField:      operatorStamp,
+	PremiseVerifiedEvidenceField: operatorStamp,
+	IntakeOverrideField:          operatorStamp,
+}
+
+func RoleOf(key string) FieldRole {
+	if role, listed := fieldRoles[key]; listed {
+		return role
+	}
+	return FieldRole{Owner: AuthorOwned}
+}
+
+func FieldsOwnedBy(owner FieldOwner) []string {
+	var keys []string
+	for _, key := range slices.Sorted(maps.Keys(fieldRoles)) {
+		if fieldRoles[key].Owner == owner {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}

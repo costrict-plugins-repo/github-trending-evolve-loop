@@ -1,0 +1,93 @@
+package lifecycle
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"testing"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/adapters/ledger"
+	"github.com/mickeyyaya/evolve-loop/go/internal/signalcenter"
+)
+
+func TestAPI_EveryExportIsNamed(t *testing.T) {
+	var (
+		_ func(string, LedgerAppender, ...Option) *Mover                     = New
+		_ func(io.Writer) Option                                             = WithStderr
+		_ func(func() time.Time) Option                                      = WithNow
+		_ func(func() (string, error)) Option                                = WithActiveCycle
+		_ func(func(string) (bool, error)) Option                            = WithLanded
+		_ func(func(string) bool) Option                                     = WithProtectedPath
+		_ func(func(string, string, string)) Option                          = WithRetire
+		_ func(func(int) string) Option                                      = WithRunWorkspace
+		_ func(func() *signalcenter.Center) Option                           = WithSignals
+		_ func([]string) Option                                              = WithPriorityClasses
+		_ func(*Mover) bool                                                  = (*Mover).SignalsWired
+		_ func(*Mover, string, string) (ClaimResult, error)                  = (*Mover).Claim
+		_ func(*Mover, string, string, PromoteOpts) (PromoteResult, error)   = (*Mover).Promote
+		_ func(*Mover, string, string, PromoteOpts, string) (string, error)  = (*Mover).RetireUnbacked
+		_ func(*Mover, string) (PromoteResult, error)                        = (*Mover).ReleaseFromQuarantine
+		_ func(*Mover) (RecoverResult, error)                                = (*Mover).RecoverOrphans
+		_ func(*Mover, int, string, *Policy) (RecoverResult, error)          = (*Mover).Release
+		_ func(*Mover, string, string, int) (RouteResult, error)             = (*Mover).RouteConsole
+		_ func(*Mover, string, string) (RouteResult, error)                  = (*Mover).RouteLane
+		_ func(*Mover, RouteRequest) (RouteResult, error)                    = (*Mover).RouteConsoleRequest
+		_ func(*Mover, RouteRequest) (RouteResult, error)                    = (*Mover).RouteLaneRequest
+		_ func(*Mover, []byte) (FileResult, error)                           = (*Mover).File
+		_ error                                                              = ErrInvalidItem
+		_ string                                                             = RouteConsoleValue
+		_ func(*Mover, string) (int, bool)                                   = (*Mover).ReadFailureCount
+		_ func(*Mover, string) string                                        = (*Mover).ReadLastFailureClass
+		_ func(string, string) (Location, error)                             = Locate
+		_ func(string, string) (string, error)                               = FindFileByTaskID
+		_ func(int, int, bool) bool                                          = ShouldQuarantine
+		_ func(string, string) (int, error)                                  = BumpFailureCount
+		_ func(string, func(map[string]json.RawMessage)) error               = UpdateItemJSON
+		_ func(func() (string, error)) Option                                = WithMainHead
+		_ func(*Mover, string, []FieldEdit) (string, error)                  = (*Mover).Edit
+		_ func(*Mover, string, string) (string, error)                       = (*Mover).Withdraw
+		_ func(*Mover, string, string) (string, error)                       = (*Mover).VerifyPremise
+		_ error                                                              = ErrNotWithdrawable
+		_ func(func(string) (bool, error)) Option                            = WithBinding
+		_ func(string) bool                                                  = IsMoverWritten
+		_ string                                                             = RouteField
+		_ func(string) (ClaimList, error)                                    = ListClaims
+		_ func(*Mover, string, Location, string) (ClaimReleaseResult, error) = (*Mover).ReleaseClaim
+		_ error                                                              = ErrClaimConflict
+		_                                                                    = ClaimedItem{Duplicate: true}
+		_ func(*Mover) ([]Absorbed, error)                                   = (*Mover).AbsorbRootCopies
+		_ AbsorbOutcome                                                      = AbsorbParked
+	)
+	if ops := []EditOp{EditSet, EditAdd, EditRemove}; ops[0] != "set" || ops[1] != "add" || ops[2] != "remove" {
+		t.Errorf("the edit ops are spelled as the CLI flags: %v", ops)
+	}
+	if edit := (FieldEdit{Op: EditSet, Field: "weight", Value: "0.4"}); edit.Field != "weight" || edit.Value != "0.4" {
+		t.Errorf("a field edit carries its field and value: %+v", edit)
+	}
+	var appender LedgerAppender = &recordingAppender{}
+	if err := appender.AppendLifecycle(context.Background(), ledger.LifecycleRecord{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range []error{ErrNotFound, ErrMvFailed, ErrBadArgs, ErrBadState, ErrConsoleRouted} {
+		if e == nil {
+			t.Error("a sentinel is nil")
+		}
+	}
+	for _, c := range []signalcenter.Code{CodeClaimNotFound, CodeClaimRefused, CodeClaimMoveFailed, CodePromoteNotFound, CodePromoteUnlandedSHA,
+		CodePromoteMoveFailed, CodeLandedCheckFailed, CodeReleaseDoubleMove, CodeReleaseMoveFailed, CodeQuarantineFailed,
+		CodeContinuationManifestUnreadable, CodeItemRewriteFailed, CodeItemRoutedConsole, CodeRouteNotFound} {
+		if !c.BelongsTo(signalcenter.ModuleInbox) {
+			t.Errorf("%s is not an inbox code", c)
+		}
+	}
+	if LegacyPrefix != "[inbox-mover] " {
+		t.Errorf("LegacyPrefix = %q", LegacyPrefix)
+	}
+	p := Policy{Ceiling: 2, SystemLevel: false, Committed: map[string]bool{"a": true}}
+	loc := Location{Path: "p", Cycle: 1}
+	cr, pr, rr, po := ClaimResult{SrcPath: "s", DestPath: "d"}, PromoteResult{NoOp: true}, RecoverResult{Recovered: 1, Paths: []string{"x"}}, PromoteOpts{Cycle: "1", CommitSHA: "s"}
+	if p.Ceiling != 2 || loc.Cycle != 1 || cr.SrcPath != "s" || !pr.NoOp || rr.Recovered != 1 || po.Cycle != "1" {
+		t.Error("the value objects carry their fields")
+	}
+}

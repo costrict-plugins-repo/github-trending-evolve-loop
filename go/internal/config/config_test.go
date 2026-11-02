@@ -1,0 +1,262 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func writeRegistry(t *testing.T, body string) string {
+	t.Helper()
+	dir := t.TempDir()
+	p := filepath.Join(dir, "phase-registry.json")
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatalf("write registry: %v", err)
+	}
+	return p
+}
+
+func hasWarning(ws []Warning, code string) bool {
+	for _, w := range ws {
+		if w.Code == code {
+			return true
+		}
+	}
+	return false
+}
+
+func TestLoad_DefaultsWhenRegistryMissing(t *testing.T) {
+	cfg, ws := Load(filepath.Join(t.TempDir(), "absent.json"))
+
+	if cfg.Stage != StageAdvisory {
+		t.Errorf("Stage = %v, want StageAdvisory (default-on since Component #7)", cfg.Stage)
+	}
+	if cfg.Mode != ModeDynamicLLM {
+		t.Errorf("Mode = %v, want ModeDynamicLLM (locked decision: LLM default)", cfg.Mode)
+	}
+	if cfg.MaxInsertions != 4 {
+		t.Errorf("MaxInsertions = %d, want 4", cfg.MaxInsertions)
+	}
+	wantMandatory := []string{"scout", "build", "audit", "ship"}
+	if got := cfg.Mandatory; len(got) != 4 || got[0] != "scout" || got[3] != "ship" {
+		t.Errorf("Mandatory = %v, want %v", got, wantMandatory)
+	}
+	rule, ok := cfg.Conditional["tdd"]
+	if !ok {
+		t.Fatalf("Conditional missing tdd pin")
+	}
+	if rule.Field != "cycle_size" || rule.Op != "!=" || rule.Value != "trivial" {
+		t.Errorf("tdd CondRule = %+v, want {cycle_size != trivial}", rule)
+	}
+	if hasWarning(ws, "weak-spine") {
+		t.Errorf("unexpected weak-spine warning on default spine")
+	}
+}
+
+func TestLoad_RegistryConfigBlockParsed(t *testing.T) {
+	reg := writeRegistry(t, `{
+      "schema_version": 3,
+      "config": {
+        "dynamic_routing": "shadow",
+        "routing_mode": "static",
+        "mandatory_phases": ["scout","build","audit","ship"],
+        "conditional_mandatory": {"tdd": "cycle_size!=trivial"},
+        "max_optional_insertions": 7
+      },
+      "phases": []
+    }`)
+
+	cfg, ws := Load(reg)
+
+	if cfg.Stage != StageShadow {
+		t.Errorf("Stage = %v, want StageShadow", cfg.Stage)
+	}
+	if cfg.Mode != ModeStaticPreset {
+		t.Errorf("Mode = %v, want ModeStaticPreset", cfg.Mode)
+	}
+	if cfg.MaxInsertions != 7 {
+		t.Errorf("MaxInsertions = %d, want 7", cfg.MaxInsertions)
+	}
+	if len(ws) != 0 {
+		t.Errorf("unexpected warnings: %+v", ws)
+	}
+}
+
+func TestApplyPolicyStages_PolicyKnobsOverrideTheRegistry(t *testing.T) {
+	reg := writeRegistry(t, `{"schema_version":3,"config":{"dynamic_routing":"shadow"},"phases":[]}`)
+	loaded, _ := Load(reg)
+	two := 2
+	cfg, ws := withKnobs(loaded, func(ps *RoutingKnobs) {
+		ps.DynamicRouting, ps.RoutingMode, ps.MaxOptionalInsertions = "enforce", "static", &two
+	})
+
+	if cfg.Stage != StageEnforce {
+		t.Errorf("Stage = %v, want StageEnforce (policy beats registry)", cfg.Stage)
+	}
+	if cfg.Mode != ModeStaticPreset {
+		t.Errorf("Mode = %v, want ModeStaticPreset", cfg.Mode)
+	}
+	if cfg.MaxInsertions != 2 {
+		t.Errorf("MaxInsertions = %d, want 2", cfg.MaxInsertions)
+	}
+	if len(ws) != 0 {
+		t.Errorf("warnings = %+v, want none", ws)
+	}
+}
+
+func TestLoad_GateStagesUseDefaults(t *testing.T) {
+	absent := filepath.Join(t.TempDir(), "absent.json")
+
+	cfg, ws := Load(absent)
+	if cfg.EvalGate != StageEnforce {
+		t.Errorf("default EvalGate = %v, want StageEnforce", cfg.EvalGate)
+	}
+	if cfg.ContractGate != StageEnforce {
+		t.Errorf("default ContractGate = %v, want StageEnforce", cfg.ContractGate)
+	}
+	if cfg.TriageCapGate != StageEnforce {
+		t.Errorf("default TriageCapGate = %v, want StageEnforce", cfg.TriageCapGate)
+	}
+	if hasWarning(ws, "unknown-value") {
+		t.Errorf("removed gate env keys should be ignored without warnings: %+v", ws)
+	}
+}
+
+func TestApplyPolicyKnobs_UnknownStageDefaultsSafe(t *testing.T) {
+	cfg, ws := withKnobs(defaults(), func(ps *RoutingKnobs) { ps.DynamicRouting = "banana" })
+	if cfg.Stage != StageOff {
+		t.Errorf("Stage = %v, want StageOff for unknown value (protect autonomy)", cfg.Stage)
+	}
+	if !hasWarning(ws, "unknown-value") {
+		t.Errorf("expected unknown-value warning for bogus stage")
+	}
+}
+
+func TestLoad_PerPhaseEnabledAndTriggers(t *testing.T) {
+	reg := writeRegistry(t, `{
+      "schema_version": 3,
+      "config": {},
+      "phases": [
+        { "name": "tester", "optional": true, "enabled": "content",
+          "routing": { "insert_when": [ {"field":"build.acs_red","op":"gt","value":0} ] } },
+        { "name": "triage", "optional": true, "enabled": "on" }
+      ]
+    }`)
+
+	cfg, _ := Load(reg)
+
+	if cfg.PhaseEnable["tester"] != EnableContent {
+		t.Errorf("tester enable = %v, want EnableContent", cfg.PhaseEnable["tester"])
+	}
+	if cfg.PhaseEnable["triage"] != EnableOn {
+		t.Errorf("triage enable = %v, want EnableOn", cfg.PhaseEnable["triage"])
+	}
+	tb, ok := cfg.Triggers["tester"]
+	if !ok || len(tb.InsertWhen) != 1 {
+		t.Fatalf("tester triggers = %+v, want one insert_when", tb)
+	}
+	c := tb.InsertWhen[0]
+	if c.Field != "build.acs_red" || c.Op != "gt" {
+		t.Errorf("tester condition = %+v, want build.acs_red gt 0", c)
+	}
+}
+
+func TestParseCondRule(t *testing.T) {
+	cases := []struct {
+		in              string
+		field, op, want string
+	}{
+		{"cycle_size!=trivial", "cycle_size", "!=", "trivial"},
+		{"cycle_size==large", "cycle_size", "==", "large"},
+		{"verdict != PASS", "verdict", "!=", "PASS"},
+	}
+	for _, tc := range cases {
+		got, err := parseCondRule(tc.in)
+		if err != nil {
+			t.Fatalf("parseCondRule(%q) error: %v", tc.in, err)
+		}
+		if got.Field != tc.field || got.Op != tc.op || got.Value != tc.want {
+			t.Errorf("parseCondRule(%q) = %+v, want {%s %s %s}", tc.in, got, tc.field, tc.op, tc.want)
+		}
+	}
+}
+
+func TestStageAndModeString(t *testing.T) {
+	if StageEnforce.String() != "enforce" {
+		t.Errorf("StageEnforce.String() = %q", StageEnforce.String())
+	}
+	if ModeDynamicLLM.String() != "llm" {
+		t.Errorf("ModeDynamicLLM.String() = %q", ModeDynamicLLM.String())
+	}
+}
+
+func TestLoad_PhaseRecoveryStage(t *testing.T) {
+	absent := filepath.Join(t.TempDir(), "absent.json")
+
+	if cfg, _ := Load(absent); cfg.PhaseRecovery != StageShadow {
+		t.Errorf("default PhaseRecovery = %v, want StageShadow", cfg.PhaseRecovery)
+	}
+	for _, v := range []string{"off", "0", "shadow", "enforce", "banana"} {
+		cfg, _ := Load(absent)
+		if cfg.PhaseRecovery != StageShadow {
+			t.Errorf("EVOLVE_PHASE_RECOVERY=%q should be ignored (retired flag); got %v, want StageShadow", v, cfg.PhaseRecovery)
+		}
+	}
+}
+
+func TestLoad_SpineFloorStage(t *testing.T) {
+	absent := filepath.Join(t.TempDir(), "absent.json")
+	if cfg, _ := Load(absent); cfg.SpineFloor != StageEnforce {
+		t.Errorf("default SpineFloor = %v, want StageEnforce (R8.5 flip)", cfg.SpineFloor)
+	}
+	for _, v := range []string{"off", "shadow", "banana"} {
+		cfg, _ := Load(absent)
+		if cfg.SpineFloor != StageEnforce {
+			t.Errorf("EVOLVE_SPINE_FLOOR=%q must be inert (policy-only dial); got %v, want StageEnforce", v, cfg.SpineFloor)
+		}
+	}
+}
+
+func TestLoad_FatalPaneStage(t *testing.T) {
+	absent := filepath.Join(t.TempDir(), "absent.json")
+	if cfg, _ := Load(absent); cfg.FatalPane != StageEnforce {
+		t.Errorf("default FatalPane = %v, want StageEnforce (F27 flip)", cfg.FatalPane)
+	}
+	for _, key := range []string{"EVOLVE_FATAL_PANE", "EVOLVE_PHASE_RECOVERY"} {
+		for _, v := range []string{"off", "shadow", "banana"} {
+			cfg, _ := Load(absent)
+			if cfg.FatalPane != StageEnforce {
+				t.Errorf("%s=%q must be inert for the policy-only fatal-pane dial; got %v, want StageEnforce", key, v, cfg.FatalPane)
+			}
+		}
+	}
+}
+
+func TestPhaseIOStage(t *testing.T) {
+	absent := filepath.Join(t.TempDir(), "absent.json")
+
+	if cfg, _ := Load(absent); cfg.PhaseIO != StageEnforce {
+		t.Errorf("default PhaseIO = %v, want StageEnforce", cfg.PhaseIO)
+	}
+	for v, want := range map[string]Stage{
+		"off": StageOff, "0": StageOff, "shadow": StageShadow,
+		"advisory": StageAdvisory, "enforce": StageEnforce,
+	} {
+		if cfg, _ := withKnobs(defaults(), func(ps *RoutingKnobs) { ps.PhaseIO = v }); cfg.PhaseIO != want {
+			t.Errorf("gates.phase_io=%q → %v, want %v", v, cfg.PhaseIO, want)
+		}
+	}
+	cfg, ws := withKnobs(defaults(), func(ps *RoutingKnobs) { ps.PhaseIO = "banana" })
+	if cfg.PhaseIO != StageOff {
+		t.Errorf("typo gates.phase_io → %v, want StageOff", cfg.PhaseIO)
+	}
+	if !hasWarning(ws, "unknown-value") {
+		t.Error("typo gates.phase_io should warn unknown-value")
+	}
+}
+
+func TestDefaults_PhaseIO_Enforce(t *testing.T) {
+	if got := defaults().RolloutStages.PhaseIO; got != StageEnforce {
+		t.Errorf("default RolloutStages.PhaseIO = %v, want StageEnforce (3.10 cutover)", got)
+	}
+}

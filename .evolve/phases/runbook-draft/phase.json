@@ -1,0 +1,38 @@
+{
+  "name": "runbook-draft",
+  "archetype": "control",
+  "agent": "evolve-runbook-draft",
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/scout-report.md"
+    ],
+    "signals": []
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/runbook-draft-report.md"
+    ],
+    "signals": [
+      "runbook.steps_count"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Trigger",
+      "Diagnosis",
+      "Resolution Steps",
+      "Escalation"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "ops-incident"
+      }
+    ]
+  },
+  "after": "triage",
+  "optional": true
+}

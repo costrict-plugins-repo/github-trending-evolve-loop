@@ -1,0 +1,99 @@
+package committedset
+
+import (
+	"os"
+	"path/filepath"
+	"reflect"
+	"testing"
+)
+
+func TestDispositions_OnlyAnsweringBucketsAnswer(t *testing.T) {
+	ws := t.TempDir()
+	write(t, ws, DecisionFile, map[string]any{
+		"top_n":    ids("committed"),
+		"deferred": ids("deferred-only"),
+		"dropped": []map[string]string{
+			{"id": "dropped-shipped", "reason": "already-shipped-cycle-1679"},
+			{"id": "dropped-silent", "reason": "  "},
+		},
+		"skip_shipped":   []map[string]string{{"task_id": "shipped", "git_sha": "abc123"}, {"task_id": "shipped-no-sha"}},
+		"skip_rejected":  []map[string]string{{"task_id": "rejected"}},
+		"escalate_block": []map[string]any{{"task_id": "escalated", "reason": "console-routed"}, {"task_id": "escalated-count", "fail_count": 2}, {"task_id": "escalated-bare"}},
+	})
+
+	got := Dispositions(ws)
+	want := []Disposition{
+		{ID: "escalated", Bucket: "escalate_block", Reason: "console-routed"},
+		{ID: "escalated-count", Bucket: "escalate_block", Reason: "fail_count 2"},
+		{ID: "escalated-bare", Bucket: "escalate_block", Reason: "escalated without a stated reason"},
+		{ID: "rejected", Bucket: "skip_rejected", Reason: "triage reported an earlier rejection (inbox/rejected)"},
+		{ID: "shipped", Bucket: "skip_shipped", Reason: "git_sha abc123"},
+		{ID: "dropped-shipped", Bucket: "dropped", Reason: "already-shipped-cycle-1679"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Dispositions =\n %+v\nwant\n %+v\n(a silent drop, a sha-less skip, a deferral and a commitment answer for nothing)", got, want)
+	}
+}
+
+func TestDispositions_TheMostSevereBucketWinsAndNothingIsFabricated(t *testing.T) {
+	ws := t.TempDir()
+	write(t, ws, DecisionFile, map[string]any{
+		"dropped":        []map[string]string{{"id": "twice", "reason": "already-shipped"}},
+		"escalate_block": []map[string]string{{"task_id": "twice", "reason": "fraudulent-commit:def456"}},
+	})
+	if got := Dispositions(ws); len(got) != 1 || got[0] != (Disposition{ID: "twice", Bucket: "escalate_block", Reason: "fraudulent-commit:def456"}) {
+		t.Fatalf("an id in two buckets is one disposition, the most severe bucket's: %+v", got)
+	}
+
+	if got := Dispositions(t.TempDir()); got != nil {
+		t.Fatalf("an absent decision answers for nothing: %+v", got)
+	}
+	bad := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bad, DecisionFile), []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := Dispositions(bad); got != nil {
+		t.Fatalf("a malformed decision answers for nothing: %+v", got)
+	}
+}
+
+func TestDispositionsFrom_ReadsTheDecisionBody(t *testing.T) {
+	got := DispositionsFrom([]byte(`{"dropped":[{"id":"x","reason":"superseded"}],"deferred":[{"id":"y"}]}`))
+	if len(got) != 1 || got[0] != (Disposition{ID: "x", Bucket: "dropped", Reason: "superseded"}) {
+		t.Fatalf("DispositionsFrom = %+v", got)
+	}
+	if got := DispositionsFrom([]byte("{not json")); got != nil {
+		t.Fatalf("a malformed body answers for nothing: %+v", got)
+	}
+}
+
+func TestDispositionsFrom_AWellFormedDecisionWithAMistypedFieldAnswersForNothing(t *testing.T) {
+	body := `{"escalate_block":[{"task_id":"a","reason":"r"}],"dropped":[{"id":"b","reason":7}]}`
+	if got := DispositionsFrom([]byte(body)); got != nil {
+		t.Fatalf("a decision that fails to decode answers for nothing, even for its well-typed buckets: %+v", got)
+	}
+}
+
+func TestDispositionsFrom_TrimsIDsEvidenceAndShas(t *testing.T) {
+	got := DispositionsFrom([]byte(`{
+		"escalate_block":[
+			{"task_id":" padded-reason ","reason":" console-routed ","fail_count":3},
+			{"task_id":"blank-reason","reason":"   "},
+			{"task_id":"negative-count","fail_count":-2}
+		],
+		"skip_rejected":[{"task_id":" rejected "}],
+		"skip_shipped":[{"task_id":"padded-sha","git_sha":" abc123 "},{"task_id":"blank-sha","git_sha":"  "}],
+		"dropped":[{"id":" dropped ","reason":"  superseded  "}]
+	}`))
+	want := []Disposition{
+		{ID: "padded-reason", Bucket: "escalate_block", Reason: "console-routed"},
+		{ID: "blank-reason", Bucket: "escalate_block", Reason: "escalated without a stated reason"},
+		{ID: "negative-count", Bucket: "escalate_block", Reason: "escalated without a stated reason"},
+		{ID: "rejected", Bucket: "skip_rejected", Reason: "triage reported an earlier rejection (inbox/rejected)"},
+		{ID: "padded-sha", Bucket: "skip_shipped", Reason: "git_sha abc123"},
+		{ID: "dropped", Bucket: "dropped", Reason: "superseded"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("DispositionsFrom =\n %+v\nwant\n %+v", got, want)
+	}
+}

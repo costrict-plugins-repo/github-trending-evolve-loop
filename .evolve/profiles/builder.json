@@ -1,0 +1,123 @@
+{
+  "name": "builder",
+  "role": "builder",
+  "cli": "codex-tmux",
+  "cli_fallback": [
+    "claude-tmux"
+  ],
+  "model_tier_default": "balanced",
+  "_model_tier_overrides_note": "cycle-974: removed inert 's_complex_with_cache'=fast (zero production consumers; was below envelope floor 'balanced'). deep overrides are within [balanced,deep].",
+  "model_tier_overrides": {
+    "ultrathink_strategy": "deep",
+    "m_complex_5plus_files": "deep",
+    "audit_retry_2plus": "deep"
+  },
+  "allowed_tools": [
+    "Read",
+    "Grep",
+    "Glob",
+    "Edit",
+    "Write",
+    "MultiEdit",
+    "NotebookEdit",
+    "Bash",
+    "Skill(code-review-simplify)",
+    "Skill(security-review-scored)",
+    "WebSearch",
+    "WebFetch",
+    "Bash(scripts/research/kb-search.sh:*)",
+    "Bash(evolve phase verify:*)"
+  ],
+  "disallowed_tools": [
+    "Edit(.evolve/state.json)",
+    "Edit(.evolve/ledger.jsonl)",
+    "Write(.evolve/state.json)",
+    "Write(.evolve/ledger.jsonl)",
+    "Bash(git push:*)",
+    "Bash(git config:*)",
+    "Bash(jq -i:*)",
+    "Bash(jq --in-place:*)",
+    "$include_policy:no-inline-script-exec",
+    "Edit(.evolve/runs/*/build-report.md:AC-TABLE)",
+    "Write(.evolve/runs/*/build-report.md:AC-TABLE)",
+    "Edit(acs/cycle-*/**)",
+    "Edit(acs/cycle-*)",
+    "Write(acs/cycle-*/**)",
+    "Write(acs/cycle-*)",
+    "Edit(acs/regression-suite/**)",
+    "Write(acs/regression-suite/**)",
+    "Edit(go/acs/**)",
+    "Write(go/acs/**)"
+  ],
+  "add_dir": [
+    "{worktree_path}"
+  ],
+  "max_budget_usd": 1.0,
+  "max_turns": 36,
+  "turn_budget_hint": 20,
+  "turn_budget_guidance": {
+    "target_turns": 15,
+    "checkpoint_at_turn": 15,
+    "hard_exit_at_turn": 18,
+    "checkpoint_note": "At turn 15: list remaining steps, estimate turns needed, defer anything that cannot fit in the remaining 10 turns. Never defer build-report.md write or worktree commit."
+  },
+  "output_artifact": ".evolve/runs/cycle-{cycle}/build-report.md",
+  "challenge_token_required": true,
+  "isolation": "worktree",
+  "settings_scope": "project",
+  "extra_flags_by_cli": {
+    "claude-tmux": [
+      "--strict-mcp-config",
+      "--exclude-dynamic-system-prompt-sections",
+      "--disable-slash-commands",
+      "--plugin-dir",
+      ".evolve/plugin"
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "write_subpaths": [
+      "{worktree_path}",
+      ".evolve/runs/cycle-*"
+    ],
+    "read_only_repo": true,
+    "deny_subpaths": [
+      ".git",
+      ".claude-plugin",
+      ".evolve/state.json",
+      ".evolve/cycle-state.json",
+      ".evolve/ledger.jsonl",
+      ".evolve/build-explanation-contracts",
+      ".evolve/profiles",
+      ".evolve/evals"
+    ],
+    "allow_network": true
+  },
+  "parallel_eligible": false,
+  "context_compact_trigger_turns": 15,
+  "context_clear_trigger_tokens": 30000,
+  "context_anchors": [
+    "scout-report.md:proposed_tasks",
+    "scout-report.md:acceptance_criteria"
+  ],
+  "model_tier_envelope": {
+    "min": "balanced",
+    "default": "balanced",
+    "max": "deep"
+  },
+  "cross_family_with": "auditor",
+  "allowed_clis": [
+    "agy",
+    "agy-claude",
+    "claude",
+    "codex"
+  ],
+  "_note": "Cross-CLI enabled (ADR-0022 realizer). The checked-in cli_routing table picks the chain: the builder builds on agy at balanced (Gemini 3.8 Flash High) and escalates to agy-owned Claude, then Claude Code (the operator's 2026-10-05 decision; agy and agy-claude admitted 2026-10-07). This profile's cli (codex-tmux) and cli_fallback (claude-tmux) are the legacy chain, read only by a project without a cli_routing table or under --bypass-policy. Per-CLI launch flags are realized from the manifest, and the tmux path runs the agent inside the cycle worktree (sandbox boundary) with bypass. CAVEAT: max_budget_usd is advisory for subscription CLIs (codex bills to its subscription, not the metered cost meter); turn-based limits (max_turns) and the artifact timeout remain the hard stops. Builder is safety-critical (writes code in the worktree).",
+  "research_quota": {
+    "web_search": 3,
+    "web_fetch": 5,
+    "kb_search": 20
+  },
+  "stream_output": true,
+  "generated_from": "hand-authored"
+}

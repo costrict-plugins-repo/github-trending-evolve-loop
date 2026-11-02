@@ -1,0 +1,139 @@
+//go:build e2e
+
+package main
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+)
+
+func envDurationSeconds(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return def
+}
+
+var tmuxCLIs = []string{"claude-tmux", "codex-tmux", "agy-tmux"}
+
+func TestE2ECycleTmuxMatrix(t *testing.T) {
+	t.Parallel()
+	t.Skip("legacy ship-script hatch removed (Stage 5.1); native tmux-matrix e2e pending port to go/test/e2e/ — see PORTING-LEDGER.md")
+	if testing.Short() {
+		t.Skip("E2E test; skipped in -short mode")
+	}
+	for _, bin := range []string{"git", "bash", "tmux"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("required tool %q not on PATH; skipping tmux E2E", bin)
+		}
+	}
+
+	repoRoot := mustRepoRoot(t)
+	binDir := t.TempDir()
+	evolveBin := buildBinary(t, binDir, "evolve", "./cmd/evolve", repoRoot)
+	fakeBin := buildBinary(t, binDir, "evolve-fake-cli", "./cmd/evolve-fake-cli", repoRoot)
+
+	for _, cli := range tmuxCLIs {
+		cli := cli
+		t.Run("offline_"+cli, func(t *testing.T) {
+			runOneTmuxCycle(t, tmuxCycleConfig{
+				CLI: cli, EvolveBin: evolveBin, FakeBin: fakeBin, RepoRoot: repoRoot, Live: false,
+			})
+		})
+	}
+
+	if os.Getenv("EVOLVE_E2E_LIVE") != "1" {
+		t.Logf("EVOLVE_E2E_LIVE not set; skipping live tmux sub-tests. Set EVOLVE_E2E_LIVE=1 to run.")
+		return
+	}
+	for _, cli := range tmuxCLIs {
+		cli := cli
+		t.Run("live_"+cli, func(t *testing.T) {
+			runOneTmuxCycle(t, tmuxCycleConfig{
+				CLI: cli, EvolveBin: evolveBin, FakeBin: fakeBin, RepoRoot: repoRoot, Live: true,
+			})
+		})
+	}
+}
+
+type tmuxCycleConfig struct {
+	CLI       string
+	EvolveBin string
+	FakeBin   string
+	RepoRoot  string
+	Live      bool
+}
+
+func runOneTmuxCycle(t *testing.T, cfg tmuxCycleConfig) {
+	t.Helper()
+	projRoot := setupTempProject(t, cfg.RepoRoot)
+	shipScript := writeFakeShipScript(t, projRoot)
+	fakeHome := t.TempDir()
+
+	env := append(os.Environ(),
+		"EVOLVE_CLI="+cfg.CLI,
+		"EVOLVE_SHIP_SCRIPT="+shipScript,
+		"EVOLVE_NATIVE_SHIP=0",
+		"EVOLVE_RESEARCH_HOOK_DISABLED=1",
+		"EVOLVE_CODEX_CONFIG_PATH="+filepath.Join(fakeHome, ".codex", "config.toml"),
+		"HOME="+fakeHome,
+	)
+	if !cfg.Live {
+		env = append(env, fakeCLIsFirstOnPath(t, cfg.FakeBin, "claude", "codex", "agy"))
+	} else if _, err := exec.LookPath(liveBinaryName(cfg.CLI)); err != nil {
+		t.Skipf("live mode: %s binary not on PATH (%v); skipping", cfg.CLI, err)
+	}
+
+	args := []string{"cycle", "run",
+		"--project-root", projRoot,
+		"--goal-hash", "e2etmux" + cfg.CLI,
+		"--evolve-dir", filepath.Join(projRoot, ".evolve"),
+	}
+	if cfg.Live {
+		args = append(args, "--budget-usd", "0.50")
+	}
+
+	cmd := exec.Command(cfg.EvolveBin, args...)
+	cmd.Env = env
+	cmd.Dir = projRoot
+
+	timeout := envDurationSeconds("EVOLVE_E2E_TMUX_TIMEOUT_S", 7*time.Minute)
+	if cfg.Live {
+		timeout = envDurationSeconds("EVOLVE_E2E_TMUX_LIVE_TIMEOUT_S", 12*time.Minute)
+	}
+	out, err := runWithTimeout(cmd, timeout)
+	if err != nil {
+		t.Logf("--- combined output ---\n%s", out)
+		dumpWorkspaceLogs(t, projRoot)
+		t.Fatalf("evolve cycle run (%s) failed: %v", cfg.CLI, err)
+	}
+
+	entries := readLedger(t, projRoot)
+	if len(entries) == 0 {
+		dumpWorkspaceLogs(t, projRoot)
+		t.Fatalf("ledger is empty; cycle output:\n%s", out)
+	}
+	for _, want := range expectedPhasesHappyPath {
+		if !ledgerHasRole(entries, want) {
+			dumpWorkspaceLogs(t, projRoot)
+			t.Errorf("ledger missing role=%q\nfull ledger roles: %v\noutput:\n%s", want, ledgerRoles(entries), out)
+		}
+	}
+	if state := readState(t, projRoot); state.LastCycleNumber < 1 {
+		t.Errorf("state.json:lastCycleNumber=%d, want >=1", state.LastCycleNumber)
+	}
+	logOut, err := exec.Command("git", "-C", projRoot, "log", "--format=%s", "-1").Output()
+	if err != nil {
+		t.Fatalf("git log: %v", err)
+	}
+	if !strings.Contains(string(logOut), "e2etmux") {
+		t.Errorf("git log missing e2etmux ship commit; got %q", string(logOut))
+	}
+}

@@ -1,0 +1,356 @@
+package bridge
+
+import (
+	"cmp"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+	"github.com/mickeyyaya/evolve-loop/go/internal/policy"
+)
+
+func (e *Engine) LaunchArgs(ctx context.Context, args []string, env map[string]string, stdout, stderr io.Writer) int {
+	raw, err := parseLaunchArgs(args, env)
+	if err != nil {
+		fmt.Fprintf(stderr, "[bridge] launch: %v\n", err)
+		return ExitBadFlags
+	}
+
+	missing := raw.missingRequired()
+	if len(missing) > 0 {
+		fmt.Fprintf(stderr, "[bridge] launch: missing required (flag or env): %s\n", strings.Join(missing, " "))
+		return ExitBadFlags
+	}
+
+	prof, err := LoadProfile(raw.profile)
+	if err != nil {
+		fmt.Fprintf(stderr, "[bridge] %v\n", err)
+		return ExitBadFlags
+	}
+
+	promptData, err := os.ReadFile(raw.promptFile)
+	if err != nil {
+		fmt.Fprintf(stderr, "[bridge] launch: prompt file not readable: %s\n", raw.promptFile)
+		return ExitBadFlags
+	}
+	if len(promptData) == 0 {
+		fmt.Fprintf(stderr, "[bridge] launch: prompt file is empty: %s\n", raw.promptFile)
+		fmt.Fprintln(stderr, "[bridge] (an empty prompt would hang the agent at the artifact timeout)")
+		return ExitBadFlags
+	}
+
+	if raw.humanReason != "" && !raw.dryRun && !raw.validateOnly {
+		if err := e.deps.auditBypass("human-input", raw.humanReason); err != nil {
+			fmt.Fprintf(stderr, "[bridge] launch: %v\n", err)
+			return ExitSafetyGate
+		}
+	}
+
+	effectiveModel := raw.model
+	if effectiveModel == "auto" && prof.Model != "" {
+		effectiveModel = prof.Model
+	}
+
+	if raw.effort != "" {
+		if err := policy.ValidateEffort(raw.effort); err != nil {
+			fmt.Fprintf(stderr, "[bridge] invalid --effort value: %v\n", err)
+			return ExitBadFlags
+		}
+	}
+
+	permMode := raw.permissionMode
+	if permMode == "" {
+		permMode = prof.PermissionMode
+	}
+	if !validPermissionModes[permMode] {
+		fmt.Fprintf(stderr, "[bridge] invalid --permission-mode value: '%s'\n", permMode)
+		fmt.Fprintln(stderr, "[bridge] valid: plan, default, acceptEdits, bypassPermissions, auto, dontAsk")
+		return ExitBadFlags
+	}
+
+	streamOut := prof.StreamOutput
+	switch raw.streamOutput {
+	case "":
+	case "true", "1", "yes", "on":
+		streamOut = true
+	case "false", "0", "no", "off":
+		streamOut = false
+	default:
+		fmt.Fprintf(stderr, "[bridge] invalid --stream-output value: '%s' — must be boolean\n", raw.streamOutput)
+		return ExitBadFlags
+	}
+
+	sessionName := raw.sessionName
+	if sessionName == "" {
+		sessionName = prof.SessionName
+	}
+	if sessionName != "" {
+		if len(sessionName) > 32 || !sessionNameRE.MatchString(sessionName) {
+			fmt.Fprintf(stderr, "[bridge] invalid --session-name '%s' — must match [a-zA-Z0-9._-]+ (max 32)\n", sessionName)
+			return ExitBadFlags
+		}
+	}
+
+	cycle := 0
+	if raw.cycle != "" {
+		cycle, _ = strconv.Atoi(raw.cycle)
+	}
+
+	artifactTimeoutS := 0
+	if raw.artifactTimeoutS != "" {
+		if n, err := strconv.Atoi(raw.artifactTimeoutS); err == nil && n > 0 {
+			artifactTimeoutS = n
+		}
+	}
+
+	cfg := Config{
+		CLI:                raw.cli,
+		Profile:            raw.profile,
+		Model:              effectiveModel,
+		Effort:             raw.effort,
+		PromptFile:         raw.promptFile,
+		Workspace:          raw.workspace,
+		StdoutLog:          raw.stdoutLog,
+		StderrLog:          raw.stderrLog,
+		Artifact:           raw.artifact,
+		SecondaryArtifacts: splitNonEmptyCSV(raw.secondaryArtifacts),
+		Completion:         core.CompletionContract(raw.completion),
+		Cycle:              cycle,
+		Worktree:           raw.worktree,
+		RunID:              raw.runID,
+		ProjectRoot:        raw.projectRoot,
+		Agent:              raw.agent,
+		PermissionMode:     permMode,
+		StreamOutput:       streamOut,
+		SessionName:        sessionName,
+		AllowBypass:        raw.allowBypass,
+		HumanInput:         raw.humanReason != "",
+		RequireFull:        raw.requireFull,
+		RequireSandbox:     raw.requireSandbox,
+		AllowedTools:       prof.AllowedTools,
+		ExtraFlags:         raw.extra,
+		AnthropicBaseURL:   raw.anthropicBaseURL,
+		ArtifactTimeoutS:   artifactTimeoutS,
+	}
+	intent := launchIntentFor(&cfg, prof, e.deps.Efforts)
+	cfg.Realization = RealizeFor(raw.cli, intent)
+	observeLaunchEffort(e.deps, intent.Effort)
+	if prof.Sandbox != nil {
+		cfg.AllowNetwork = prof.Sandbox.AllowNetwork
+		if prof.Sandbox.Enabled {
+			cfg.RequireSandbox = true
+			cfg.SandboxWriteSubpaths = prof.Sandbox.WriteSubpaths
+			cfg.DenyPaths, err = resolveSandboxDenials(prof.Sandbox.DenySubpaths, cfg.ProjectRoot, cfg.Worktree, true)
+			if err == nil {
+				cfg.DenyReadPaths, err = resolveSandboxDenials(prof.Sandbox.DenyReadSubpaths, cfg.ProjectRoot, cfg.Worktree, false)
+			}
+			if err != nil {
+				fmt.Fprintf(stderr, "[bridge] invalid sandbox policy: %v\n", err)
+				return ExitBadFlags
+			}
+		}
+	}
+
+	if raw.validateOnly {
+		printResolvedConfig(stdout, &cfg, prof)
+		return ExitOK
+	}
+	if raw.dryRun {
+		return e.runDryRun(&cfg, stdout, stderr)
+	}
+	if raw.requireFull {
+		if rc, blocked := e.requireFullCheck(&cfg, stderr); blocked {
+			return rc
+		}
+	}
+
+	driver, ok := LookupDriver(cfg.CLI)
+	if !ok {
+		fmt.Fprintf(stderr, "[bridge] no driver for cli=%s\n", cfg.CLI)
+		return ExitBadFlags
+	}
+
+	d := e.deps
+	d.Stdout = stdout
+	d.Stderr = stderr
+
+	if pf, ok := driver.(CLIPreflight); ok {
+		if err := pf.Preflight(ctx, &cfg, d); err != nil {
+			fmt.Fprintf(stderr, "[bridge] %s preflight: %v (continuing — best-effort)\n", cfg.CLI, err)
+		}
+	}
+
+	rc, err := launchSwept(ctx, driver, &cfg, d)
+	if err != nil {
+		fmt.Fprintf(stderr, "[bridge] %v\n", err)
+		if rc == 0 {
+			rc = ExitBadFlags
+		}
+	}
+	return rc
+}
+
+const secondaryArtifactSep = "\x1f"
+
+func splitNonEmptyCSV(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, secondaryArtifactSep) {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+type rawLaunch struct {
+	cli, profile, model, promptFile, workspace, stdoutLog, stderrLog, artifact string
+	cycle, worktree, projectRoot, agent, completion, effort                    string
+	permissionMode, sessionName, streamOutput, runID                           string
+	anthropicBaseURL, artifactTimeoutS, secondaryArtifacts, humanReason        string
+	validateOnly, dryRun, requireFull, requireSandbox, allowBypass             bool
+	extra                                                                      []string
+}
+
+func (r rawLaunch) missingRequired() []string {
+	var m []string
+	check := func(v, label string) {
+		if v == "" {
+			m = append(m, label)
+		}
+	}
+	check(r.cli, "--cli/BRIDGE_CLI")
+	check(r.profile, "--profile/PROFILE_PATH")
+	check(r.model, "--model/RESOLVED_MODEL")
+	check(r.promptFile, "--prompt-file/PROMPT_FILE")
+	check(r.workspace, "--workspace/WORKSPACE_PATH")
+	check(r.stdoutLog, "--stdout-log/STDOUT_LOG")
+	check(r.stderrLog, "--stderr-log/STDERR_LOG")
+	check(r.artifact, "--artifact/ARTIFACT_PATH")
+	return m
+}
+
+const paneAuthorityFile = "pane-authority.md"
+
+func launchIntentFor(cfg *Config, prof Profile, efforts policy.EffortTable) LaunchIntent {
+	intent := LaunchIntent{
+		ModelTier:       cfg.Model,
+		Permission:      permissionIntent(cfg.PermissionMode),
+		SessionMode:     "ephemeral",
+		Effort:          cmp.Or(cfg.Effort, LaunchEffort(cfg.CLI, cfg.Model, efforts, prof.Name)),
+		AllowedTools:    prof.AllowedTools,
+		DisallowedTools: prof.DisallowedTools,
+		SettingsScope:   prof.SettingsScope,
+		RawByCLI:        prof.ExtraFlagsByCLI,
+	}
+	intent.LadderEffort = cfg.Effort
+	if cfg.SessionName != "" {
+		intent.SessionMode = "named:" + cfg.SessionName
+	}
+	if cfg.Agent != "" {
+		intent.SystemPromptFile = filepath.Join(cfg.Workspace, paneAuthorityFile)
+	}
+	return intent
+}
+
+func parseLaunchArgs(args []string, env map[string]string) (rawLaunch, error) {
+	get := func(k string) string {
+		if env == nil {
+			return ""
+		}
+		return env[k]
+	}
+	truthy := func(v string) bool {
+		switch v {
+		case "1", "true", "yes", "on":
+			return true
+		}
+		return false
+	}
+
+	r := rawLaunch{
+		cli:            get("BRIDGE_CLI"),
+		profile:        get("PROFILE_PATH"),
+		model:          get("RESOLVED_MODEL"),
+		promptFile:     get("PROMPT_FILE"),
+		workspace:      get("WORKSPACE_PATH"),
+		stdoutLog:      get("STDOUT_LOG"),
+		stderrLog:      get("STDERR_LOG"),
+		artifact:       get("ARTIFACT_PATH"),
+		cycle:          get("CYCLE"),
+		worktree:       get("WORKTREE_PATH"),
+		projectRoot:    get("PROJECT_ROOT"),
+		runID:          get("BRIDGE_RUN_ID"),
+		agent:          get("AGENT"),
+		completion:     get("BRIDGE_COMPLETION"),
+		permissionMode: get("BRIDGE_PERMISSION_MODE"),
+		sessionName:    get("BRIDGE_SESSION_NAME"),
+		streamOutput:   get("BRIDGE_STREAM_OUTPUT"),
+		requireFull:    truthy(get("BRIDGE_REQUIRE_FULL")),
+		requireSandbox: truthy(get("BRIDGE_REQUIRE_SANDBOX")),
+		validateOnly:   truthy(get("VALIDATE_ONLY")),
+	}
+
+	stringDest := map[string]*string{
+		"--cli": &r.cli, "--profile": &r.profile, "--model": &r.model, "--effort": &r.effort,
+		"--prompt-file": &r.promptFile, "--workspace": &r.workspace,
+		"--stdout-log": &r.stdoutLog, "--stderr-log": &r.stderrLog,
+		"--artifact": &r.artifact, "--secondary-artifacts": &r.secondaryArtifacts, "--cycle": &r.cycle, "--worktree": &r.worktree,
+		"--project-root": &r.projectRoot, "--run-id": &r.runID,
+		"--agent": &r.agent, "--permission-mode": &r.permissionMode,
+		"--session-name": &r.sessionName, "--completion": &r.completion,
+		"--anthropic-base-url": &r.anthropicBaseURL,
+		"--artifact-timeout-s": &r.artifactTimeoutS,
+		"--human-input":        &r.humanReason,
+	}
+
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--":
+			r.extra = append(r.extra, args[i+1:]...)
+			return r, nil
+		case a == "--validate-only":
+			r.validateOnly = true
+		case a == "--dry-run":
+			r.dryRun = true
+		case a == "--require-full":
+			r.requireFull = true
+		case a == "--require-sandbox":
+			r.requireSandbox = true
+		case a == "--allow-bypass":
+			r.allowBypass = true
+		case a == "--human-input":
+			return r, errors.New("--human-input needs a reason: pass --human-input=<why>")
+		case a == "--stream-output":
+			r.streamOutput = "true"
+		case a == "--no-stream-output":
+			r.streamOutput = "false"
+		case strings.HasPrefix(a, "--") && strings.Contains(a, "="):
+			key, val, _ := strings.Cut(a, "=")
+			dst, ok := stringDest[key]
+			if !ok {
+				return r, fmt.Errorf("unknown flag: %s", key)
+			}
+			*dst = val
+		case strings.HasPrefix(a, "--"):
+			dst, ok := stringDest[a]
+			if !ok {
+				return r, fmt.Errorf("unknown flag: %s", a)
+			}
+			if i+1 >= len(args) {
+				return r, fmt.Errorf("%s requires a value", a)
+			}
+			*dst = args[i+1]
+			i++
+		default:
+			return r, fmt.Errorf("unexpected argument: %s", a)
+		}
+	}
+	return r, nil
+}

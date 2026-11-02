@@ -1,0 +1,149 @@
+package bridge
+
+import (
+	"bytes"
+	"context"
+	"strings"
+	"testing"
+)
+
+func mapLookup(m map[string]string) func(string) (string, bool) {
+	return func(k string) (string, bool) {
+		v, ok := m[k]
+		return v, ok
+	}
+}
+
+func runLookup(t *testing.T, fr *fakeRunner, args []string, lookup map[string]string) (int, string) {
+	t.Helper()
+	return runLookupWith(t, Deps{Runner: fr.runner(), LookupEnv: mapLookup(lookup)}, args)
+}
+
+func runLookupWith(t *testing.T, deps Deps, args []string) (int, string) {
+	t.Helper()
+	eng := NewEngine(deps)
+	var stdout, stderr bytes.Buffer
+	code := eng.LaunchArgs(context.Background(), args, nil, &stdout, &stderr)
+	return code, stderr.String()
+}
+
+func codexArgs(fx launchFixture, model string) []string {
+	return []string{
+		"--cli=codex",
+		"--profile=" + fx.profile,
+		"--model=" + model,
+		"--prompt-file=" + fx.promptFile,
+		"--workspace=" + fx.ws,
+		"--stdout-log=" + fx.stdoutLog,
+		"--stderr-log=" + fx.stderrLog,
+		"--artifact=" + fx.artifact,
+	}
+}
+
+func TestLaunchArgs_ClaudeP_AnthropicAPIKey_CostLeak(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t, "claude-p", "")
+	fr := &fakeRunner{}
+	code, stderr := runLookup(t, fr, fx.args("claude-p"), map[string]string{"ANTHROPIC_API_KEY": "sk-test"})
+	if code != ExitCostLeak {
+		t.Fatalf("exit = %d, want %d (ExitCostLeak)", code, ExitCostLeak)
+	}
+	if !strings.Contains(stderr, "ANTHROPIC_API_KEY") {
+		t.Fatalf("stderr should name ANTHROPIC_API_KEY; got %q", stderr)
+	}
+	if len(fr.calls) != 0 {
+		t.Fatalf("driver must NOT invoke the inner CLI when a credential leak is detected")
+	}
+}
+
+func TestLaunchArgs_ClaudeP_AnthropicBaseURL_CostLeak(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t, "claude-p", "")
+	fr := &fakeRunner{}
+	code, stderr := runLookup(t, fr, fx.args("claude-p"), map[string]string{"ANTHROPIC_BASE_URL": "http://127.0.0.1:4000"})
+	if code != ExitCostLeak {
+		t.Fatalf("exit = %d, want ExitCostLeak", code)
+	}
+	if !strings.Contains(stderr, "ANTHROPIC_BASE_URL") {
+		t.Fatalf("stderr should name ANTHROPIC_BASE_URL; got %q", stderr)
+	}
+}
+
+func TestLaunchArgs_ClaudeP_AnthropicBaseURL_AllowedProceeds(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t, "claude-p", "")
+	fr := &fakeRunner{writeArtifactPath: fx.artifact, writeArtifactBody: "ok"}
+	code, _ := runLookupWith(t, Deps{Runner: fr.runner(), AllowAnthropicBaseURL: true, LookupEnv: mapLookup(map[string]string{
+		"ANTHROPIC_BASE_URL": "http://127.0.0.1:4000",
+	})}, fx.args("claude-p"))
+	if code != ExitOK {
+		t.Fatalf("exit = %d, want ExitOK (guard waived)", code)
+	}
+	if len(fr.calls) == 0 {
+		t.Fatalf("driver should have invoked the inner CLI")
+	}
+}
+
+func TestLaunchArgs_Codex_OpenAIKey_CostLeak(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t, "codex", "")
+	fr := &fakeRunner{}
+	code, stderr := runLookup(t, fr, fx.args("codex"), map[string]string{"OPENAI_API_KEY": "sk-x"})
+	if code != ExitCostLeak {
+		t.Fatalf("exit = %d, want ExitCostLeak", code)
+	}
+	if !strings.Contains(stderr, "OPENAI_API_KEY") {
+		t.Fatalf("stderr should name OPENAI_API_KEY; got %q", stderr)
+	}
+}
+
+func TestLaunchArgs_Codex_OpenAIKey_AllowedProceeds(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t, "codex", "")
+	fr := &fakeRunner{writeArtifactPath: fx.artifact, writeArtifactBody: "ok"}
+	code, _ := runLookupWith(t, Deps{Runner: fr.runner(), AllowOpenAIAPIKey: true, LookupEnv: mapLookup(map[string]string{
+		"OPENAI_API_KEY": "sk-x",
+	})}, fx.args("codex"))
+	if code != ExitOK {
+		t.Fatalf("exit = %d, want ExitOK (guard waived)", code)
+	}
+}
+
+func TestLaunchArgs_Codex_ModelMap(t *testing.T) {
+	t.Parallel()
+	fam := codexFamilyManifest(t)
+	cases := []struct {
+		tier, codexModel string
+	}{
+		{"haiku", fam.ModelTierMap["fast"]},
+		{"sonnet", fam.ModelTierMap["balanced"]},
+		{"opus", fam.ModelTierMap["deep"]},
+	}
+	for _, tc := range cases {
+		t.Run(tc.tier, func(t *testing.T) {
+			fx := newFixture(t, "codex", "")
+			fr := &fakeRunner{writeArtifactPath: fx.artifact, writeArtifactBody: "ok"}
+			code, _ := runLookup(t, fr, codexArgs(fx, tc.tier), nil)
+			if code != ExitOK {
+				t.Fatalf("exit = %d, want ExitOK", code)
+			}
+			if !fr.argvContainsPair("-m", tc.codexModel) {
+				t.Fatalf("codex argv should map %s → -m %s; calls=%+v", tc.tier, tc.codexModel, fr.calls)
+			}
+			if !fr.argvContainsPair("-c", "model_reasoning_effort=high") {
+				t.Fatalf("codex argv must carry -c model_reasoning_effort=high; calls=%+v", fr.calls)
+			}
+			var effortTokens int
+			for _, call := range fr.calls {
+				for _, a := range call.args {
+					if strings.Contains(a, "model_reasoning_effort=") {
+						effortTokens++
+					}
+				}
+			}
+			if effortTokens != 1 {
+				t.Fatalf("exactly ONE effort override expected in argv, got %d; calls=%+v", effortTokens, fr.calls)
+			}
+		})
+	}
+}

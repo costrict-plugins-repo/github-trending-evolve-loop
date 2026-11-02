@@ -1,0 +1,203 @@
+package core
+
+import (
+	"bytes"
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/dossier"
+)
+
+const systemFailureKey = "system_failure"
+
+func closeoutRun(t *testing.T, cycle int, fixture string) (*cycleRun, string) {
+	t.Helper()
+	root := initDossierRepo(t)
+	var ws string
+	if fixture == "" {
+		ws = t.TempDir()
+	} else {
+		ws = realCycleWorkspace(t, fixture)
+	}
+	o := &Orchestrator{storage: &fakeUpdaterStorage{}, gitHEAD: func() (string, error) { return "same-head", nil }}
+	cr := &cycleRun{
+		ctx:    context.Background(),
+		o:      o,
+		cycle:  cycle,
+		req:    CycleRequest{ProjectRoot: root, GoalHash: "lost-ship-dossier-evidence", Context: map[string]string{"goal": "durable closeout evidence for a raced landing"}},
+		cs:     CycleState{WorkspacePath: ws, RunID: "run-" + fixture},
+		result: CycleResult{Cycle: cycle, FinalVerdict: VerdictPASS, PhasesRun: []Phase{PhaseBuild, PhaseAudit, PhaseShip}},
+	}
+	return cr, root
+}
+
+func systemFailureBlock(t *testing.T, m map[string]any) map[string]any {
+	t.Helper()
+	sf, ok := m[systemFailureKey].(map[string]any)
+	if !ok {
+		t.Fatalf("RED: dossier carries no %q object; top-level keys=%v", systemFailureKey, dossierTopLevelKeys(m))
+	}
+	return sf
+}
+
+func TestDossierSystemFailure_LostLandingReachesTheCommittedDossier(t *testing.T) {
+	t.Parallel()
+
+	cr, root := closeoutRun(t, 1535, "cycle-1535")
+	if err := cr.completeCycle(); err != nil {
+		t.Fatalf("completeCycle: %v", err)
+	}
+	sig := cr.result.SystemFailure
+	if sig == nil || sig.Category != "landing-lost" {
+		t.Fatalf("precondition: finalizeCycle must record the landing-lost signal on the result; got %+v", sig)
+	}
+
+	m, md := readDossierPair(t, root, 1535)
+	if got := m["final_verdict"]; got != dossier.VerdictWarn {
+		t.Errorf("final_verdict = %v, want %q (the verdict routing must not change — only evidence is added)", got, dossier.VerdictWarn)
+	}
+	sf := systemFailureBlock(t, m)
+	if got := sf["category"]; got != "landing-lost" {
+		t.Errorf("%s.category = %v, want %q", systemFailureKey, got, "landing-lost")
+	}
+	evidence, _ := sf["evidence"].(string)
+	if evidence != sig.Evidence {
+		t.Errorf("%s.evidence must be the floor's evidence VERBATIM\n got: %q\nwant: %q", systemFailureKey, evidence, sig.Evidence)
+	}
+	if !strings.Contains(evidence, "GIT_FLEET_REBASE_NEEDED") {
+		t.Errorf("%s.evidence must name the ship-error code an operator has to act on; got %q", systemFailureKey, evidence)
+	}
+	for _, want := range []string{"landing-lost", "GIT_FLEET_REBASE_NEEDED"} {
+		if !strings.Contains(md, want) {
+			t.Errorf("dossier md must carry %q; got:\n%s", want, md)
+		}
+	}
+	jb, err := os.ReadFile(filepath.Join(root, "knowledge-base", "cycles", "cycle-1535.json"))
+	if err != nil {
+		t.Fatalf("read dossier: %v", err)
+	}
+	d, err := dossier.ParseJSON(jb)
+	if err != nil {
+		t.Fatalf("ParseJSON: %v", err)
+	}
+	if err := d.Validate(); err != nil {
+		t.Errorf("a landing-lost dossier must stay valid: %v", err)
+	}
+}
+
+func TestDossierSystemFailure_LandedSiblingCarriesNone(t *testing.T) {
+	t.Parallel()
+
+	cr, root := closeoutRun(t, 1536, "cycle-1536")
+	cr.cs.Shipped = true
+	if err := cr.completeCycle(); err != nil {
+		t.Fatalf("completeCycle: %v", err)
+	}
+	if cr.result.SystemFailure != nil {
+		t.Fatalf("precondition: the landed sibling must not be flagged by the floor; got %+v", cr.result.SystemFailure)
+	}
+	m, md := readDossierPair(t, root, 1536)
+	if got := m["final_verdict"]; got != dossier.VerdictPass {
+		t.Errorf("final_verdict = %v, want %q", got, dossier.VerdictPass)
+	}
+	if got, _ := m["commit_sha"].(string); !strings.HasPrefix(got, "adcbddb2") {
+		t.Errorf("commit_sha = %q, want the binding's adcbddb2… (proves the real 1536 workspace was projected)", got)
+	}
+	if v, present := m[systemFailureKey]; present {
+		t.Errorf("a landed cycle must carry no %q object; got %v", systemFailureKey, v)
+	}
+	for _, leak := range []string{"landing-lost", "GIT_FLEET_REBASE_NEEDED"} {
+		if strings.Contains(md, leak) {
+			t.Errorf("landed sibling's md leaks %q — the transient error it survived is not evidence of a lost landing:\n%s", leak, md)
+		}
+	}
+}
+
+func goldenPassDossierParams(projectRoot string) cycleDossierParams {
+	return cycleDossierParams{
+		ProjectRoot:   projectRoot,
+		WorkspacePath: "/nonexistent/workspace/for/golden-pass",
+		Cycle:         4243,
+		Goal:          "fixed goal text for the ordinary-PASS byte-clean pin",
+		RunID:         "01JFIXEDRUNIDFORGOLDEN01",
+		Outcome:       CycleOutcomeShippedViaBuild,
+		PhaseTimings: []phaseTimingEntry{
+			{Phase: "scout", DurationMS: 1200, Verdict: VerdictPASS, StartedAt: "2026-09-14T00:00:00Z", EndedAt: "2026-09-14T00:00:01.2Z", AttemptCount: 1, ResolvedModel: "gpt-5.6-terra", ModelSource: "profile"},
+			{Phase: "build", DurationMS: 30000, Verdict: VerdictPASS, StartedAt: "2026-09-14T00:00:02Z", EndedAt: "2026-09-14T00:00:32Z", AttemptCount: 1},
+			{Phase: "ship", DurationMS: 4000, Verdict: VerdictPASS, StartedAt: "2026-09-14T00:00:33Z", EndedAt: "2026-09-14T00:00:37Z", AttemptCount: 1},
+		},
+	}
+}
+
+func TestDossierSystemFailure_OrdinaryPassStaysByteClean(t *testing.T) {
+	t.Parallel()
+
+	root := initDossierRepo(t)
+	if err := writeCycleDossier(nil, goldenPassDossierParams(root)); err != nil {
+		t.Fatalf("writeCycleDossier: %v", err)
+	}
+	dir := filepath.Join(root, "knowledge-base", "cycles")
+	for _, tc := range []struct{ got, golden string }{
+		{"cycle-4243.json", "cycle-4243.golden.json"},
+		{"cycle-4243.md", "cycle-4243.golden.md"},
+	} {
+		got, err := os.ReadFile(filepath.Join(dir, tc.got))
+		if err != nil {
+			t.Fatalf("%s not written: %v", tc.got, err)
+		}
+		if want := readGolden(t, tc.golden); !bytes.Equal(got, want) {
+			t.Errorf("RED: ordinary PASS %s is no longer byte-clean (a nil signal must add NOTHING to the record)\n--- got ---\n%s\n--- want ---\n%s", tc.got, got, want)
+		}
+		if bytes.Contains(got, []byte(systemFailureKey)) || bytes.Contains(got, []byte("landing-lost")) {
+			t.Errorf("RED: ordinary PASS %s mentions a system failure it never had:\n%s", tc.got, got)
+		}
+	}
+}
+
+func TestDossierSystemFailure_AbnormalEpilogueThreadsTheSignal(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		signal *SystemFailureSignal
+	}{
+		{"stamped-signal-reaches-the-abnormal-dossier", detectLostLanding(graded(realCycleWorkspace(t, "cycle-1535"), 1535, VerdictPASS))},
+		{"no-signal-fabricates-nothing", nil},
+	}
+	if cases[0].signal == nil {
+		t.Fatalf("precondition: the floor must produce a signal for the 1535 artifacts")
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cr, root := epilogueRun(t, false)
+			cr.result.SystemFailure = tc.signal
+			cr.abnormalEpilogue(nil)
+			m, md := readDossierPair(t, root, 77)
+			if got := m["final_verdict"]; got != dossier.VerdictFail {
+				t.Errorf("abnormal exit final_verdict = %v, want %q", got, dossier.VerdictFail)
+			}
+			if tc.signal == nil {
+				if v, present := m[systemFailureKey]; present {
+					t.Errorf("no signal on the result ⇒ no %q object; got %v", systemFailureKey, v)
+				}
+				if strings.Contains(md, "landing-lost") {
+					t.Errorf("no signal on the result ⇒ no landing-lost text in md:\n%s", md)
+				}
+				return
+			}
+			sf := systemFailureBlock(t, m)
+			if got := sf["category"]; got != tc.signal.Category {
+				t.Errorf("%s.category = %v, want %q", systemFailureKey, got, tc.signal.Category)
+			}
+			if got, _ := sf["evidence"].(string); got != tc.signal.Evidence {
+				t.Errorf("%s.evidence must be the stamped signal's evidence VERBATIM\n got: %q\nwant: %q", systemFailureKey, got, tc.signal.Evidence)
+			}
+			if !strings.Contains(md, tc.signal.Category) {
+				t.Errorf("abnormal dossier md must carry the category %q:\n%s", tc.signal.Category, md)
+			}
+		})
+	}
+}

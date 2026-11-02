@@ -1,0 +1,33 @@
+{
+  "name": "evo",
+  "owner": {
+    "name": "Dan Lee"
+  },
+  "metadata": {
+    "description": "Self-evolving development pipeline with eval gating, continuous learning, and loop monitoring. 4 agents across 5 phases to autonomously discover, build, audit, and ship improvements."
+  },
+  "plugins": [
+    {
+      "name": "evo",
+      "source": "./",
+      "description": "3 lean agents across 6 phases with compound discovery loop, proactive research, and strict evaluation — RESEARCH, DISCOVER, BUILD, AUDIT, SHIP, LEARN",
+      "version": "23.0.0",
+      "author": {
+        "name": "Dan Lee"
+      },
+      "homepage": "https://github.com/mickeyyaya/evolve-loop",
+      "repository": "https://github.com/mickeyyaya/evolve-loop",
+      "license": "Apache-2.0",
+      "category": "workflow",
+      "tags": [
+        "agents",
+        "skills",
+        "autonomous",
+        "pipeline",
+        "eval",
+        "self-evolving"
+      ],
+      "strict": false
+    }
+  ]
+}

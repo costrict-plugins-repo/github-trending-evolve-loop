@@ -1,0 +1,39 @@
+{
+  "name": "context-condense",
+  "archetype": "control",
+  "agent": "evolve-context-condense",
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/scout-report.md"
+    ],
+    "signals": [
+      "run_dir.artifact_bytes"
+    ]
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/context-condense-report.md"
+    ],
+    "signals": [
+      "condense.ratio"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Artifacts Scanned",
+      "Condensed Digest",
+      "Verdict"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "run_dir.artifact_bytes",
+        "op": "gt",
+        "value": 102400
+      }
+    ]
+  },
+  "after": "triage",
+  "optional": true
+}

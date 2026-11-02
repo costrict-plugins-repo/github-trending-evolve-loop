@@ -1,0 +1,28 @@
+# Git attributes for evolve-loop.
+#
+# export-ignore is honored by `git archive` (when producing tarballs from
+# git). It tells `git archive` to exclude matching paths from the generated
+# archive. This is the standard mechanism for "track in repo, exclude from
+# distribution tarballs".
+#
+# Note: Claude Code's plugin installer does NOT currently use `git archive` —
+# it clones the source repo and applies a separate hardcoded filter — so
+# these directives here may be no-ops for /plugin install. We declare them
+# anyway because:
+#   1. It's the standard Git mechanism (documentation-as-config)
+#   2. Other consumers (Gemini CLI, Codex CLI, manual `git archive` users)
+#      may honor it
+#   3. Future Claude Code versions may honor it
+#
+# docs/private/ is the agent-context-excluded folder.
+#
+# See docs/architecture/private-context-policy.md for the full architecture.
+
+docs/private/ export-ignore
+
+# Append-only registries: parallel fleet lanes each add a line, and a union
+# merge keeps both instead of a rebase conflict (wave 21, cycle 1725).
+go/.apicover-enforce merge=union
+
+docs/history/code-comments/*.md merge=union
+guidance/** text eol=lf

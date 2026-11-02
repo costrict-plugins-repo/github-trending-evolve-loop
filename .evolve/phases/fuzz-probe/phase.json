@@ -1,0 +1,39 @@
+{
+  "name": "fuzz-probe",
+  "archetype": "evaluate",
+  "agent": "evolve-fuzz-probe",
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/build-report.md"
+    ],
+    "signals": [
+      "build.files_touched"
+    ]
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/fuzz-probe-report.md"
+    ],
+    "signals": [
+      "fuzz.crashers",
+      "fuzz.coverage_new"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Target Functions",
+      "Fuzz Results",
+      "Verdict"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "build.files_touched",
+        "op": "gt",
+        "value": 0
+      }
+    ]
+  },
+  "after": "build"
+}

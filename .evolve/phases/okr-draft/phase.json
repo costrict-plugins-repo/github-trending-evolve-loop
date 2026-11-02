@@ -1,0 +1,43 @@
+{
+  "name": "okr-draft",
+  "catalog": "on-demand",
+  "archetype": "plan",
+  "agent": "evolve-okr-draft",
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/scout-report.md"
+    ],
+    "signals": []
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/okr-draft-report.md"
+    ],
+    "signals": [
+      "okr.key_results_count"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Objective",
+      "Key Results",
+      "Confidence and Scoring"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "business-strategy"
+      },
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "business-plan"
+      }
+    ]
+  },
+  "after": "triage",
+  "optional": true
+}

@@ -1,0 +1,195 @@
+//go:build integration
+
+package ship
+
+import (
+	"context"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestShipFromWorktree_GitAddFails_Errors(t *testing.T) {
+	t.Parallel()
+	repo, wt := makeWorktreeScenario(t)
+
+	runGit(t, wt, "reset", "HEAD", "wt-change.txt")
+
+	opts := &Options{
+		Class:         ClassCycle,
+		CommitMessage: "feat: worktree add fail",
+		ProjectRoot:   repo,
+		Runner:        faultRunner("git add", 1, nil),
+		Stdout:        io.Discard,
+		Stderr:        io.Discard,
+	}
+	err := shipFromWorktree(context.Background(), opts, &RunResult{}, "main", wt)
+	if err == nil || !strings.Contains(err.Error(), "git add failed") {
+		t.Fatalf("want 'git add failed' error, got %v", err)
+	}
+}
+
+func TestShipFromWorktree_DiffCachedQuietFails_Errors(t *testing.T) {
+	t.Parallel()
+	repo, wt := makeWorktreeScenario(t)
+
+	opts := &Options{
+		Class:         ClassCycle,
+		CommitMessage: "feat: diff quiet fail",
+		ProjectRoot:   repo,
+		Runner: func(ctx context.Context, name, cwd string, args, env []string,
+			stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+			if name == "git" && argsContain(args, "--cached") && argsContain(args, "--quiet") {
+				return -1, errors.New("diff quiet injected error")
+			}
+			return execRunner(ctx, name, cwd, args, env, stdin, stdout, stderr)
+		},
+		Stdout: io.Discard,
+		Stderr: io.Discard,
+	}
+	err := shipFromWorktree(context.Background(), opts, &RunResult{}, "main", wt)
+	if err == nil || !strings.Contains(err.Error(), "diff --cached --quiet failed") {
+		t.Fatalf("want 'diff --cached --quiet failed' error, got %v", err)
+	}
+}
+
+func TestShipFromWorktree_RevListFails_WhenBranchAheadCheck(t *testing.T) {
+	t.Parallel()
+	repo := makeRepo(t)
+	addRemote(t, repo)
+	seedAudit(t, repo, "PASS")
+
+	wt := tempRepoDir(t)
+	runGit(t, repo, "worktree", "add", "-b", "cycle-ahead", wt)
+	mustWrite(t, filepath.Join(wt, "ahead.txt"), "ahead\n")
+	runGit(t, wt, "add", "ahead.txt")
+	runGit(t, wt, "commit", "-m", "ahead commit")
+
+	opts := &Options{
+		Class:         ClassCycle,
+		CommitMessage: "feat: rev-list fail",
+		ProjectRoot:   repo,
+		Runner:        faultRunner("git rev-list", 1, errors.New("rev-list injected")),
+		Stdout:        io.Discard,
+		Stderr:        io.Discard,
+	}
+	err := shipFromWorktree(context.Background(), opts, &RunResult{}, "main", wt)
+	if err == nil {
+		t.Fatal("want rev-list error, got nil")
+	}
+}
+
+func TestShipFromWorktree_BuildDiffFooterFails_Errors(t *testing.T) {
+	t.Parallel()
+	repo, wt := makeWorktreeScenario(t)
+
+	opts := &Options{
+		Class:         ClassCycle,
+		CommitMessage: "feat: diff footer fail",
+		ProjectRoot:   repo,
+		Runner: func(ctx context.Context, name, cwd string, args, env []string,
+			stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+			if name == "git" && argsContain(args, "--name-status") {
+				return -1, errors.New("name-status injected error")
+			}
+			return execRunner(ctx, name, cwd, args, env, stdin, stdout, stderr)
+		},
+		Stdin:  strings.NewReader(""),
+		Stdout: io.Discard,
+		Stderr: io.Discard,
+	}
+	err := shipFromWorktree(context.Background(), opts, &RunResult{}, "main", wt)
+	if err == nil {
+		t.Fatal("want buildDiffFooterAtDir error, got nil")
+	}
+	if !strings.Contains(err.Error(), "name-status") {
+		t.Errorf("want name-status error, got %v", err)
+	}
+}
+
+func TestShipFromWorktree_ADivergedMainFailsBeforeThePush(t *testing.T) {
+	t.Parallel()
+	repo, wt := makeWorktreeScenario(t)
+	published := remoteHeadSHA(t, repo)
+
+	opts := &Options{
+		Class:         ClassCycle,
+		CommitMessage: "feat: ff-merge fail",
+		ProjectRoot:   repo,
+		Runner:        faultRunner("git merge-base", 1, nil),
+		Stdout:        io.Discard,
+		Stderr:        io.Discard,
+	}
+	err := shipFromWorktree(context.Background(), opts, &RunResult{}, "main", wt)
+	if err == nil || !strings.Contains(err.Error(), "ff-merge") {
+		t.Fatalf("want ff-merge error, got %v", err)
+	}
+	if got := remoteHeadSHA(t, repo); got != published {
+		t.Errorf("origin moved to %s: a main the lane cannot fast-forward is refused before the push", got)
+	}
+}
+
+func TestShipFromWorktree_AFastForwardThatFailsAfterThePushStillLands(t *testing.T) {
+	t.Parallel()
+	repo, wt := makeWorktreeScenario(t)
+	res := &RunResult{}
+
+	opts := &Options{
+		Class:         ClassCycle,
+		CommitMessage: "feat: ff-merge fail after the push",
+		ProjectRoot:   repo,
+		Runner:        faultRunner("git merge", 1, nil),
+		Stdout:        io.Discard,
+		Stderr:        io.Discard,
+	}
+	err := shipFromWorktree(context.Background(), opts, res, "main", wt)
+
+	tip := strings.TrimSpace(runGitOut(t, wt, "rev-parse", "HEAD"))
+	if err != nil || remoteHeadSHA(t, repo) != tip || res.CommitSHA != tip {
+		t.Fatalf("err=%v origin=%s result=%s, want the pushed lane commit %s to stand: origin holds the landing", err, remoteHeadSHA(t, repo), res.CommitSHA, tip)
+	}
+	if !containsLog(*res, "the fast-forward of main to the pushed "+tip+" failed") {
+		t.Errorf("logs %q, want the lagging main reported", res.Logs)
+	}
+}
+
+func TestShipFromWorktree_PushFails_Errors(t *testing.T) {
+	t.Parallel()
+	repo, wt := makeWorktreeScenario(t)
+
+	opts := &Options{
+		Class:         ClassCycle,
+		CommitMessage: "feat: push fail",
+		ProjectRoot:   repo,
+		Runner:        faultRunner("git push", 1, nil),
+		Stdout:        io.Discard,
+		Stderr:        io.Discard,
+	}
+	err := shipFromWorktree(context.Background(), opts, &RunResult{}, "main", wt)
+	if err == nil || !strings.Contains(err.Error(), "to origin/main failed (rc=1)") {
+		t.Fatalf("want push-failed error, got %v", err)
+	}
+}
+
+func TestWriteShipBinding_ReadStateMapError_ReturnsError(t *testing.T) {
+	t.Parallel()
+	repo := makeRepo(t)
+
+	csDir := filepath.Join(repo, ".evolve")
+	if err := os.MkdirAll(csDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	csPath := filepath.Join(csDir, "cycle-state.json")
+	if err := os.MkdirAll(csPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := &Options{ProjectRoot: repo}
+	err := writeShipBinding(opts, "abc123tree", "abc123sha")
+	if err == nil {
+		t.Fatal("want error from readStateMap on directory, got nil")
+	}
+}

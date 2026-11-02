@@ -1,0 +1,94 @@
+package continuation
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestDeleteRegistryEntry_RemovesOnlyTheNamedScope(t *testing.T) {
+	root := t.TempDir()
+	if err := WriteRegistryEntry(root, "scope-a", Continuation{Cycle: 1405, SnapshotSHA: "c4f6b41b"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteRegistryEntry(root, "scope-b", Continuation{Cycle: 1421, SnapshotSHA: "deadbeef"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := DeleteRegistryEntry(root, "scope-a"); err != nil {
+		t.Fatalf("DeleteRegistryEntry: %v", err)
+	}
+	if _, ok, _ := ReadRegistryEntry(root, "scope-a"); ok {
+		t.Error("scope-a binding survived deletion — the absorbing-FAIL state cannot be released")
+	}
+	if c, ok, err := ReadRegistryEntry(root, "scope-b"); !ok || err != nil || c.Cycle != 1421 {
+		t.Errorf("scope-b binding must be untouched, got ok=%v err=%v cycle=%d", ok, err, c.Cycle)
+	}
+}
+
+func TestDeleteRegistryEntry_AbsentScopeIsACleanNoop(t *testing.T) {
+	root := t.TempDir()
+	if err := DeleteRegistryEntry(root, "never-existed"); err != nil {
+		t.Errorf("deleting an absent binding must be a clean no-op, got %v", err)
+	}
+	if err := WriteRegistryEntry(root, "scope-a", Continuation{Cycle: 7, SnapshotSHA: "abc"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteRegistryEntry(root, "never-existed"); err != nil {
+		t.Errorf("deleting an absent scope from a populated registry must be a clean no-op, got %v", err)
+	}
+}
+
+func TestDeleteRegistryEntry_EmptyScopeRejected(t *testing.T) {
+	if err := DeleteRegistryEntry(t.TempDir(), ""); err == nil {
+		t.Error("empty scope id must be rejected (mirrors WriteRegistryEntry)")
+	}
+	if _, err := DeleteRegistryEntryIfCycle(t.TempDir(), "", 7); err == nil {
+		t.Error("empty scope id must be rejected on the conditional path too")
+	}
+}
+
+func TestDeleteRegistryEntryIfCycle_ReleasesOnlyTheNamedAncestor(t *testing.T) {
+	root := t.TempDir()
+	if err := WriteRegistryEntry(root, "todo-42", Continuation{Cycle: 1409, SnapshotSHA: "fresh"}); err != nil {
+		t.Fatal(err)
+	}
+	released, err := DeleteRegistryEntryIfCycle(root, "todo-42", 1405)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if released {
+		t.Error("released=true for a binding naming a DIFFERENT ancestor — the guard is a rubber stamp")
+	}
+	if c, ok, _ := ReadRegistryEntry(root, "todo-42"); !ok || c.Cycle != 1409 {
+		t.Errorf("the fresh cycle-1409 binding must survive a stale cycle-1405 release attempt, got ok=%v cycle=%d", ok, c.Cycle)
+	}
+
+	released, err = DeleteRegistryEntryIfCycle(root, "todo-42", 1409)
+	if err != nil || !released {
+		t.Fatalf("matching-ancestor release: released=%v err=%v, want true nil", released, err)
+	}
+	if _, ok, _ := ReadRegistryEntry(root, "todo-42"); ok {
+		t.Error("matching binding survived its conditional release")
+	}
+}
+
+func TestAppendReleased(t *testing.T) {
+	home, herr := os.UserHomeDir()
+	if herr != nil {
+		t.Skipf("no home dir: %v", herr)
+	}
+	doc := map[string]any{"released_continuations": []any{map[string]any{"reason": "earlier"}}}
+	got := AppendReleased(doc, Continuation{Branch: "b", SnapshotSHA: "s", Cycle: 3,
+		Worktree: filepath.Join(home, "wt")}, "test-route")
+	if len(got) != 2 {
+		t.Fatalf("entries = %d, want prior + new", len(got))
+	}
+	entry, _ := got[1].(map[string]any)
+	if entry["reason"] != "test-route" || entry["branch"] != "b" {
+		t.Fatalf("entry = %+v", entry)
+	}
+	if wt, _ := entry["worktree"].(string); wt != "~/wt" {
+		t.Fatalf("worktree %q, want the operator home collapsed to ~ (audit cycle-1507 M1)", wt)
+	}
+}

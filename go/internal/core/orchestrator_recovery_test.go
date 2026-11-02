@@ -1,0 +1,357 @@
+package core_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+)
+
+type recStorage struct {
+	mu    sync.Mutex
+	state core.State
+	cs    core.CycleState
+}
+
+func (s *recStorage) ReadState(_ context.Context) (core.State, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state, nil
+}
+func (s *recStorage) WriteState(_ context.Context, st core.State) error {
+	s.mu.Lock()
+	s.state = st
+	s.mu.Unlock()
+	return nil
+}
+func (s *recStorage) ReadCycleState(_ context.Context) (core.CycleState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cs, nil
+}
+func (s *recStorage) WriteCycleState(_ context.Context, cs core.CycleState) error {
+	s.mu.Lock()
+	s.cs = cs
+	s.mu.Unlock()
+	return nil
+}
+func (s *recStorage) AcquireLock(_ context.Context) (func() error, error) {
+	return func() error { return nil }, nil
+}
+
+type fakeLedger struct {
+	mu      sync.Mutex
+	entries []core.LedgerEntry
+}
+
+func (l *fakeLedger) Append(_ context.Context, e core.LedgerEntry) error {
+	l.mu.Lock()
+	l.entries = append(l.entries, e)
+	l.mu.Unlock()
+	return nil
+}
+func (l *fakeLedger) Verify(_ context.Context) error { return nil }
+func (l *fakeLedger) Iter(_ context.Context) (core.LedgerIterator, error) {
+	return nil, errors.New("not implemented")
+}
+func (l *fakeLedger) entryKinds() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	kinds := make([]string, len(l.entries))
+	for i, e := range l.entries {
+		kinds[i] = e.Kind
+	}
+	return kinds
+}
+
+var allPhases = []core.Phase{
+	core.PhaseIntent, core.PhaseScout, core.PhaseTriage, core.PhaseTDD,
+	core.PhaseBuildPlanner, core.PhaseBuild, core.PhaseAudit,
+	core.PhaseShip, core.PhaseRetro, core.PhaseDebugger,
+}
+
+type passRunner struct{ name string }
+
+func (r *passRunner) Name() string { return r.name }
+func (r *passRunner) Run(_ context.Context, req core.PhaseRequest) (core.PhaseResponse, error) {
+	if r.name == string(core.PhaseBuild) && req.ExplanationDocumentationVersion != 0 {
+		if err := os.MkdirAll(req.Workspace, 0o755); err != nil {
+			return core.PhaseResponse{}, err
+		}
+		report := "## Explanation Documentation\n- Status: NOT_APPLICABLE\n- Reason: the base-bound Build diff contains no material changes\n"
+		if err := os.WriteFile(filepath.Join(req.Workspace, "build-report.md"), []byte(report), 0o644); err != nil {
+			return core.PhaseResponse{}, err
+		}
+	}
+	return core.PhaseResponse{Phase: r.name, Verdict: core.VerdictPASS, ArtifactsDir: req.Workspace}, nil
+}
+
+type explanationTestWorktree struct{}
+
+func (explanationTestWorktree) Create(projectRoot string, cycle int) (string, error) {
+	path := filepath.Join(projectRoot, ".test-worktrees", fmt.Sprintf("cycle-%d", cycle))
+	if out, err := exec.Command("git", "-C", path, "rev-parse", "--verify", "HEAD").CombinedOutput(); err == nil && strings.TrimSpace(string(out)) != "" {
+		return path, nil
+	}
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return "", err
+	}
+	commands := [][]string{
+		{"init", "-q"},
+		{"config", "user.email", "test@evolve-loop.test"},
+		{"config", "user.name", "Evolve Test"},
+	}
+	for _, args := range commands {
+		if out, err := exec.Command("git", append([]string{"-C", path}, args...)...).CombinedOutput(); err != nil {
+			return "", fmt.Errorf("git %v: %w: %s", args, err, strings.TrimSpace(string(out)))
+		}
+	}
+	if err := os.WriteFile(filepath.Join(path, ".gitignore"), []byte(".evolve/\n"), 0o644); err != nil {
+		return "", err
+	}
+	for _, args := range [][]string{{"add", ".gitignore"}, {"commit", "-q", "-m", "test base"}} {
+		if out, err := exec.Command("git", append([]string{"-C", path}, args...)...).CombinedOutput(); err != nil {
+			return "", fmt.Errorf("git %v: %w: %s", args, err, strings.TrimSpace(string(out)))
+		}
+	}
+	return path, nil
+}
+
+func (explanationTestWorktree) Cleanup(string, string) error { return nil }
+
+func explanationHarnessOptions(opts ...core.Option) []core.Option {
+	return append([]core.Option{core.WithWorktreeProvisioner(explanationTestWorktree{})}, opts...)
+}
+
+func newRunners(over map[core.Phase]core.PhaseRunner) map[core.Phase]core.PhaseRunner {
+	out := make(map[core.Phase]core.PhaseRunner, len(allPhases))
+	for _, p := range allPhases {
+		out[p] = &passRunner{name: string(p)}
+	}
+	for p, r := range over {
+		out[p] = r
+	}
+	return out
+}
+
+func newTestOrchestrator(t *testing.T, runners map[core.Phase]core.PhaseRunner) (*core.Orchestrator, *recStorage, *fakeLedger) {
+	t.Helper()
+	st := &recStorage{}
+	ld := &fakeLedger{}
+	return core.NewOrchestrator(st, ld, runners, explanationHarnessOptions()...), st, ld
+}
+
+func runCycleT(t *testing.T, o *core.Orchestrator) (core.CycleResult, error) {
+	t.Helper()
+	return o.RunCycle(context.Background(), core.CycleRequest{
+		ProjectRoot: t.TempDir(),
+		GoalHash:    "test-goal",
+		Context:     map[string]string{"commit_message": "test commit"},
+	})
+}
+
+type shipErrorStub struct {
+	name      string
+	failFirst int
+	errOnFail error
+	calls     int
+}
+
+func (s *shipErrorStub) Name() string { return s.name }
+
+func (s *shipErrorStub) Run(_ context.Context, _ core.PhaseRequest) (core.PhaseResponse, error) {
+	s.calls++
+	if s.calls <= s.failFirst {
+		return core.PhaseResponse{Phase: s.name, Verdict: core.VerdictFAIL}, s.errOnFail
+	}
+	return core.PhaseResponse{Phase: s.name, Verdict: core.VerdictPASS}, nil
+}
+
+type signalStub struct {
+	name    string
+	signals map[string]any
+	calls   int
+}
+
+func (s *signalStub) Name() string { return s.name }
+
+func (s *signalStub) Run(_ context.Context, _ core.PhaseRequest) (core.PhaseResponse, error) {
+	s.calls++
+	return core.PhaseResponse{Phase: s.name, Verdict: core.VerdictPASS, Signals: s.signals}, nil
+}
+
+func runRecoveryCycle(t *testing.T, over map[core.Phase]core.PhaseRunner) (core.CycleResult, error, *fakeLedger) {
+	t.Helper()
+	orch, _, ld := newTestOrchestrator(t, newRunners(over))
+	res, err := runCycleT(t, orch)
+	return res, err, ld
+}
+
+func TestRunCycle_ShipPreconditionError_ReRunsAuditThenShips(t *testing.T) {
+	t.Parallel()
+	ship := &shipErrorStub{
+		name:      "ship",
+		failFirst: 1,
+		errOnFail: core.NewShipError(core.CodeAuditBindingHeadMoved, core.ShipClassPrecondition, core.StageVerifyClass, "stale binding"),
+	}
+	res, err, ld := runRecoveryCycle(t, map[core.Phase]core.PhaseRunner{core.PhaseShip: ship})
+	if err != nil {
+		t.Fatalf("recoverable precondition ship error should NOT abort the cycle, got: %v", err)
+	}
+	if ship.calls != 2 {
+		t.Fatalf("ship calls = %d, want 2 (fail → re-audit → ship succeeds)", ship.calls)
+	}
+	if !containsKind(ld, "ship_error") {
+		t.Fatalf("expected a ship_error ledger entry; kinds=%v", ld.entryKinds())
+	}
+	_ = res
+}
+
+func TestRunCycle_ShipControlPlaneViolation_RebuildsThenShips(t *testing.T) {
+	t.Parallel()
+	ship := &shipErrorStub{
+		name:      "ship",
+		failFirst: 1,
+		errOnFail: core.NewShipError(core.CodeControlPlaneViolation, core.ShipClassPrecondition, core.StageVerifyClass, "INTEGRITY VIOLATION: go/internal/core/cyclerun.go"),
+	}
+	build := &explanationWritingRunner{}
+	audit := &countingRunner{name: "audit"}
+	_, err, ld := runRecoveryCycle(t, map[core.Phase]core.PhaseRunner{core.PhaseShip: ship, core.PhaseBuild: build, core.PhaseAudit: audit})
+	if err != nil {
+		t.Fatalf("a control-plane refusal is recoverable by the builder, got: %v", err)
+	}
+	if build.calls != 2 || audit.calls != 2 || ship.calls != 2 {
+		t.Fatalf("ship refusal → build → audit → ship: build=%d audit=%d ship=%d, want 2/2/2", build.calls, audit.calls, ship.calls)
+	}
+	if !containsKind(ld, "ship_error") {
+		t.Fatalf("expected a ship_error ledger entry; kinds=%v", ld.entryKinds())
+	}
+}
+
+func TestRunCycle_ShipTransientError_RetriesShip(t *testing.T) {
+	t.Parallel()
+	ship := &shipErrorStub{
+		name:      "ship",
+		failFirst: 1,
+		errOnFail: core.NewShipError(core.CodeGitPushRejected, core.ShipClassTransient, core.StageAtomicShip, "push race"),
+	}
+	_, err, _ := runRecoveryCycle(t, map[core.Phase]core.PhaseRunner{core.PhaseShip: ship})
+	if err != nil {
+		t.Fatalf("transient ship error should retry+succeed, got: %v", err)
+	}
+	if ship.calls != 2 {
+		t.Fatalf("ship calls = %d, want 2 (fail → retry ship)", ship.calls)
+	}
+}
+
+func TestRunCycle_ShipIntegrityError_AbortsLoud(t *testing.T) {
+	t.Parallel()
+	se := core.NewShipError(core.CodeIntegrityTreeDrift, core.ShipClassIntegrity, core.StageAtomicShip, "tree drift")
+	ship := &shipErrorStub{name: "ship", failFirst: 99, errOnFail: se}
+	_, err, _ := runRecoveryCycle(t, map[core.Phase]core.PhaseRunner{core.PhaseShip: ship})
+	if err == nil {
+		t.Fatal("integrity ship error MUST abort the cycle")
+	}
+	if got, ok := core.AsShipError(err); !ok || got.Code != core.CodeIntegrityTreeDrift {
+		t.Fatalf("aborted error should carry the integrity ShipError, got: %v", err)
+	}
+	if ship.calls != 1 {
+		t.Fatalf("ship calls = %d, want 1 (integrity never retries)", ship.calls)
+	}
+}
+
+func TestRunCycle_ShipRecoveryExhausted_Aborts(t *testing.T) {
+	t.Parallel()
+	se := core.NewShipError(core.CodeAuditBindingHeadMoved, core.ShipClassPrecondition, core.StageVerifyClass, "always stale")
+	ship := &shipErrorStub{name: "ship", failFirst: 99, errOnFail: se}
+	_, err, _ := runRecoveryCycle(t, map[core.Phase]core.PhaseRunner{core.PhaseShip: ship})
+	if err == nil {
+		t.Fatal("a never-resolving ship error must abort once recovery depth is exhausted")
+	}
+	if ship.calls != 3 {
+		t.Fatalf("ship calls = %d, want 3 (initial + maxRecoveryDepth=2)", ship.calls)
+	}
+}
+
+func TestRunCycle_ShipUnknownError_DebuggerReship(t *testing.T) {
+	t.Parallel()
+	se := core.NewShipError(core.CodeWorktreeResolve, core.ShipClassConfig, core.StageArgs, "novel")
+	ship := &shipErrorStub{name: "ship", failFirst: 1, errOnFail: se}
+	dbg := &signalStub{name: "debugger", signals: map[string]any{"debugger.action": "RESHIP"}}
+	res, err, ld := runRecoveryCycle(t, map[core.Phase]core.PhaseRunner{
+		core.PhaseShip:     ship,
+		core.PhaseDebugger: dbg,
+	})
+	if err != nil {
+		t.Fatalf("debugger RESHIP path should recover, got: %v", err)
+	}
+	if dbg.calls != 1 {
+		t.Fatalf("debugger calls = %d, want 1", dbg.calls)
+	}
+	if ship.calls != 2 {
+		t.Fatalf("ship calls = %d, want 2 (fail → debugger → reship)", ship.calls)
+	}
+	if !containsKind(ld, "debugger_decision") {
+		t.Fatalf("expected a debugger_decision ledger entry; kinds=%v", ld.entryKinds())
+	}
+	_ = res
+}
+
+func TestRunCycle_ShipUnknownError_DebuggerRerunAudit(t *testing.T) {
+	t.Parallel()
+	se := core.NewShipError(core.CodeWorktreeResolve, core.ShipClassConfig, core.StageArgs, "novel")
+	ship := &shipErrorStub{name: "ship", failFirst: 1, errOnFail: se}
+	dbg := &signalStub{name: "debugger", signals: map[string]any{
+		"debugger.action":      "RERUN_PHASE",
+		"debugger.rerun_phase": "audit",
+	}}
+	_, err, _ := runRecoveryCycle(t, map[core.Phase]core.PhaseRunner{
+		core.PhaseShip:     ship,
+		core.PhaseDebugger: dbg,
+	})
+	if err != nil {
+		t.Fatalf("debugger RERUN_PHASE:audit path should recover, got: %v", err)
+	}
+	if ship.calls != 2 {
+		t.Fatalf("ship calls = %d, want 2 (fail → debugger → re-audit → ship)", ship.calls)
+	}
+}
+
+func TestRunCycle_ShipUnknownError_DebuggerBlock(t *testing.T) {
+	t.Parallel()
+	se := core.NewShipError(core.CodeWorktreeResolve, core.ShipClassConfig, core.StageArgs, "novel")
+	ship := &shipErrorStub{name: "ship", failFirst: 99, errOnFail: se}
+	dbg := &signalStub{name: "debugger", signals: map[string]any{"debugger.action": "BLOCK"}}
+	_, err, _ := runRecoveryCycle(t, map[core.Phase]core.PhaseRunner{
+		core.PhaseShip:     ship,
+		core.PhaseDebugger: dbg,
+	})
+	if err != nil {
+		t.Fatalf("debugger BLOCK ends the cycle cleanly (no abort error), got: %v", err)
+	}
+	if dbg.calls != 1 {
+		t.Fatalf("debugger calls = %d, want 1", dbg.calls)
+	}
+	if ship.calls != 1 {
+		t.Fatalf("ship calls = %d, want 1 (BLOCK → no reship)", ship.calls)
+	}
+}
+
+func containsKind(ld *fakeLedger, kind string) bool {
+	for _, k := range ld.entryKinds() {
+		if k == kind {
+			return true
+		}
+	}
+	return false
+}
+
+var _ = errors.Is
+var _ = strings.Contains

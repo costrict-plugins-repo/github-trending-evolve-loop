@@ -1,0 +1,80 @@
+package bridge
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+	"github.com/mickeyyaya/evolve-loop/go/internal/tokenusage"
+)
+
+func tokenLaunchFixture(t *testing.T, withEventsLog bool) (*Engine, core.BridgeRequest, time.Time) {
+	t.Helper()
+	ws := t.TempDir()
+	if withEventsLog {
+		envelope := `{"kind":"result","data":{"cost_usd":0.4,"tokens":{"in":900,"out":210,"cache_r":30,"cache_c":7}}}` + "\n"
+		if err := os.WriteFile(filepath.Join(ws, "tdd-events.ndjson"), []byte(envelope), 0o644); err != nil {
+			t.Fatalf("write events fixture: %v", err)
+		}
+	}
+	start := time.Date(2026, 7, 13, 10, 0, 0, 0, time.UTC)
+	e := NewEngine(Deps{
+		Now:           func() time.Time { return start.Add(90 * time.Second) },
+		TokenResolver: tokenusage.DefaultResolver(t.TempDir()),
+	})
+	req := core.BridgeRequest{
+		CLI:          "claude-tmux",
+		Agent:        "tdd",
+		Workspace:    ws,
+		Worktree:     "/repo/worktrees/cycle-754",
+		ArtifactPath: filepath.Join(ws, "test-report.md"),
+	}
+	return e, req, start
+}
+
+func readLLMCalls(t *testing.T, workspace string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(workspace, "llm-calls.ndjson"))
+	if err != nil {
+		t.Fatalf("llm-calls.ndjson not written: %v", err)
+	}
+	return string(b)
+}
+
+func TestRecordTokenUsage_EventsLogFallback_EndToEnd(t *testing.T) {
+	t.Parallel()
+	e, req, start := tokenLaunchFixture(t, true)
+
+	var resp core.BridgeResponse
+	e.recordTokenUsage(req, "sonnet", 0, start, &resp)
+
+	if resp.Tokens.Output != 210 || resp.Tokens.Input != 900 {
+		t.Errorf("resp.Tokens = %+v, want Input=900 Output=210 recovered from the workspace events log", resp.Tokens)
+	}
+	rec := readLLMCalls(t, req.Workspace)
+	if !strings.Contains(rec, `"source":"events_result"`) {
+		t.Errorf("llm-calls.ndjson must attribute the eventsResult tier, got: %s", rec)
+	}
+	if strings.Contains(rec, `"source":"none"`) {
+		t.Errorf("launch with a recoverable events log must not record source=none, got: %s", rec)
+	}
+}
+
+func TestRecordTokenUsage_NoSources_RecordsSourceNoneZeroTokens(t *testing.T) {
+	t.Parallel()
+	e, req, start := tokenLaunchFixture(t, false)
+
+	var resp core.BridgeResponse
+	e.recordTokenUsage(req, "sonnet", 0, start, &resp)
+
+	if resp.Tokens != (core.TokenUsage{}) {
+		t.Errorf("no telemetry source available: resp.Tokens must stay zero (no fabrication), got %+v", resp.Tokens)
+	}
+	rec := readLLMCalls(t, req.Workspace)
+	if !strings.Contains(rec, `"source":"none"`) {
+		t.Errorf("no-source launch must record source=none, got: %s", rec)
+	}
+}

@@ -1,0 +1,247 @@
+# internal/guards
+
+> Decision records: [ADR-0064](../adr/0064-pipeline-integrity-boundary.md) (the control-plane boundary, its ship tripwire and build floor) and [ADR-0075](../adr/0075-guard-phase-hook-rewire.md) (the phase guard's hook wiring). More records: [ADR-0074](../adr/0074-typed-signal-contracts-routing-authority.md) (the routing projection `IsProtectedScope`) and [ADR-0102](../adr/0102-explanation-review-reasoning-is-the-gate.md) (the explanation-review reasoning ladder). Why the compiled-default overlay skills are protected: [skill-overlays.md § Security surface](../skill-overlays.md). The hermetic `TestMain`: [testing-strategy.md § Review findings](../testing-strategy.md). The scope rework: [verification wave findings § F29](../../research/verification-wave-findings-2026-09-14.md). This page keeps the package-level detail those do not.
+
+## Purpose
+
+`internal/guards` is the in-process trust kernel. It holds the five `core.Guard` implementations that `evolve guard <name>` runs as Claude Code PreToolUse hooks. It also holds `ProtectedSurfaceManifest`, the single list of the pipeline control plane that no autonomous cycle can change. Other packages (the ship tripwire, the build floor and the fleet preflight) inject `IsProtectedSurface` and keep no list of their own. The inbox routing roots and triage's breaker judge with `lanerouting.Forbidden`. It composes `IsProtectedScope` with the sandbox deny list of the build profile ([internal-lanerouting](internal-lanerouting.md)).
+
+The hooks are defence in depth, because they fire only in Claude Code panes. The OS sandbox, the worktree fence and the ship gates hold each guarantee for every family. The protected write rule of the sandbox denies only at `isolation.i7.stage` `enforce`; at the default `shadow` it only reports. The sandbox reads `ProtectedSurfaceManifest` for its protected write rule ([llm-isolation.md §9.1](../llm-isolation.md#91-as-built-x7), I-7).
+
+## Design
+
+- **One decision per process.** `internal/cli/guardcmd` builds one guard (`buildGuard`) and reads the PreToolUse JSON from stdin. It calls `Decide` once and appends to `.evolve/guards.log`. It writes an `Alarm` decision to `.evolve/integrity-alarm.jsonl`, and exits 2 on deny. `.claude/settings.json` wires `ship`, `phase`, `role` and `docdelete`. `chain` is run by hand (`evolve guard chain`, the same check as `evolve ledger verify`).
+- **The guards.**
+
+| Guard | Tool | Rule | Off switch |
+|---|---|---|---|
+| `chain` | any | allow only while the ledger's hash chain verifies | none |
+| `phase` | `Agent`, `Task` | deny a phase persona (`subagent_type` `evolve-*`) outside a phase cell during an active cycle. Inside a cell (the advisory `EVOLVE_PHASE` marker), allow each call (llm-isolation §7.2). | `--bypass` |
+| `role` | `Edit`, `Write` | per-phase write allowlist plus the control-plane boundary | `--bypass` (still alarms on a protected path) |
+| `ship` | `Bash` | deny `git commit`, `git push` and `gh release create/edit` unless that simple command itself runs `evolve ship`; each command on the line is judged on its own | `--bypass` |
+| `docdelete` | `Bash` | deny an `rm` whose line names `docs/` or `knowledge-base/` anywhere (case-folded, bare or as a directory). Deny a removal whose words name a doc root after quote removal. A removal is `rm`, `git rm`, `unlink`, `git clean`, a `find` with `-delete`, or a `find` with an `-exec`/`-execdir`/`-ok` of `rm` or `unlink` by any path. Deny an `rm` or `mv` run inside a doc root (`cd`, `pushd`, `git -C`, or the shell's own directory). Deny an `mv` or `git mv` (past git's global options) of doc content outside `docs/`. Allow only an `rm`/`git rm` of exactly the active cycle's never-committed explanation document | `workflow.allow_doc_delete` |
+
+- **The `docdelete` details.** A command substitution can feed the `rm` a path that another command names. For an `mv`, the guard reads the destination from `-t`/`--target-directory` (and its abbreviations) when given, and every word after `--` as a source.
+- **The role guard's order.** A tool other than Edit/Write, or an empty `file_path`, is allowed. The path is cleaned once, so every later rule judges the file the write lands on. Then:
+  - `--bypass` allows (with an alarm on a protected path).
+  - An always-safe path (`/tmp/`, `<home>/.claude/`) is allowed unless it is protected.
+  - Missing storage or a cycle-state read error denies.
+  - Outside a cycle (`CycleID == 0`) everything is allowed.
+  - Inside a cycle a protected path is denied with an alarm.
+  - Then retro is allowed to write the lesson corpus `.evolve/instincts/lessons/`.
+  - Then any phase is allowed to write under its workspace.
+  - Then a worktree phase (`core.WorktreePhase`: tdd and build) is allowed to write under the active worktree.
+  - Everything else is denied.
+- **Run-scoped state.** A lane's guard reads `<worktree>/.evolve/cycle-state.json`, which `core.linkGuardDeps` links to the run's own `run.json` (the mirror `WriteCycleState` writes, [ADR-0049](../adr/0049-concurrent-multi-cycle-execution.md) CB.4). The host-global `cycle-state.json` can hold a different concurrent run's phase.
+- **The manifest.** Each `ProtectedSurfaceEntry` is a lower-case, slash-normalized fragment, a guarantee class and a rationale. A fragment matches anywhere in the normalized path, so the boundary holds in a cycle worktree, the branch root or main. The class is one of the ten values of `GuaranteeClasses` ([ADR-0157](../adr/0157-the-loop-works-its-own-code-a-narrow-fence-and-held-proposals.md)):
+  - Guard, ship or commit gate, sandbox rule, ledger, policy parser, phase order, audit verdict, dispatch credential, kernel-loaded instruction and the manifest itself.
+  - A directory entry is used only when each file in it enforces the guarantee. A package that also holds ordinary code gets file entries: `core`, `bridge`, `phases/ship` and `phases/audit`.
+  - The fragments stay narrow: `go/acs/regression/` but not `go/acs/`, so a cycle still writes its own `go/acs/cycleN/` predicates.
+- **Two projections of one manifest.** `IsProtectedSurface` is membership. `normalizeSurfacePath` makes the path slash-separated and cleans it, but keeps a directory's trailing slash, so `..` cannot step around a fragment. It adds a leading slash so a repo-relative path matches, and it case-folds the path. Appending one slash lets a slashless directory name (a package or import path) match its directory fragment.
+- **`ProtectedPathsIn(text)` finds the protected paths that free text names** (2026-10-21). It takes each path-shaped token, drops a line locator and a trailing period, and keeps the ones `IsProtectedScope` accepts, once each and sorted. Triage reads a scout report with it, and the TDD gate reads an AC's `Needs changed` cell. Pinned by `TestProtectedPathsIn_*`.
+  - A token under `internal/`, `cmd/`, `pkg/`, `acs/` or `test/` is read relative to the `go/` module, so `internal/cli/guardcmd/eval.go` names `go/internal/cli/guardcmd/eval.go`. Other tokens keep their spelling, because a blanket `go/` prefix can match a manifest fragment such as `/skills/audit/`.
+  - `PathsIn(text)` names every path or file token, with a segment longer than one character, so `n/a` is no path. The TDD gate uses it to refuse a predicate row that names no path.
+- **The healing constitution is a marked part of the manifest.** `IsHealingConstitution` is true for a path whose entry has `Constitution: true`. It uses the same match as `IsProtectedSurface` (`matchesManifest`), so each constitution path is also protected. The gate classifier reads it for the pattern `healing-constitution` ([internal-gateclass.md](internal-gateclass.md)). Pinned by `TestIsHealingConstitution_IsTheMarkedPartOfTheManifest`.
+- **Scope is a second name of membership.** `IsProtectedScope` gives the same answer as `IsProtectedSurface` ([ADR-0139](../adr/0139-a-wave-orchestrator-supplies-admits-and-backfills-every-lane.md) decision 5). A directory is protected there only when it lies inside a fragment, for example `go/internal/bridge/sub/`. The role guard, the ship tripwire, the fleet preflight and the build floor use membership. The routing roots use scope, where a directory that only holds a fragment is lane work.
+- **Containment is the split name.** `TouchesProtectedSurface` is true when `IsProtectedSurface` is true, or when the path is a directory that holds a fragment. It treats each slash of the cleaned path as the possible start of a repo-relative path. It then asks if a fragment starts with the text from that slash. Thus `go/internal/core` holds 44 fragments and `go/cmd/evolve` holds 3. The bare root slash never counts.
+  - Only `evolve inbox split` uses it, on top of the lane predicate. A lane part must not list a directory that holds a protected file.
+  - The claim floor, `evolve inbox route-lane`, the wave seed, `evolve inbox rank` and triage's breaker keep scope. They accept some items that the split refuses. That trade-off keeps four lanes supplied.
+  - The role guard and the ship tripwire judge real file paths, so they keep membership. A directory is not a write target.
+  - [ADR-0139](../adr/0139-a-wave-orchestrator-supplies-admits-and-backfills-every-lane.md) decision 5 gives the reason and the rejected options.
+- **Two tripwires, on different lanes.** `go/acs/regression/protectedsurface` walks the repo by name: every `*_gate.go` or `*guard*` file must be covered. `TestProtectedSurface_CoversEveryExplanationLifecycleCallSite` walks `go/internal` by call site. The by-name tripwire enrolled `internal/recoveryguard` and `internal/triagedecision` (ADR-0106): the fence is gate-shaped, and the derivation writes what a lane commits itself to.
+- **The call-site scanner.** `explanationLifecycleVocabulary` derives the explanation-lifecycle API names from beliefs that already exist, not from a hand list. The sources are:
+  - the callee and value columns of `explanationLifecycleCallPins` and `explanationLifecycleAssignPins`;
+  - the gate entry points of the activation belt;
+  - the two single-sourced callees;
+  - the free functions `core/build_explanation_handoff.go` declares;
+  - the exported functions of `explanationdocs`.
+  - `explanationCallSiteFiles` reports each non-test file under `go/internal` that calls a vocabulary name or assigns one as a struct-literal value. The assignment is where the wiring decision lives.
+  - The scanner resolves names with the pin tables' `expressionName`. It skips `vendor/`, `testdata/`, `_test.go` files (a fixture is not a dispatch site) and files that fail to parse (a build concern).
+  - `go/cmd` and `go/acs` are not walked. No call site into the vocabulary lives there.
+  - `DocumentPath` is excluded: it only formats a prompt-hint path. The cost of including it is a manifest row for all of `phases/build`.
+  - Methods are excluded, because a method is never called by its bare name.
+  - Two data references share vocabulary names (`explanationdocs.CurrentContractVersion` in `orchestrator.go`, `o.explanationContractVersion` in `cyclerun.go`). Both files are protected for their own reasons.
+  - Known limit: a call through an interface or a func-valued field (`a.hooks.explanationCheck(a.req)`) resolves to the field path, not a vocabulary name. The scanner catches the wiring site instead.
+- **Explanation single-sourcing pins.** `TestBuildExplanationLifecycleWiring` pins which function calls or assigns each lifecycle step. The activation cross-check lives only in `explanationdocs.CrossCheckActivation`; the ship gate, the audit gate, retro's handoff refresh and the resume identity check call it (`TestExplanationActivationBelt_SharedByEveryHostConsult`). The explanation-review contract (status enum, build-status match, required or not-applicable switch, evidence references) lives only in `explanationdocs.ValidateReviewedHandoff`, read through `reportdoc.ReasonedReview`. Per-phase policy (heading, missing-handoff verdict, NEEDS_CORRECTION disposition) stays in each gate. The pin tables are package-level so the scanner reads the same lists.
+  - `TestSameWorkspacePath_IsTheOneWorkspaceRuleInsideExplanationdocs` pins `ActivationForCycle`, `RecoverRebaseSplit` and `resolveActivation` on the shared workspace rule.
+- **The ship guard judges simple commands.** `splitShellCommands` (`shell_commands.go`) is a small quote-aware scanner. It splits a Bash tool command at `;`, `&`, `|`, newlines and parentheses into the commands that the shell runs. It yields each command's text for verb matching, and its unquoted words for naming the executable.
+  - A command substitution (`$( )` or backticks) is a command of its own, even inside double quotes. The shell runs it before the command around it.
+  - Comments and heredoc bodies are dropped.
+  - A heredoc opens only at an unquoted `<<` (not `<<<`), outside a comment and outside parentheses. In parentheses, `<<` can be an arithmetic shift.
+  - The delimiter is the whole shell word after quote removal, as bash reads it. Examples are `EOF-MARKER`, `'END.'`, `"a\b"`, a line-continued word and a trailing CR. The delimiter is never an identifier prefix of it.
+  - A body closes at a line holding the delimiter after leading blanks, or the delimiter then `)`. It runs to the end of the input when unterminated.
+  - Where the scanner and the shell can disagree, it errs toward showing the guard more text: an early close reveals lines, it never hides them.
+  - An ANSI-C `$'…'` part is one quoted part. Its escapes are decoded as bash decodes them (`\xHH`, octal `\NNN`, `\uHHHH`, `\UHHHHHHHH`, and the single-letter escapes such as `\n` and `\'`). So `$'\x67it' push` is `git push` to the ship guard. Also, `find $'\x64ocs' -delete` names `docs` to `docdelete`.
+  - An unknown escape keeps its backslash. Inside double quotes `$'` is literal text, as in bash. A locale-quoted `$"…"` part is a double-quoted part whose `$` bash drops, so `$"docs"` is the word `docs`.
+  - **The program a command runs.** `programName` (`shell_commands.go`) is a word's base name, lowercased, because a case-insensitive filesystem runs `MV` as `mv` and `GIT` as `git`. Both guards use it.
+  - The ship guard's deny check already scans every word for `git`. The deny checks of docdelete ask `candidateCommands`.
+  - `candidateCommands` skips any `VAR=value` assignments and the shell reserved words that can precede a command: `!`, `{`, `if`, `then`, `elif`, `else`, `do`, `while`, `until`.
+  - After that, the command's first word is a candidate. Behind a wrapper (`arch`, `builtin`, `caffeinate`, `command`, `env`, `exec`, `nice`, `nohup`, `sudo`, `time`, `timeout`, `xargs`), every later word is a candidate.
+  - A removal, a move out of the doc roots or a `git -C <doc root>` by any candidate counts. A wrapper's options can take values (`env -u PATH rm …`, `exec -a name rm …`, `timeout 5 unlink …`). Judging more positions only ever denies more.
+  - The git word helpers (`gitSubcommand`, `gitSubcommandIndex`, `gitOptionsWithValue`) live beside them.
+  - A command is ship-class when its text matches the verb pattern or its words reach `commit` or `push` through git's global options (`git -C dir push`). The git word matches in any case. It is allowed only when its own words, after any `VAR=value` assignments, are `<…/>evolve ship`. That allow check is deliberately strict and peels no wrapper. A wrapper's option can run another command first (`env -S'git push …' evolve ship`).
+- **What the ship guard cannot see.** It is a PreToolUse screen, not a shell. A verb assembled at run time is outside its reach (`P=push; git $P`, an alias, a function, `eval` of computed text). A binary that an agent names `evolve` is also outside its reach. The ship tripwire, the commit gate and `evolve ship`'s self-SHA pin are the backstops ([ADR-0064](../adr/0064-pipeline-integrity-boundary.md)).
+- **`helpers.go`.** `cmdString` and `strField` read a string from `tool_input` and return "" when it is absent or not a string. The unexported alias `core_GuardInput` lets `helpers.go` take the core type without importing `core`.
+
+- **The CLI-neutral assignment guard** (I-17, X19a, `cli_neutral_assignment_test.go`). `TestNoCLISpecificsAboveTheDriver` walks the non-test Go files. It skips the bridge, the routing data (`llmroute`, `cliroute`, `policy`) and the homes of `TestFlowCodeNamesNoFamily`.
+- **The three rules of the guard.** A field of `PhaseRequest`, `PhasePlanEntry` or `MintSpec` must not name a CLI. A string literal must not hold the JSON key `"cli":`. A `==`, `!=` or `switch` must not test a driver identity. A driver identity is a name that ends in `cli` or `driver`, its `String()`, or a call of `Family`, `BaseCLI` or `Bind`. An empty-string check is not a branch.
+- **The limit of the name rule.** The rule reads names, not types, so a driver in a variable with another name passes it.
+- **The allowlist only shrinks.** `cliSpecificsAllowlist` counts the sites of each declaration. A count above its entry fails, and a count below its entry also fails, so a fixed site must leave the list. [The spec §28](../llm-isolation.md#28-the-cli-neutral-task-assignment-x19) gives the start count and the sites that stay.
+
+## Invariants
+
+- **Every guard fails closed on missing state.** Missing storage or a cycle-state read error denies in `phase` and `role`; a nil ledger or any `Verify` error denies in `chain`. A guard that cannot see the cycle must not guess that none is running. Pinned by `TestPhase_NilStorageDenies`, `TestPhase_ReadCycleStateErrorDenies`, `TestRole_NilStorageDenies`, `TestRole_ReadCycleStateErrorDenies`, `TestChain_NilLedgerDenies`, `TestChain_DeniesOnAnyVerifyError` and `TestChain_DeniesBroken`.
+- **The control-plane check precedes every allowance and applies to every phase.** A build phase may write source into its worktree but never the gate that grades it. The deny carries an alarm, so it lands in a dedicated channel rather than as a silent exit 2. Pinned by `TestRole_DeniesControlPlaneEditInBuildPhase` and `TestRole_DeniesRelocatedExplanationCallSitesInBuildPhase`.
+- **An always-safe directory does not shield a protected file.** The global `~/.claude/settings.json` wires the hooks themselves. If a cycle rewrites it, the cycle can disable every guard. Pinned by `TestRole_DeniesGlobalSettingsInCycle` and `TestRole_C1_DeniesGlobalSettingsUnsetHome`.
+- **An emergency bypass of a protected path is allowed but alarmed; any other bypass is silent.** Pinned by `TestRole_BypassProtectedPathAlarms`.
+- **Outside a cycle the operator is allowed to edit anything.** Control-plane changes ship through human-gated `evolve ship --class manual`, never an autonomous `--class cycle`. Pinned by `TestRole_OutsideCycleAllowsControlPlane` and `TestRole_AllowsGlobalSettingsOutsideCycle`.
+- **The retro lessons allowance sits after the boundary** and is phase-scoped, so no protected path can ride it. It is fragment-anchored because the guard knows no project root. Pinned by `TestRole_LessonsAllowanceNeverCoversProtectedSurface`, `TestRole_RetroMayWriteLessonsCorpus` and `TestRole_NonRetroDeniedLessonsCorpus`.
+- **Only worktree phases write into the worktree.** Scout, audit and the rest keep to their workspace. Pinned by `TestRole_TDDWritesTestsInWorktree`, `TestRole_NonWorktreePhaseDeniedWorktreeWrite` and `TestRole_BuildPhaseNoWorktree_DeniesNonWorkspace`.
+- **The operator home is read once, and an empty home disables its rule.** `NewRole` reads `$HOME` once so one process makes one reproducible decision; `isAlwaysSafe` reads no environment. With no home, `filepath.Join("", ".claude")` blesses every relative `.claude/` path. A `/tmp` fallback silently turns the home rule into the `/tmp` rule. Pinned by `TestNewRole_ResolvesHomeFromEnv`, `TestIsAlwaysSafe_UnsetHomeNeverMatchesClaude` and `TestIsAlwaysSafe_DecidesAgainstTheGivenHome`.
+- **An always-safe write never alarms.** A flood of false alarms is how a real violation hides. Pinned by `TestRole_AlwaysSafeDirs`.
+- **The manifest is compiled, not config**, so a cycle cannot write a `.evolve/policy.json` knob that disarms it. The manifest protects itself through its `/go/internal/guards/` entry. The why stays in code; `TestProtectedSurfaceManifest_KeepsEveryPreRefactorFragment` pins the self-entry.
+- **Each gate file keeps its entry and its class.** `protectedGateFiles` names each protected file and its class, independent of the manifest. A removed entry or a changed class fails `TestProtectedGateFiles_EachKeepsItsEntryAndItsClass`, and a stale path fails `TestProtectedGateFiles_EachExistsInTheTree`. Each entry names a class of ADR-0157 (`TestGuaranteeClasses_EveryManifestEntryNamesOneOfTheTenClasses`). The files that ADR-0157 frees stay free until a new decision (`TestNarrowFence_FreedFilesAreLaneWork`).
+- **A symbol pin guards a call in a lane-editable file.** `go/acs/regression/gatepins` pins the shape of the sandbox refusal in two direct drivers and two sandbox calls of `engine.go`. `TestRefusalCallSitesAreFencedOrPinned` fails when a file outside the fence calls a refusal with no pin. The acs suite runs at audit, so a lane that breaks a pin fails before its landing.
+- **Every fragment is well formed.** It is lower-case (the path is case-folded, never the fragment) and has no backslash. It starts with a slash (so `go/acs` cannot match `lego/acs`) and carries a rationale. Pinned by `TestProtectedSurfaceManifest_EveryEntryDenies`, which also checks each entry denies in worktree-absolute and repo-relative form.
+- **The original perimeter stays byte-for-byte.** Pinned by `TestProtectedSurfaceManifest_KeepsEveryPreRefactorFragment`.
+- **The boundary stays narrow.** Neighbors of protected files remain writable. Pinned by `TestProtectedSurfaceManifest_NonProtectedPathsStillAllow`, `TestIsProtectedSurface` and `TestRole_AllowsLegitWorktreeWritesUnderProtection`.
+- **Scope is membership.** A directory that only contains a fragment is not protected; a directory inside a fragment and a protected file are. The routing roots keep scope. The appended slash can only complete a fragment ending in a slash, so it changes no file match. Pinned by `TestIsProtectedScope_ADirectoryThatOnlyContainsAFragmentIsNotProtected` (which also pins that the bare root `/` matches nothing), `TestIsProtectedScope_ADirectoryInsideAFragmentIsProtected`, `TestIsProtectedScope_AProtectedFileSpellingIsProtected`, `TestIsProtectedSurface_MembershipStaysMembership` and `TestIsProtectedScope_ImpliedByMembership`.
+- **Containment holds every ancestor of a fragment.** Every ancestor directory of every fragment is protected, in the repo-relative, trailing-slash and worktree-absolute forms. A path that meets no fragment stays free. Containment never widens membership or scope. Pinned by `TestTouchesProtectedSurface_EveryAncestorOfEveryFragmentIsProtected`, `TestTouchesProtectedSurface_ADirectoryThatContainsAFragmentIsProtected`, `TestTouchesProtectedSurface_APathThatMeetsNoFragmentIsFree`, `TestTouchesProtectedSurface_ImpliedByMembership` and `TestTouchesProtectedSurface_LeavesMembershipAndScopeAlone`.
+- **Every compiled-default overlay skill is protected**, read from policy's own export so the next one cannot skip the manifest. Pinned by `TestProtectedSurface_CompiledDefaultOverlaySkills`.
+- **Every explanation-lifecycle call site is protected.** Pinned by `TestProtectedSurface_CoversEveryExplanationLifecycleCallSite`. Its supports:
+  - `TestExplanationCallSiteScanner_SeesEveryPinnedFile` is the anti-vacuity check: the scanner must find every file a pin table names.
+  - `TestExplanationHandoffVocabulary_IncludesKnownLifecycleFunctions` and `TestExplanationDocsVocabulary_IncludesKnownVerificationFunctions` put a floor on the two derivation sources, so splitting either file fails directly.
+  - `TestExplanationLifecycleImportAliases_NoneExist` enforces the scanner's precondition that nothing aliases or dot-imports `explanationdocs`. Any hit is a blind spot, so the bound is exactly zero.
+  - `TestExplanationDocsExportedNames_ExcludedDocumentPathStillExists` fails a stale exclusion.
+- **The ship guard ignores verbs inside heredoc bodies**, because a commit message may describe `git push`. `devolve ship` is not `evolve ship`. Pinned by `TestSplitShellCommands_DropsHeredocBodies`, `TestShip_Decide_VerbInHeredocBody` and `TestShip_Decide_WordBoundary_Devolve`.
+- **An `evolve ship` allows only itself.** A ship verb elsewhere on the line, in a command substitution inside the ship's arguments, or after a quoted, commented or arithmetic `<<` is denied. Pinned by `TestShip_ANativeShipElsewhereInTheCommandAllowsNothingElse`, `TestShip_ACommandSubstitutionInsideANativeShipStillRuns`, `TestShip_OnlyAnUnquotedHeredocOpenerHidesTheLinesAfterIt`, `TestShip_AHeredocMarkerIsTheWholeShellWord` and `TestShip_GitGlobalOptionsDoNotHideTheSubcommand`; `TestShip_ANativeShipMayMentionShipVerbs` keeps real ship commands allowed.
+- **Every decision judges the clean path.** `..` cannot reach a protected file past its fragment, nor leave `/tmp` or `<home>/.claude` while keeping their always-safe standing. Pinned by `TestRole_DeniesADotDotPathIntoTheControlPlane`, `TestRole_ADotDotOutOfAnAlwaysSafeDirIsNotAlwaysSafe` and `TestIsProtectedSurface_JudgesTheCleanPath`.
+- **Ship holds the complete check.** A text guard cannot see every spelling that bash resolves to a removal, nor an interpreter or a redirection. Ship reads the diff that lands and refuses the deletion of a committed doc with `COMMITTED_DOC_DELETED` (`internal/phases/ship/committed_doc_guard.go`). `docdelete` is the early warning before the change is made.
+- **A doc move is a deletion unless it lands under `docs/`.** `knowledge-base/` is not a destination: its `research/` subtree is retired and `cycles/` is runtime state. Pinned by `TestDocDelete_DeniesMvToLegacyArchiveHome`, `TestDocDelete_DeniesMvOutOfDocs` and `TestDocDelete_AllowsConsolidationIntoDocs`.
+- **A guard decides on its own run's state.** Pinned by `TestRoleAndPhaseGuards_ReadOwnRunState`, which also checks that a read of the global view denies the same write.
+- **Every go-test deadline in pipeline code is the one shared budget.**
+  - `TestGoTestTimeouts_AreTheSharedPackageBudget` parses every non-test Go file under `go/internal` and `go/cmd` (`testdata` skipped).
+  - It reads only go-test argvs. A go-test argv is a `[]string` literal, or a call's arguments, that carries the `"test"` token. The token can be direct, or in a `[]string` literal passed in, as `append([]string{"test", …}, …)` does.
+  - In those it finds each `-timeout`, followed by its value, inline as `-timeout=…`, or concatenated with one. `-test.timeout` names a Go test binary on its own, so it is checked in any argv.
+  - Each value must be `addedtests.PackageTimeout`. The test reads it under the file's own import name, or through a package constant that aliases it. A literal, a local variable and a constant holding a literal all fail.
+  - An argv reader (`slices.Contains(argv, "-timeout")`, `strings.HasPrefix(a, "-timeout=")`), another tool's `-timeout` (`exec.Command("curl", …)`) and evolve's own `loop-stop -timeout` are not go-test argvs and are ignored.
+  - The test also requires the scan to read `cmd/evolve/main.go` and the floor's runner. It also requires the scan to see the go-test `-timeout` in the floor's two runner files and ship's repo contract. So a narrowed scope or a matcher that drops a real site cannot pass.
+  - `TestGoTestTimeouts_FlagEveryDeadlineButTheSharedBudget` pins each accepted and ignored shape.
+  - `TestFloorGoTestRunners_BuildTheirArgvFromTheBudgetedBuilders` pins each floor runner to its argv builder (`realGoUnitTest` → `unitTestArgs`, `realGoUnitTestTagged` → `taggedTestArgs`, `scopedCoverFunc` → `coverTestArgs`). So a floor runner cannot write an argv in place that drops `-timeout`, which the scan alone does not see.
+  - Why: a 120 s literal in the build floor killed a green `./cmd/evolve` in cycles 1787, 1791, 1792 and 1798.
+- **The budget guard checks a `-timeout` that is present; it does not require one.** A go-test argv with no `-timeout` runs under Go's 10 m default. An argv assembled across statements (`args = append(args, "-timeout", x)` after `args := []string{"test"}`) carries no `"test"` token where the flag is added. Both are out of the guard's reach. The known no-flag go-test runs are the residual:
+  - `acsrunner` (`runner.go`, `go test -json -count=1 <pkg>`);
+  - `commitgate` (`lanes.go`, `go test <pkgs>`);
+  - `ciparity` (`ciparity.go`, the coverage-profile argv);
+  - `pkg/acsassert` (`go_tests.go`);
+  - `releasepreflight` (`releasepreflight.go`, args from its caller).
+- **The suite is hermetic because the guards read no environment.** A guard's decision comes from its constructor arguments and cycle state; the one read is `$HOME`, taken once by `NewRole`. No shell the suite runs from can turn a deny into an allow. Pinned by `TestGuards_ReadNoEnvironmentButHome`, an AST scan of the package's non-test files. Role fixtures use non-`/tmp` paths such as `/work/wt/cycle-20`, because on Linux `t.TempDir()` sits under `/tmp`, where the always-safe rule decides before cycle state is read. A fixture whose workspace must not exist on disk serves its cycle state from the `cycleStateOnly` stub, since `WriteCycleState` mirrors run state into the workspace.
+
+## Findings
+
+- **Cycle 20, flag-campaign-10** ([ADR-0064](../adr/0064-pipeline-integrity-boundary.md)): a build agent edited `go/acs/regression/flagreaders/readers_test.go` and the registry SSOT to bless its own split-const dodge, and the audit approved the self-edit. The role guard then let build write anything under the worktree. That produced the manifest and the in-cycle deny with alarm. The same change closed four review findings:
+  - C1: the global `settings.json` sat under the always-safe home rule. The id survives in `TestRole_C1_DeniesGlobalSettingsUnsetHome`.
+  - H2: a bypass of a protected path must alarm.
+  - M1: case-insensitive filesystems.
+  - M2: `.evolve/policy.json` overrides gate defaults, so it is protected.
+- **The L4 architecture review (2026-07-16)** turned the fragment literal into the exported manifest. It grew the perimeter to the gate-shaped surfaces that the first list missed. It added the by-name tripwire under `go/acs/regression/protectedsurface`.
+- **The disposition gate** was enrolled by the operator during the cycle-1034 salvage ([ADR-0074](../adr/0074-typed-signal-contracts-routing-authority.md) S2). It grades the retro that grades failed cycles. If a cycle can edit it, the cycle can route its own failure classification.
+- **PR #549**, a decomposition slice, moved five explanation-lifecycle call sites out of protected files into unprotected ones: `cyclerun_postreview.go`, `resume_execution.go`, `resume_bootstrap.go`, `phases/audit/classification.go` and `phases/runner/dispatch.go`. The manifest and the four pin tables had drifted apart. The fix added the rows and the call-site scanner, which derives its vocabulary so no fifth hand list can drift. Two architecture-review rounds on 2026-09-12 added these items:
+  - gate entry points in the vocabulary (`verifyExplanationDocumentation`, wired by struct-literal value in `audit.go`, was invisible);
+  - struct-literal values;
+  - the method exclusion;
+  - the enforced alias precondition;
+  - the derivation-source floors;
+  - the `DocumentPath` exclusion.
+- **The architecture review of 2026-09-01** found `CycleBinding.ContractVersion == 0` meant both "legacy cycle" and "a caller dropped the field". Only the host activation marker tells them apart. Ship checked it inline, audit not at all, so version 0 silently disabled audit's explanation gate. Both now call `explanationdocs.CrossCheckActivation`. The same review found the explanation-review contract stated once per phase gate with nothing binding the copies, which became `ValidateReviewedHandoff`.
+- **Cycles 1036, 1041 and 1042**: `role.go`'s header documented a retro lessons allowance that `Decide` never implemented. So retros did not persist lesson YAMLs, and learning durability broke silently. The ACS suites `go/acs/cycle1036`, `go/acs/cycle1041` and `go/acs/cycle1042` carry the behavioral contract under `-tags acs`; `role_lessons_test.go` keeps the crux in the default run. `go/acs/cycle1036` reads `role.go` and requires the text `.evolve/instincts/lessons`.
+- **PR #351**: a lessons test built on `t.TempDir()` passed on macOS and failed the Ubuntu job, because on Linux the path rode the `/tmp` rule. Role fixtures use fixed non-`/tmp` paths since.
+- **The tdd worktree allowance**: only `build` once got the worktree allowance, so tdd's RED tests were denied and the phase exited 81. The allowance now follows `core.WorktreePhase`.
+- **`guards-role-hermetic-home`** ([change log 2026-07-30](../../operations/change-log-2026-07-30.md)): the filed escape did not exist. But `isAlwaysSafe` read `$HOME` raw and the test helper fell back to `/tmp`, so every `$HOME/.claude` assertion exercised the `/tmp` rule. Home is now injected at the composition root.
+- **The Local Hero `TestMain`** ([testing-strategy.md](../testing-strategy.md)): an operator shell exporting `EVOLVE_BYPASS_SHIP_GATE=1` made every deny test fail open locally while CI stayed green. The guards have since moved to constructor bypass (`go/acs/cycle31`, `go/acs/cycle32`) and read none of these variables.
+- **CB.4** ([ADR-0049](../adr/0049-concurrent-multi-cycle-execution.md)): under concurrent runs the host-global cycle state can hold another run's phase. Before the fix, a guard that read it denied a build write in the lane's own worktree. The worktree symlink to `run.json` closed that.
+- **F29** ([verification wave findings](../../research/verification-wave-findings-2026-09-14.md)): with membership alone, an item declaring `go/internal/core/` and `go/internal/phases/runner/` reached a lane four times. Triage's breaker refused its card each time (cycles 1646, 1651, 1654 and 1656). That produced `IsProtectedScope` and the slashless-directory membership fix. ADR-0139 decision 5 removed the "contains" half of that rule on 2026-10-17. It held 8 items from the lanes. The tree had 1 ready item before the change and 9 after it.
+- **Split review (2026-10-18)** ([internal-inboxsplit](internal-inboxsplit.md)): a live review ran 34 real splits. On the tracked inbox, 17 of 112 proposed lane parts listed a protected path or a directory that holds one. Only the split took `TouchesProtectedSurface`, so the routing roots keep their 3 lane-routable items on that inbox.
+- **F37** ([incident](../../incidents/2026-09-26-lane-edited-the-control-plane-through-a-shell-tool.md)): a builder rewrote the protected `core/cyclerun.go` through a shell tool. The role guard sees only Edit and Write, so the boundary's question is now also asked by the build floor, which injects `IsProtectedSurface`.
+- **ADR-0075**: `evolve guard phase` was wired only under the `Bash` matcher, so its one real branch never fired. It is now wired to `Agent|Task`.
+- **v11.7.5 to v11.8.3** ([phase5-audit.md](../phase5-audit.md)): the Go port of the ship gate lacked the bash heredoc strip, so commit bodies that described `git push` were denied.
+- **The 2026-08-05 doc-root consolidation** moved the archive home to `docs/private/research/archived-YYYY-MM-DD/` and retired `knowledge-base/research/` as a destination.
+- **Cycle 1705** ([incident](../../incidents/2026-09-26-the-doc-guard-sent-a-draft-where-the-predicate-gate-refuses-it.md)):
+  - A Build retracting its own never-committed explanation draft was denied both `rm` and a move out of `docs/`. The deny message prescribed a plain `mv` into the archive home, which left the draft untracked in the worktree.
+  - The host predicate gate then refused the untracked file and forced FAIL over the auditor's PASS.
+  - `docdelete` now allows exactly one removal: the active cycle's own never-committed explanation document, named by the host. It advises `git mv` for committed content. A general "never committed" allowance was reviewed and dropped: an untracked symlinked directory and `git rm ':(top)…'` both reached committed files through it.
+  - A second security review found evasions older than the fix: quote or escape splitting (`rm doc''s/…`), `unlink`, `find … -delete` and `git clean`. The removal verbs are now recognised, and doc roots are matched on the words bash passes as well as on the raw text.
+  - A third pass (the port's own reviews, 2026-09-28) closed these cases:
+    - `mv -t <dir>` and `--target-directory` (which read the destination as a source);
+    - `find … -exec /bin/rm`;
+    - ANSI-C `$'…'` quoting;
+    - `git --no-pager mv`;
+    - a `--`-guarded source that starts with `-`.
+  - The third pass also stopped `find docs -name rm` from counting as a removal.
+  - Its reviews found the rule for which program a command runs held three ways (exact `words[0]`, `path.Base`, and assignments skipped only by the ship guard). So `/usr/bin/unlink docs/…`, `FOO=1 unlink docs/…`, `/bin/rm doc''s/…` and `command rm doc''s/…` were allowed. One helper became that rule (the third round split it into `programName` and `candidateCommands`, below).
+  - The guard scans the command once, unfolded, with case-insensitive patterns. Folding before decoding had turned `\U` into `\u`, and the unfolded move scan missed `MV`.
+  - `mv` options are read as GNU getopt reads them. So `S` and `t` each take a value (`-S.t` is a suffix, `-St` too), and `--suffix` consumes its word. `$"…"` locale quoting is decoded.
+  - A third review round split the rule by the direction it fails in. The deny side judges every word behind a wrapper as a possible program. That closed `env -u PATH rm docs/…`, `exec -a name rm …`, `sudo unlink …`, `timeout 5 unlink …` and `nice -n 5 find docs -delete`. The second round's wrapper skipping had read the option's value as the program. The allow side went back to main's strict rule, because peeling wrappers there had allowed `env -S'git push origin HEAD:main' evolve ship`. The ship guard's git match became case-insensitive (`GIT push`).
+  - A post-merge security audit (2026-09-29) found that entering a doc root was recognised only when `cd` or `pushd` began the raw command text. The regex was anchored at `^cd`. A command's text keeps the blanks after the `;`, `&&` or newline before it.
+  - So `true; cd docs && rm -f README.md`, or an indented script block, removed or moved committed docs unseen. Every earlier test began with `cd`.
+  - Entering is now read from the words like every other verb (`entersADocRoot` through `candidateCommands`, so `command cd docs` and `builtin cd docs` count too).
+  - The review of that fix found every verb missed behind a reserved word (`{ cd docs; rm …; }`, `if cd docs; then rm …; fi`, `! cd docs; …`). So `candidateCommands` skips them.
+  - Entering is sticky for the rest of the line, which errs toward denying. A `cd docs` inside `$( … )` or undone by `popd` still counts.
+  - The same audit noted the draft exception checked the draft's parent directories for symlinks but not the draft itself. A draft path that is not a regular file is no longer the draft.
+  - The draft exception keeps its exact spelling: `rm <draft>` or `git rm <draft>` with no global option, wrapper or assignment. `git -C docs rm <draft>` and `GIT_WORK_TREE=docs git rm <draft>` name the draft's path but remove another file, so every other spelling is judged as a removal.
+  - Known limits of a text guard:
+    - an interpreter (`python -c`, `perl -e`, `sh -c`, `eval`);
+    - a wrapper not in the list;
+    - a path assembled at run time (`D=docs; rm -r $D`);
+    - a directory whose name hides a doc root (`cd mirror` where `mirror` is a symlink to `docs/`: only names are checked);
+    - a redirection that truncates a file;
+    - the time between the check and the command.
+  - The draft exception trusts the cycle state's identity, but the `HEAD` check keeps it off committed files.
+- **`guards-path-traversal-and-ship-bypass`** (P1, found 2026-09-26 by reading the code during comment-reduction batch 19):
+  - Neither the surface normalizer nor the always-safe check cleaned its path. `<worktree>/go/internal/core/../guards/role.go` missed the `/go/internal/guards/` fragment, and `isUnderDir` (which does clean) placed it in the worktree, so a build or tdd Write reached a guard. `/tmp/../x` counted as always-safe.
+  - The ship guard allowed a whole line whenever `evolve ship` or `ship.sh` appeared anywhere in it, so `git push origin main; echo evolve ship` passed. A quoted `'<<EOF'`, a here-string `<<<` and an arithmetic `$((x<<y))` each opened a false heredoc that hid the next line from the verb check. And `git -C . push` never matched the verb pattern.
+  - The fix cleans at both boundaries and replaces the line-based heredoc stripper with the per-command scanner. It also drops the `ship.sh` allowance: `scripts/lifecycle/ship.sh` no longer exists, and an allowance keyed to a path an agent can write is itself a bypass.
+  - Review of the fix found one more way past, older than it. The heredoc marker was read with an identifier regex. So `<<EOF-MARKER` waited for a line `EOF` that never came, and hid everything after the real close, a `git push` included. The old line-based stripper had the same regex. The marker is now the whole shell word after quote removal (`TestShip_AHeredocMarkerIsTheWholeShellWord`).
+  - Three tests had passed for the wrong reason and were rewritten. `TestRole_BuilderWritesInWorktree` and `TestRole_AuditPhaseRestricted` sat under `/tmp`. `TestShip_Decide_VerbInHeredocBody` ran `evolve ship`, whose substring allowance decided it. Each rule was mutation-checked: removing it turns its named test red.
+- **The quota guard never denied, and is removed** (2026-09-26, part of `guards-path-traversal-and-ship-bypass`).
+  - `evolve guard quota` built a fresh `Quota` for each hook call, so its in-memory counters never outlived one call. It keyed them on an `agent` field that no Claude Code tool input carries.
+  - Its hook matched `WebSearch|WebFetch|Bash`, so it started a process and read `policy.json` on every Bash call for nothing.
+  - The guard, its hook entry, its `guards.log` tag and `workflow.allow_deep_research` are gone. `TestHookWiring_EveryWiredGuardIsAGuardTheBinaryBuilds` (guardcmd) keeps the hook wiring and the binary in step.
+  - The old `TestMain` also went: it unset three `EVOLVE_BYPASS_*` variables that nothing reads, and `testing-strategy.md` counted five.
+- **ADR-0115 (2026-10-01)**: `/go/internal/commentaudit/` joined the manifest beside `/go/internal/commitgate/`. The commit gate trusts it for the comment-only proof behind the review waiver and for its comment and history refusals. If a lane can edit it, the lane can widen its own waiver (`TestProtectedSurfaceManifest_CoversTheCommentProofTheCommitGateTrusts`; inbox `commentaudit-joins-the-protected-surface`).
+- **ADR-0106 (2026-09-26)**: the recovery fence shipped without a manifest entry. The by-name tripwire caught it on the CI-parity floor before the PR. Both new kernel packages are enrolled with their rationale.
+- **ADR-0113 (2026-10-01)**: `core/bridge_completion.go` shipped off the manifest. It is the predicate that decides which correction re-dispatch can complete on worktree evidence with its deliverable carried unchanged. The architecture review caught it before merge. It is enrolled as a file entry (the rest of `core` stays cycle territory) and pinned by `TestProtectedSurfaceManifest_CoversTheCorrectionCompletionPredicate`.
+- **ADR-0117 (2026-10-01)**: the build handoff floor moved its mandatory half, its chain walker and the review-input projection into a new file, `go/internal/core/build_handoff_floor.go`. The file lies beside three protected neighbours. It is not gate-shaped by name, so the by-name tripwire did not see it. The architecture review caught it before landing. It is enrolled with its rationale and pinned by `TestProtectedSurfaceManifest_CoversTheBuildHandoffFloor`. The same class as PR #549 above: moving protected logic into a new file moves it off the surface unless the manifest moves with it.
+- **Cycle 1811 (2026-10-07)**: the tree-diff guard's leak exemptions, including the mint-registry read and its quarantine, moved out of the protected `cyclerun_postreview.go`. They went into a new file, `go/internal/core/leak_ownership.go`. The same file holds the main-tree ownership Specification, which decides what leak recovery can claim and which leaked paths count as a live sibling's. It is enrolled with its rationale. Two tests pin it: `TestProtectedSurfaceManifest_CoversTheMainTreeOwnershipSpecification` by name, and the call-site scanner through its `explanationdocs.IsCycleChangeRecord` call ([incident](../../incidents/2026-10-06-cycle-1811-cross-lane-eval-relocation.md)). `go/internal/core/leak_recovery.go` is enrolled beside it, because it holds rules the guard depends on:
+  - the snapshot retry the guard reads through, and the abort when the retries still fail in a checkout;
+  - the once-per-cycle no-checkout exemption;
+  - the fail-closed owner rule;
+  - quarantine-not-delete.
+
+  `TestProtectedSurfaceManifest_CoversTheLeakRecoveryRules` pins it.
+- **The floor's go-test budget (2026-10-05)**: `core/phase_bindings_selfcheck.go` and `addedtests/budget.go` joined the manifest as file entries.
+  - `core/phase_bindings_selfcheck.go` builds the floor's unit and tagged `go test` argvs. `addedtests/budget.go` holds `PackageTimeout`.
+  - Lane 1763 had raised the floor's tagged deadline to survive its own predicate (inst-L1763b). After the floor moved onto the shared budget, its value lives in `budget.go`.
+  - If a lane can edit either file, the lane can move the deadline that grades it.
+  - `addedtests.go`, the added-test grouping, stays cycle territory.
+  - Pinned by `TestProtectedSurfaceManifest_CoversTheFloorsGoTestBudget`.
+- **The one-ranking guard (2026-10-06)**: `inboxrank/weightsort_ban_test.go` joined the manifest as a file entry, at the operator's approval. It bans any ordering of inbox items outside `inboxrank` (ADR-0121, inbox rank P2), so the queue a lane is graded from has one order. If a lane can edit the guard, the lane can reorder that queue. For that reason the file is protected, not just tested.
+
+## Rules kept from code comments
+
+- **The role guard decides in a fixed order.** The path is cleaned once, first. A bypass of the control plane is alarmed, even in an emergency. A protected path inside an always-safe directory still faces the integrity check. Outside a cycle the operator is allowed to edit anything, the control plane too.
+- **The control-plane check comes before every allowance.** The retro lessons allowance comes after it, so no protected path can use it.
+- **A deleted draft is proven, not parsed.** `retractsOwnDraft` compares one exact path. The host fixes that path (`explanationdocs.DocumentPath`). The guard does not interpret the shell. An expansion, a pathspec or another spelling is not that path.
+- **The draft counts as never committed only in four conditions.**
+  - `cwd` is the repository root.
+  - `HEAD` holds nothing of that name, compared case-folded.
+  - Every directory on the path is a real directory. A symlinked parent can resolve the name elsewhere.
+  - An existing draft is a regular file.
+- **The doc roots match case-folded.** A case-insensitive filesystem resolves `DOCS/` to `docs/`.
+- **The scanner shows the guard more text, never less.** `splitShellCommands` is an approximation for a guard, not a parser. A close that it cannot place ends a heredoc early.
+- **A heredoc body ends at a marker line.** The line holds the marker after leading blanks, or the marker then `)`. An unterminated body runs to the end of the input, as in bash. In double quotes a backslash escapes only `$`, a backtick, `"`, `\` and newline.
+- **The manifest is compiled, not config.** A cycle cannot write the knob that disarms it. A directory entry is used only if every file in it is control plane.
+- **One manifest has three names.** `IsProtectedSurface` (membership) and `IsProtectedScope` give the same answer for each path. Routing and the breaker of triage compose `IsProtectedScope` with the build sandbox (lanerouting). The split adds `TouchesProtectedSurface`, which also covers the directories that hold a fragment (ADR-0139 decision 5, amended 2026-10-18). The ship tripwire and the role guard use `IsProtectedSurface`.
+- **ADR-0157 (2026-10-27)**: the fence narrowed from whole packages to the files and symbols that enforce a guarantee. It freed 25 entries. They are the bridge outside its rule files, the ADR-0103 unit packages with no gate and the inbox lifecycle outside its claim files. They also include the wave and chain engines and four core files.
+  - It added the ledger, the policy parser, the phase-order state machine and the manifest file. It also gave entries of their own to the refusal files of the bridge and the inbox claim, and to five bridge guard tests.
+  - On a copy of the live inbox, the protected refusals fell from 76 to 51 ([research](../../research/narrow-fence-2026-10.md)).

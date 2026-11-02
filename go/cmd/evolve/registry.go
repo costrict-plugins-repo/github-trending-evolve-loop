@@ -1,0 +1,168 @@
+package main
+
+import (
+	"fmt"
+	"io"
+	"os"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/cli/contextcmd"
+	"github.com/mickeyyaya/evolve-loop/go/internal/cli/guardcmd"
+	"github.com/mickeyyaya/evolve-loop/go/internal/cli/opscmd"
+	"github.com/mickeyyaya/evolve-loop/go/internal/cli/phasecmd"
+	"github.com/mickeyyaya/evolve-loop/go/pkg/version"
+)
+
+type subcommand struct {
+	Name    string
+	Aliases []string
+	Summary string
+	Run     func(args []string, stdin io.Reader, stdout, stderr io.Writer) int
+}
+
+var commands = []subcommand{
+	{Name: "version", Aliases: []string{"--version", "-v"}, Summary: "Print build version", Run: runVersion},
+	{Name: "help", Aliases: []string{"--help", "-h"}, Summary: "Show usage", Run: runHelp},
+	{Name: "rebuild", Summary: "Rebuild the plane binary from HEAD (rebuild [--project-root P] [--repin])", Run: runRebuild},
+
+	{Name: "doctor", Summary: "Probe environment", Run: opscmd.RunDoctor},
+	{Name: "console-lease", Summary: "Time-bounded operator lease for runtime-tree paths (ADR-0080 S4)", Run: opscmd.RunConsoleLease},
+	{Name: "setup", Summary: "Onboarding: detect CLIs, validate per-phase models, mark first-run", Run: runSetup},
+	{Name: "install", Summary: "Manual install of agents + loop skill into ~/.claude (install [--ci])", Run: runInstall},
+	{Name: "uninstall", Summary: "Remove manually-installed agents + loop skill from ~/.claude (uninstall [--ci])", Run: runUninstall},
+	{Name: "guard", Summary: "Run a trust-kernel guard", Run: guardcmd.RunGuard},
+	{Name: "msg", Summary: "Agent messaging of one cycle: msg send | wait | reply (ADR-0129)", Run: runMsg},
+	{Name: "ledger", Summary: "Verify or tail the ledger", Run: runLedger},
+	{Name: "dossier", Summary: "Read and verify cycle dossiers (dossier verify)", Run: runDossier},
+	{Name: "audit", Summary: "Analyze auditor calibration evidence (audit calibration)", Run: runAudit},
+	{Name: "salvage", Summary: "Report the recoverable-malformed bad_verdict rate (salvage report [-json]) and list gc's operator-salvage leaves read-only (salvage list [--json])", Run: runSalvage},
+	{Name: "soak-report", Summary: "Render the EVOLVE_PHASE_RECOVERY soak evidence table (read-only)", Run: runSoakReport},
+	{Name: "dashboard", Summary: "Serve the read-only live pipeline dashboard (dashboard [--addr A] [--project-root P] [--snapshot])", Run: runDashboard},
+	{Name: "names", Summary: "Guard naming after a rename: names check (scan) | names fix (rewrite dead tokens)", Run: runNames},
+	{Name: "acs", Summary: "Run ACS predicates", Run: runACS},
+	{Name: "apicover", Summary: "Measure public-API coverage (apicover [-cover f] [-require-doc] [-enforce] <pkgdir>...)", Run: runApicover},
+	{Name: "inbox", Summary: "The backlog: batches (the grouping triage consumes) | list | show | add | edit | verify | withdraw | route-console | route-lane | consume | quarantine | ack-fingerprint (evolve inbox --help)", Run: runInbox},
+	{Name: "phase", Summary: "Run a single phase in-process", Run: runPhase},
+	{Name: "agent", Summary: "Run one phase agent with no cycle, through the bridge: agent run <profile> [--input FILE|-] [--file PATH]... [--worktree DIR [--writable PATH]...] [--json] [--keep] [--project-root P] prints the report on stdout (--json: one envelope with the report, verdict, driver, family, model, cost, tokens and the launch record); each run writes .evolve/agent-runs/<run label>.json; agent list [--json] names the profiles; agent capabilities [--json] prints the agent class of each verb (exit 0 pass, 1 fail, 3 refused, 21 dispatch error, 10 usage, 11 input)", Run: runAgentCommand},
+	{Name: "phases", Summary: "List/validate/scaffold phase definitions (the phase catalog)", Run: phasecmd.RunPhases},
+	{Name: "serve-phase", Summary: "Envelope-framed phase subprocess", Run: phasecmd.NewRunServePhase(rootRouterInstaller)},
+	{Name: "cycle", Summary: "Run one full cycle", Run: runCycle},
+	{Name: "fleet", Summary: "Launch N concurrent cycles (ADR-0049 S6)", Run: runFleet},
+	{Name: "campaign", Summary: "Multi-cycle campaign planner (study|replan|run|status)", Run: runCampaign},
+	{Name: "worktree", Summary: "Manage per-cycle worktrees", Run: runWorktree},
+	{Name: "land", Summary: "Land a patch or a salvaged cycle uncommitted on a hub dev worktree at the fetched origin/main; never commits or pushes (land --branch B (--patch F | --salvage <leaf>) [--project-root P])", Run: runLand},
+	{Name: "branches", Summary: "Audit/prune superseded orphan cycle-* branches (branches audit|prune)", Run: runBranches},
+	{Name: "continuation", Summary: "Inspect, release or adopt scope-keyed continuation bindings (continuation list | continuation release <scope-id> | continuation adopt <item-id> --worktree <path>)", Run: runContinuation},
+	{Name: "carryover", Summary: "Apply a reviewed keep/drop/cluster decisions file to state.json:carryoverTodos via the sanctioned locked RMW path (carryover apply-decisions)", Run: runCarryover},
+	{Name: "swarm", Summary: "Inspect/reap swarm worker sessions (ADR-0032)", Run: runSwarm},
+	{Name: "checkpoint", Summary: "Protect uncommitted worktree work as refs/checkpoints snapshots, never touching the branch, index or tree: checkpoint save [--worktree DIR | --all] [--label T] [--push] | list [--worktree DIR] | restore <ref> --into DIR | prune [--landed] (each takes --json and --project-root P)", Run: runCheckpoint},
+	{Name: "treewalk", Summary: "Guard the test tiers against leaked files and empty directories: treewalk snapshot --root DIR --out FILE | treewalk check --root DIR --baseline FILE (exit 1 names each new path)", Run: runTreewalk},
+	{Name: "kb", Summary: "Query the read-only knowledge-base graph over cycle dossiers and inbox items: kb graph neighbors <node-id> [--hops N] | kb graph recurrences <fingerprint> (each takes --json and --project-root P)", Run: runKB},
+	{Name: "gc", Summary: "Release what finished cycles left behind: tmux sessions/sockets, orphan processes, worktrees, run dirs, go build cache (gc --project-root <dir> [--dry-run])", Run: runGC},
+	{Name: "verdicts", Summary: "Read or empty the shared verdict store of the build floor and the ship: verdicts stats | verdicts wipe [--apply] (a preview without --apply; each takes --project-root P)", Run: runVerdicts},
+	{Name: "failures", Summary: "Inspect and clear state.json:failedApproaches: failures list [--class C] [--json] | failures reset [--fingerprint F] | failures prune [--dry-run] (prune also drops expired carryoverTodos; reset and a real prune require --project-root)", Run: runFailures},
+	{Name: "loop", Summary: "Drive the dispatcher loop", Run: runLoop},
+	{Name: "loop-stop", Summary: "Stop a running loop after its current wave: engage the .evolve/loop-stop brake (loop-stop [--release] [--project-root P])", Run: runLoopStop},
+	{Name: "pr", Summary: "Merge reviewed PRs at a wave boundary: refuses while a loop runs or required CI is not green on the verified head (pr merge <n>... [--update-branch] [--wait D] [--project-root P]); classify a PR as a merge-window or a boundary change (pr window <n> | --files-from FILE [--json]); regenerate the derived files after a rebase and commit only them (pr refresh [--project-root P])", Run: runPR},
+	{Name: "boundary", Summary: "The low-level boundary primitive (any goal file; it stops a live loop first); the operator and LLM path is wave next. It runs: loop-stop --wait, pr merge, ratchet-tighten (opens or updates a pull request with the tightened size-ratchet list; a failure only warns), sync-main, queue-apply (the CLI requests queued during the wave), quality report, gc, loop-stop --release, loop --detach; stops at the first failed step with its exit code (boundary run [--merge n,...] --goal-text-file F [--max-cycles N] [--dry-run] [--project-root P])", Run: runBoundary},
+	{Name: "postmortem", Summary: "The attempt postmortem of a phase dispatch (ADR-0130): collect writes the record of a dispatch that ended abnormally from its Claude transcript (a backfill for a dispatch before the runner wiring), show prints the Previous attempts section that the next dispatch gets (postmortem collect --cycle N --phase P --attempt K --session UUID|--transcript PATH --cause CODE [--exit-code E] [--started T --ended T] | show --cycle N --phase P [--project-root P])", Run: runPostmortem},
+	{Name: "landing", Summary: "The operator decision on a held proposal (ADR-0157): list the held cycles, approve a held tree with its adversarial audit report, or reject it (landing list | approve --cycle N --tree SHA --audit-report P --operator | reject --cycle N --tree SHA --operator)", Run: runLanding},
+	{Name: "wave", Summary: "The operator and LLM path for waves (boundary run is the low-level primitive): next (the boundary, a goal composed from facts, the launch, a wave record), status, supply (the census of the lane-routable supply, read-only), watch (one line per state event until the loop exits) and note (queue context for the next goal); --json prints an envelope on every exit (wave next|status|supply|watch|note ... [--json] [--project-root P])", Run: runWave},
+	{Name: "handoff", Summary: "Phase handoff exit check (ADR-0141 H7), read-only: check --cycle N --pair triage-tdd|tdd-build prints pass, retry, blocked or invalid from the ledger of the run directory (exit 0 pass, 1 retry/blocked/invalid, 2 IO error, 10 usage); show --cycle N lists the result of each pair (each takes --json and --project-root P)", Run: runHandoff},
+	{Name: "ci", Summary: "Classify a red CI run's failing tests as real, pre-existing, flake-evidence or unknown from evidence (ci classify <run-id|pr:N|sha:H> [--json] [--rerun] [--project-root P]), or watch a pushed SHA, PR or tag until its CI completes (ci watch (--sha S | --pr N | --tag T) [--workflow W]... [--cycle N]), or write or check go/.darwin-set (ci darwin-set <generate|check> [--project-root P]), or print the L5 to L1 critical path of a CI run (ci telemetry --jobs FILE [--job-artifacts \"JOB NAME=DIR\"]... [--json])", Run: runCI},
+	{Name: "comments", Summary: "Comment-campaign proof tools, the commentaudit CLI (comments rank|check|comments|verify|history|strip ...)", Run: runComments},
+	{Name: "events", Summary: "Read the event channels (ADR-0127): events channels lists the catalog with the tail cursor of each channel, events kinds prints the filter vocabulary, events watch prints each record of the selected channels and ends at --until, and the kernel wakes it on each append (events channels|kinds [--json] | events watch --channel C[,C] [--filter EXPR] [--since all|new|last|CURSORS|RFC3339] [--until EXPR] [--json]; each takes --project-root P; exit 0 ok or stopped, 2 I/O, 3 output gone or no kernel wake, 10 usage, 11 unknown kind or channel)", Run: runEvents},
+	{Name: "status", Summary: "Read-only report: loop, cycles, ship streak, open PRs with check state, failing CI jobs on main (status [--json] [--project-root P])", Run: runStatus},
+	{Name: "ship", Summary: "Atomic commit + push", Run: runShipCmd},
+	{Name: "reset-sha", Summary: "Re-pin the ship-gate binary SHA to the running binary (provenance-gated; --operator to override)", Run: runResetSHA},
+	{Name: "sync-main", Summary: "Reconcile a locally-diverged main with origin via merge only (never rebase/force-push/push); refuses on live lease or dirty tree", Run: runSyncMain},
+	{Name: "quality", Summary: "Compute the quality index readings of a scope and publish them through the Signal Center (quality report --scope wave|tree|judges|replay --project-root P | quality compare --index PQ1|PQ4 --a W --b W [--paired] --project-root P; ADR-0153; report exits 0 unless usage)", Run: runQuality},
+	{Name: "selfheal", Summary: "The incident detector of the self-healing loop (ADR-0155 X12): incidents [--json] [--project-root P] runs one detection pass over the Signal Center channels, the cycle state, the CI runs and the usage readings, writes the records under .evolve/incidents, publishes selfheal.incident events and lists the records; it never acts (policy healing.detector.stage: shadow by default, off lists only). propose [--json] [--project-root P] runs the orchestrator agent (ADR-0155 X13) through evolve agent run for each open incident that has no current proposal, checks its diagnosis.json against the evolve.diagnosis/1 schema and records one typed proposal under .evolve/incidents/proposals; the catalog validator (ADR-0155 X14) then accepts or refuses each proposal against the action catalog, the inbox and routing inventory, the incident tier, the repair budgets and the class breakers, appends the decision to .evolve/incidents/decisions.jsonl and publishes selfheal.decision events (HEALING_PROPOSAL_REFUSED, HEALING_ESCALATED); it acts on nothing (policy healing.orchestrator: stage shadow by default, off runs no agent; max_per_pass 2; retry_after_hours 6. policy healing.validator: stage shadow records would-apply decisions, off decides nothing). Exit 0 ok, 2 io, 10 usage, 11 bad policy", Run: runSelfheal},
+	{Name: "commit-gate", Summary: "Pre-commit quality gate (lint + targeted tests + attestation)", Run: guardcmd.RunCommitGate},
+	{Name: "guidance", Summary: "The rule registry under guidance/rules: build writes guidance/index.md, guidance/index.json and the L0 region of AGENTS.md; check reports stale output and registry problems; index prints the rules of a case (guidance build|check [--project-root P] | guidance index [--audience X] [--phase P] [--cli F] [--json] [--project-root P]; exit 0 ok, 1 check problems, 2 I/O, 10 usage, 11 bad registry)", Run: runGuidance},
+	{Name: "scan", Summary: "Scan the staged diff or a ref range for secrets, masked; exit 0 clean, 1 finding, 2 git error (scan secrets [--staged | --diff <ref>] [--project-root P])", Run: runScan},
+	{Name: "bridge", Summary: "Native-Go multi-CLI agent bridge (launch|probe)", Run: runBridge},
+
+	{Name: "detect-cli", Summary: "Identify driving AI CLI", Run: runDetectCLI},
+	{Name: "detect-nested-claude", Summary: "Detect nested claude -p", Run: runDetectNested},
+	{Name: "phase-order", Summary: "List phases from registry", Run: phasecmd.RunPhaseOrder},
+	{Name: "routing", Summary: "Explain a recorded routing decision, or ask the advisor for a plan (writes nothing under the cycle)", Run: runRouting},
+	{Name: "convergence", Summary: "The convergence policy (ADR-0126): decide --input <rounds.json> [--json] prints the next rung of a repeat-until-accepted loop (read-only)", Run: runConvergence},
+	{Name: "cli-routing", Summary: "The CLI routing table (ADR-0119): show [--static] [--json] | check | explain <agent> (read-only)", Run: runCLIRouting},
+	{Name: "estimate-quota-reset", Summary: "Predict quota reset timestamp", Run: runQuotaReset},
+	{Name: "build-invocation-context", Summary: "Emit subagent bedrock prefix", Run: runBedrock},
+	{Name: "resolve-llm", Summary: "Route phase role → cli + model", Run: runResolveLLM},
+	{Name: "consensus-dispatch", Summary: "Cross-CLI consensus auditor", Run: runConsensusDispatch},
+	{Name: "cycle-simulator", Summary: "No-LLM cycle plumbing simulator", Run: runCycleSimulator},
+	{Name: "phase-watchdog", Summary: "Activity-based stall watchdog", Run: phasecmd.RunPhaseWatchdog},
+	{Name: "aggregator", Summary: "Merge fan-out worker artifacts", Run: runAggregator},
+	{Name: "fanout-dispatch", Summary: "Bounded-concurrency parallel dispatcher", Run: runFanoutDispatch},
+	{Name: "preflight-environment", Summary: "Probe host capabilities", Run: guardcmd.RunPreflight},
+	{Name: "phase-observer", Summary: "Stream-json tail + stall detect", Run: phasecmd.RunPhaseObserver},
+	{Name: "subagent", Summary: "Subagent helpers", Run: runSubagent},
+	{Name: "changelog-gen", Summary: "Generate changelog from git log", Run: opscmd.RunChangelogGen},
+	{Name: "version-bump", Summary: "Atomic version bump", Run: opscmd.RunVersionBump},
+	{Name: "marketplace-poll", Summary: "Verify marketplace propagation", Run: opscmd.RunMarketplacePoll},
+	{Name: "release-preflight", Summary: "Pre-publish 5-step gate", Run: opscmd.RunReleasePreflight},
+	{Name: "rollback", Summary: "Auto-revert failed release", Run: opscmd.RunRollback},
+	{Name: "release", Aliases: []string{"release-pipeline"}, Summary: "Self-healing release pipeline", Run: opscmd.RunReleasePipeline},
+	{Name: "prune-ephemeral", Summary: "TTL retention for .ephemeral/", Run: runPruneEphemeral},
+	{Name: "postedit-validate", Summary: "PostToolUse validator", Run: guardcmd.RunPostEditValidate},
+	{Name: "inbox-mover", Summary: "Inbox lifecycle ops", Run: runInboxMover},
+	{Name: "commit-prefix-gate", Summary: "Conventional-commits prefix check", Run: guardcmd.RunCommitPrefixGate},
+	{Name: "release-consistency", Summary: "Verify version markers", Run: opscmd.RunReleaseConsistency},
+	{Name: "release-verify-clis", Summary: "Verify the release installs + performs for every LLM CLI", Run: runReleaseVerifyCLIs},
+	{Name: "release-verify-binaries", Summary: "Verify every prebuilt binary + checksums is published on a release tag", Run: runReleaseVerifyBinaries},
+	{Name: "release-promote", Summary: "Re-promote a demoted release after workflow+assets check (release-promote <tag> [--rerun])", Run: runReleasePromote},
+	{Name: "backups", Summary: "Verify backup bundles/patches already exist elsewhere (backups verify [--dir D])", Run: runBackups},
+
+	{Name: "skill-inventory", Summary: "Build skill inventory cache", Run: runSkillInventory},
+	{Name: "skills", Summary: "Project phase facts into skill docs from SSOT (generate|check); publish skills to other LLM CLIs (publish) — ADR-0040/0041", Run: runSkills},
+	{Name: "flags", Summary: "Project the EVOLVE_* flag registry into control-flags.md (generate|check; check exits 2 on drift) — L2 flag SSOT", Run: runFlags},
+	{Name: "signals", Summary: "Signal Center (ADR-0101): `signals codes generate|check` projects the code registry into signal-codes.md (check exits 2 on drift)", Run: runSignals},
+	{Name: "phase-inventory", Summary: "Build phase inventory cache (the advisor's phase index)", Run: phasecmd.RunPhaseInventory},
+	{Name: "eval", Summary: "Eval-quality + verify subcommands", Run: guardcmd.RunEval},
+	{Name: "docs", Summary: "Documentation tools: ste-lint checks text against the ASD-STE100 house rules (docs ste-lint [--json] [--strict] [--go] [--changed <base-ref>] [--project-root P] [paths...]); WARN only, exit 1 only with --strict; docs index writes or checks the dated entries of docs/research-index.md (docs index <generate|check> [--project-root P])", Run: runDocs},
+	{Name: "solution", Summary: "Document deliverable contract (ADR-0099): check <solutions/slug> [--project-root DIR] — the same engine as the build floor and the audit gate", Run: runSolution},
+	{Name: "cycle-health", Summary: "11-signal cycle integrity fingerprint", Run: runCycleHealth},
+	{Name: "selfcheck", Summary: "Build self-check: the deliverable contract plus the build handoff floor, bound to the worktree's cycle; the same probe as phase verify build ( selfcheck build [--worktree DIR] )", Run: runSelfcheck},
+	{Name: "plan-and-execute", Summary: "Two-pass dispatch: plan → execute", Run: runPlanAndExecute},
+	{Name: "compose", Summary: "Ad-hoc phase composition", Run: runCompose},
+	{Name: "models", Summary: "Model catalog and attempt performance: refresh | list | performance", Run: runModels},
+	{Name: "tokens", Summary: "Token-usage telemetry: report [--last N] (ranked per-phase consumers)", Run: runTokens},
+	{Name: "lessons", Summary: "Lesson analytics: recurrence (deterministic recurrence ledger, patterns by count + fix status)", Run: runLessons},
+	{Name: "reachability", Summary: "Import-cycle-safety probe for structural test pins (reachability check-pin)", Run: runReachability},
+	{Name: "clihealth", Aliases: []string{"cli-health"}, Summary: "CLI quota/credential benches: list [--json] | clear <family> | usage [--json] [family...] [--project-root DIR]", Run: runClihealth},
+	{Name: "cli", Summary: "CLI binaries: update [--dry-run] [--json] [--project-root P] runs each subscribed family's manifest updater, then smoke-tests a changed version (exit 1 on update-failed or smoke-failed)", Run: runCLICommand},
+	{Name: "practice", Summary: "CLI practice watch: watch [--dry-run] [--json] [--project-root P] reads each configured practice source (changelogs, prompting guides), compares it with its last snapshot and files one inbox research item per changed source (exit 1 on a bad policy, 10 on usage)", Run: runPracticeCommand},
+	{Name: "ratchet", Summary: "Function-size + raw-git-fixture ratchets over a module: check [size|rawgit] [--root DIR]; tighten [--check] [--root DIR] [--project-root P] (the one writer of offenders.json, refused inside a phase or under a live lease)", Run: runRatchet},
+	{Name: "floor", Summary: "Run the local CI floor tier by tier (fmt on CI's pinned Go, vet, integration, e2e, acs-durable, apicover, cover, ratchet): floor run [--tier fmt,vet,...] [--root DIR] [--dry-run]; one PASS/RED/ERROR line per tier, every tier runs, exit 1 on a red tier, 2 when a tier cannot run", Run: runFloor},
+	{Name: "cover", Summary: "Coverage gate over a change: changed --base <ref> [--profile <path>] [--json] [--root DIR] refuses every changed function below 100%; strict [--profile <path>] [--floors <path>] [--json] [--root DIR] refuses every package of go/.cover-strict below its floor", Run: runCover},
+	{Name: "code", Summary: "Read-only code index for phase agents: callers <symbol> [--direction in|out] | api <file> | find <query> | map [dir] [--project-root P]; one hit per line as file:line, symbol, text, or --json for one envelope with the hits and the stale and behind fields; a stale index warns on stderr, or exits 21 when code_index.stale is refuse; exit 1 no result, 2 index absent, 3 unsupported, 10 usage; each call appends one record to the cycle workspace in a phase, else to the user cache (a write failure never changes the exit code); code usage [--since D] [--json] counts the calls by phase and command; code refresh [--json] moves the index worktree to origin/main and rebuilds it (exit 2 absent, 3 inside a phase, 22 foreign changes, 23 fetch failed)", Run: runCodeCommand},
+	{Name: "ladder", Summary: "Retry ladder telemetry: report [--json] [--project-root DIR] prints the tries, fixes and tokens per rung and failure class from each run dir's llm-calls.ndjson; read-only (exit 2 on an absent runs dir, 10 on usage)", Run: runLadderCommand},
+	{Name: "context", Summary: "The cell context index of a phase agent, read-only and agent class A: context index [--layer L1|L2] [--required] [--json] lists the rows of inputs/index.json; context open <id> [--json] prints the body of one row after its sha256 check (both take --workspace W); context stats [--phase P] [--json] [--project-root R] prints the open rate of each kind from the access log (agent class D; exit 0 ok, 1 changed body, 2 no index, 10 usage, 11 unknown id or bad index)", Run: contextcmd.New(contextcmd.Deps{Env: os.Getenv})},
+	{Name: "context-fill", Summary: "Context-window fill telemetry: correlate (peak fill band vs cycle final verdict)", Run: runContextFill},
+}
+
+func lookupCommand(name string) *subcommand {
+	for i := range commands {
+		if commands[i].Name == name {
+			return &commands[i]
+		}
+		for _, a := range commands[i].Aliases {
+			if a == name {
+				return &commands[i]
+			}
+		}
+	}
+	return nil
+}
+
+func runVersion(_ []string, _ io.Reader, stdout, _ io.Writer) int {
+	fmt.Fprintln(stdout, version.Get())
+	return 0
+}
+
+func runHelp(_ []string, _ io.Reader, stdout, _ io.Writer) int {
+	fmt.Fprint(stdout, usage)
+	return 0
+}

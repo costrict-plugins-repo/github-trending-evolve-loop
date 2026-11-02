@@ -1,0 +1,327 @@
+# Context-Window Control (v9.1.0+)
+
+> Canonical reference for evolve-loop's context-size enforcement. Paired
+> capability to `checkpoint-resume.md` — same hazard (resource exhaustion),
+> different dimension (context against cost).
+
+## Why this exists
+
+Cost budgets (`--budget-usd N`) and context budgets are two independent
+dimensions of resource consumption. Pre-v9.1.0:
+
+- **Cost budget**: tracked at the dispatcher level. Cycles ran until
+  cumulative spend exceeded the cap. Hard tripwire at 100%, no graceful
+  pause. (v8.58 Layer B improved this; v9.1.0 Cycle 2 adds 80/95% pre-
+  emptive thresholds.)
+- **Context budget**: WARN-only stderr line per phase. Operator had no
+  way to ask "how much context has this cycle burned?" without grepping
+  scrollback. No cumulative tracking across phases. No autotrim.
+
+v9.1.0 Cycle 6 closes the gap with three deliverables.
+
+## What v9.1.0 Cycle 6 does
+
+### 1. Per-phase autotrim (opt-in)
+
+When `EVOLVE_CONTEXT_AUTOTRIM=1` AND the assembled prompt exceeds
+`EVOLVE_PROMPT_MAX_TOKENS` (default 30000), `subagent-run.sh` trims the
+prompt aggressively:
+
+- Preserve **60% from the head** (instructions, role context, intent).
+- Preserve **35% from the tail** (current task, most recent activity).
+- Drop the middle (typically low-priority ledger entries, instinct
+  summaries, older artifacts).
+- Insert an explicit marker between head and tail so the LLM knows
+  content was dropped.
+
+The trim is non-destructive — Builder's edits, Scout's research, Auditor's
+verdict are all in artifact files; the prompt is just an assembly *view*
+of those artifacts. The next phase reassembles its own prompt from the
+canonical files.
+
+### 2. Per-cycle monitor JSON
+
+`subagent-run.sh` writes `.evolve/runs/cycle-N/context-monitor.json` per
+phase invocation:
+
+```json
+{
+  "cycle": 14,
+  "lastUpdated": "2026-05-11T16:42:00Z",
+  "phases": {
+    "intent":  {"input_tokens": 7340, "cap_tokens": 30000, "cap_pct": 24, "measuredAt": "..."},
+    "scout":   {"input_tokens": 11820, "cap_tokens": 30000, "cap_pct": 39, "measuredAt": "..."},
+    "builder": {"input_tokens": 24500, "cap_tokens": 30000, "cap_pct": 81, "measuredAt": "..."}
+  },
+  "cumulative_input_tokens": 43660,
+  "cumulative_cap": 120000,
+  "cumulative_pct": 36
+}
+```
+
+- `cap_tokens` is the per-phase cap (`EVOLVE_PROMPT_MAX_TOKENS`, default 30k).
+- `cumulative_cap` is `cap_tokens * 4` (~4 expensive phases per cycle).
+- `cumulative_pct` is the cycle-level usage indicator.
+
+### 3. Operator observability
+
+```bash
+$ bash legacy/scripts/observability/show-context-monitor.sh 14
+
+Cycle 14 context-monitor:
+  last updated: 2026-05-11T16:42:00Z
+
+  phase                input_tokens   cap_tokens cap_pct
+  -------------------- ------------ ------------ --------
+  intent                       7340        30000       24
+  scout                       11820        30000       39
+  builder                     24500        30000       81
+
+  CUMULATIVE: 43660 / 120000 tokens (36%)
+```
+
+Variants:
+
+| Flag | Purpose |
+|---|---|
+| (no flag, with `<cycle>`) | Tabular render of the specified cycle |
+| (no args) | Tabular render of the most recent cycle |
+| `--watch` | Live-tail mode (3s refresh) of latest cycle |
+| `--json <cycle>` | Emit raw JSON for scripting |
+
+Threshold annotations:
+
+- `>>> WARN: cumulative >= 80%` — emitted at `EVOLVE_CHECKPOINT_WARN_AT_PCT`
+- `>>> CRITICAL: cumulative >= 95% — next phase will signal checkpoint`
+  — emitted at `EVOLVE_CHECKPOINT_AT_PCT`
+
+The thresholds intentionally share env vars with `checkpoint-resume.md`.
+Context exhaustion and cost exhaustion produce the same operator action
+(graceful pause + resume), so they share the signal channel.
+
+## Env-var reference
+
+| Var | Default | Role |
+|---|---|---|
+| `EVOLVE_PROMPT_MAX_TOKENS` | `30000` | Per-phase cap. Unchanged from v8.56.0; v9.1.0 only adds autotrim enforcement |
+| `EVOLVE_CONTEXT_AUTOTRIM` | `0` (opt-in) | Set `1` to enable head/tail-preserving autotrim when over cap. v9.2 candidate flips default-on once empirical data shows it's non-harmful to verdict quality |
+| `EVOLVE_PROMPT_BUDGET_ENFORCE` | `0` | Pre-v9.1.0 hard-fail mode. Set `1` to fail-fast when over cap instead of WARN. Mutually exclusive with autotrim (autotrim runs first; if it can't get under cap, the cap-enforce check applies) |
+
+## When to enable autotrim
+
+| Workload | Recommendation |
+|---|---|
+| Multi-cycle `/loop` runs (>10 cycles) | Enable. Cumulative context grows; autotrim caps the per-phase burn |
+| Single experimental cycle | Skip. The WARN line tells you what happened; you can iterate |
+| Retrospective-heavy cycles | Skip for retrospective specifically; it's the synthesizer and needs the full picture. Per-role override not yet implemented (Cycle 6 wires global enable only) |
+| Tight subscription quota | Enable. Smaller prompts = lower output tokens = slower quota burn |
+
+## Interaction with checkpoint-resume
+
+The two systems integrate at the threshold layer:
+
+1. **Cumulative context cap** — `subagent-run.sh` records cumulative usage.
+2. **show-context-monitor.sh** emits `WARN`/`CRITICAL` annotations based
+   on the same `EVOLVE_CHECKPOINT_WARN_AT_PCT` / `EVOLVE_CHECKPOINT_AT_PCT`
+   thresholds used by the cost-side dispatcher logic.
+3. **Implicit checkpoint** — when context is in the danger zone, the
+   same `EVOLVE_CHECKPOINT_REQUEST=1` signal is set as for cost.
+
+This applies to a run such as `/evo:loop --budget-usd 5 "<goal>"`. If the run
+hits the context wall before the cost wall, the operator sees the same graceful pause
+as if cost had hit first.
+
+## What v9.1.0 Cycle 6 does NOT do
+
+- **Mid-phase trim.** The autotrim runs at prompt-assembly time, not
+  during an in-flight subagent's reasoning. The subagent's own context
+  is its concern (the kernel can't see it).
+- **Selective phase exemption.** A possible future v9.2+ change is to allow
+  `EVOLVE_CONTEXT_AUTOTRIM_EXCLUDE=retrospective` to skip autotrim for
+  the synthesizer phase. Not yet implemented.
+- **Token-accurate measurement.** The 1-token≈4-bytes heuristic is an
+  upper bound for English text. The cap_pct measurement is conservative
+  — actual token counts are typically 80-95% of the byte-based estimate.
+
+## Context-fill ratio — `internal/contextfill` (cycle-1269)
+
+The autotrim/monitor machinery above measures the **assembled prompt** against an
+operator-set byte-heuristic cap (`EVOLVE_PROMPT_MAX_TOKENS`, default 30000).
+That is a *pre-dispatch* view. It says nothing about how much of the **real
+context window of the model** a phase occupied at the end. The count includes its own output, cache reads
+and cache writes.
+
+`go/internal/contextfill` closes that gap on the measurement side. It is a pure
+stdlib+`cyclestate` leaf. It is a derivation over data that the loop **already** persists
+(`cyclestate.TokenUsage` per phase, rolled up into `<workspace>/phase-timing.json`
+by `internal/phasetiming`). So it needs no new instrumentation of the tmux or
+headless drivers:
+
+```go
+const HotThreshold = 0.85                 // inclusive: >= 0.85 of the window is "hot"
+var  ErrInvalidWindow error               // a window we cannot identify is an error, not a guess
+func FillRatio(tokens cyclestate.TokenUsage, windowSize int) (float64, error)
+func IsHot(ratio float64) bool
+func WindowSizeForTier(tier string) int   // "fast"/"balanced"/"deep"/"top"; unknown => 0
+```
+
+Two design points are load-bearing:
+
+- **Occupancy is the whole token record.** `Input + Output + CacheRead + CacheWrite`
+  all consume window space; summing only `Input`+`Output` under-reports fill by
+  more than half on cache-heavy phases — exactly the phases under pressure.
+- **The ratio is never clamped at 1.0, and an unknown window is never defaulted.**
+  Telemetry that saturates at "full" cannot distinguish a phase that just fit from
+  one that overran by 50%, which is the entire diagnostic value. Likewise an
+  unrecognised tier reports `0` from `WindowSizeForTier`, which flows into
+  `FillRatio` as `ErrInvalidWindow` rather than a fabricated fill number.
+
+`WindowSizeForTier` is deliberately a flat per-**tier** stub (every Claude tier the
+loop routes to today shares a 200k-token window). When that stops
+holding, the upgrade path is a per-model registry keyed off the resolved model id (mirroring
+the tables of `internal/modelcatalog`). This function stays as the tier-level fallback.
+
+### Telemetry wiring (cycle-1271)
+
+The derivation is persisted to the durable per-cycle record. `recordPhaseOutcome` of `internal/core`
+is the ADR-0044 C1 chokepoint and the sole writer of
+`phase-timing.json`. It derives the ratio for **every** terminal phase disposition.
+`phasetiming.Rollup` summarises it at cycle level:
+
+| Field | Where | Meaning |
+|---|---|---|
+| `context_fill_ratio` | `phasetiming.Entry` | window occupancy of the terminal try (`omitempty`) |
+| `context_window_hot` | `phasetiming.Entry` | `contextfill.IsHot(ratio)` — at/above the 0.85 threshold (`omitempty`) |
+| `hot_phase_count` | `phasetiming.Summary` | how many phases ran hot this cycle |
+| `hot_phases` | `phasetiming.Summary` | which ones, by name |
+
+Two contracts hold the wiring honest:
+
+- **The tier is read, never invented.** `PhaseOutcome.ResolvedModel` already *is*
+  the tier that the terminal try ran at (`internal/phases/runner/runner.go` sets it
+  from `tieredRes.Tier`). So it is the lookup key. Anything that is not a canonical
+  tier (a concrete model id, an empty legacy value) yields a `0` window and
+  `ErrInvalidWindow`. This degrades to both fields zero. The error never
+  propagates: the timing record of a phase must not be lost over a missing tier.
+- **Unknown fill is absent, not `0`.** Both entry fields are `omitempty`. So a
+  reader can distinguish "we could not tell" from a genuine `0.0` occupancy. A
+  `phase-timing.json` written before cycle-1271 still parses to the zero value.
+
+Both packages import `contextfill`; **nothing else is allowed to** — it stays a leaf, and a
+cycle-1271 ACS predicate re-checks the real build graph each run.
+
+### Fill vs verdict — `internal/contextfillcorrelate` (cycle-1402)
+
+Deriving and persisting the ratio does not answer the question the ratio exists
+to answer: *do cycles that ran hot fail more often?* Part (3) of the
+`context-fill-telemetry-and-cap` item is the join that asks it.
+
+`go/internal/contextfillcorrelate` is a second leaf — stdlib plus `contextfill`
+(the one definition of the hot boundary) and `phasetiming` (the one reader of the
+timing log). It reimplements neither.
+
+- `Correlate([]CycleFill) Report` is pure.
+  - It buckets each cycle by its **peak**
+    per-phase ratio into ascending bands `[0,0.50) [0.50,0.70) [0.70,0.85)` and an
+    open-ended top band. The lower bound of the top band **is** `contextfill.HotThreshold`.
+  - It then tallies FAIL/PASS/WARN per band plus a coarse hot/cold split with
+    `contextfill.IsHot`.
+- `Load(projectRoot)` reads the real corpus: `knowledge-base/cycles/cycle-*.json`
+  for `final_verdict`, joined by cycle id to
+  `.evolve/runs/cycle-<n>/phase-timing.json` for the recorded ratios.
+- `evolve context-fill correlate [--project-root DIR] [--json] [--out PATH]`
+  (`go/cmd/evolve/cmd_contextfillcorrelate.go`, registered in `registry.go`) is the
+  production caller.
+
+Two invariants keep the evidence honest, both ACS-pinned:
+
+- **Conservation.** `CyclesJoined + len(NoData)` equals the number of dossiers on
+  disk. A cycle with no usable ratio or no verdict is reported in `NoData`. It is
+  never bucketed as a fabricated `0.0`. The risk is a fabricated `0.0` that manufactures the very
+  correlation under measurement. Bucket counts sum to `CyclesJoined`.
+- **An empty corpus is an error, not a zero.** A project root with no dossiers
+  exits non-zero rather than printing an all-zero report.
+
+Bucket `Max` is `+Inf` for the open-ended top band; JSON cannot represent
+infinity, so `Bucket.MarshalJSON` emits `"max": null` and `UnmarshalJSON` restores
+it. The `--json` projection round-trips.
+
+**Three identity/write invariants (cycle-1447).** The join landed with the
+continuation. The invariants were hardened before it landed, and each is a named regression
+test, not a comment:
+
+- **The verdict vocabulary is a closed set** (`FAIL`/`PASS`/`WARN`, in
+  `recognisedVerdicts`). Membership is checked *before* a row is counted.
+  - An unrecognised verdict (schema drift, a future `BLOCKED`) previously incremented
+    `Bucket.Cycles` but did not increment `Fail`. This raised the FailRate
+    denominator only, a silent dilution of the measured correlation.
+  - Such a row is now `NoData`, the same treatment that a missing ratio gets.
+  - The current corpus is
+    100 % inside the set (408 FAIL / 356 PASS / 5 WARN of 769), so this costs
+    nothing today and cannot mislead tomorrow.
+- **The filename is the identity of the cycle**, not the `cycle`
+  field of the dossier body. The glob makes filenames unique by construction. The body is free text
+  that no writer validates. So two dossiers that claimed one id used to tally that cycle
+  twice *while row-based conservation still passed*. The body id is now only a
+  fallback for an unparseable filename, and only for an id not already claimed.
+- **`--out` writes temp-then-rename behind an `Lstat` guard**, matching the
+  atomic-write convention of the repo. The bare `os.WriteFile` followed symlinks with
+  `O_TRUNC`, so a pre-planted `report.md -> <victim>` link truncated the victim.
+
+**The first real-corpus run is not yet a usable signal, and says so.** Over 769
+dossiers: 129 joined, 640 no-data, and *all 129 joined cycles land in the hot
+band* (FAIL rate 0.760). The band is saturated for one reason.
+
+The upstream derivation sums the **cumulative** token usage of a phase across every API
+call against a single window. Observed ratios reach ~75×, not ≤1. The join is
+correct, but its input is not yet an occupancy fraction. A fix (per-call peak
+instead of a running sum) is a prerequisite for reading the correlation. The fix is
+queued as `context-fill-ratio-cumulative-overcount`; see § deferred below.
+
+### Still deliberately deferred
+
+Measurement, telemetry and the verdict join are wired; *behaviour* is not. Three
+follow-ups remain, in dependency order:
+
+0. `context-fill-ratio-cumulative-overcount`: the ratio divides the summed-across-calls `TokenUsage` of a
+   phase by one window.
+   - So it saturates above
+     1.0 (observed up to ~75×) and every joined cycle classifies hot.
+   - Until this is
+     a real occupancy fraction, the cycle-1402 correlation report has no usable
+     contrast. Neither (1) nor (2) can be threshold-tuned from it.
+1. `context-fill-stage-dial` — the `Off`/`Advisory`/`Enforce` dial from
+   `.evolve/policy.json` (the `internal/cyclebudget` Stage precedent). Default-off,
+   byte-identical to today when the policy key is absent.
+2. `context-fill-advisory-prompt-hint` — an advisory `ContextBudgetHint` line beside
+   the existing `TurnBudgetHint` injection (`internal/phases/runner/runner.go`);
+   depends on (1).
+
+Enforce-stage behaviour (interrupting an in-flight phase at the high-water mark)
+needs its own design pass on safely halting a live tmux REPL session.
+
+When (1) lands, the recommendation is that it **reconciles with, not duplicates,** `context-monitor.json`
+above. It is the same hazard, two measurement points (pre-dispatch prompt bytes against realized
+window occupancy). The `hot_phases` rollup is the evidence that is expected to set its
+threshold. Soak it before you choose an enforce trigger.
+
+## See also
+
+- `docs/architecture/checkpoint-resume.md` — paired capability for cost
+  exhaustion.
+- `docs/architecture/token-economics-2026.md` — per-phase cost forensics
+  and ROI-ordered optimization roadmap.
+- `docs/architecture/token-floor-history.md` — campaign-by-campaign
+  static-context floor measurements (see **Campaign E — clean-boot, 2026-07-17**).
+- `docs/research/token-optimization-2026/part4-per-phase-boot-context.md`
+  + `part5-campaign-implementation-2026-07-17.md` — the **clean-boot** campaign: cut the
+  per-turn boot base ~64K→~19–32K with config-injected launch flags (`extra_flags_by_cli`),
+  measured **−39% cache_read/cycle**. Complementary lever to autotrim: autotrim trims the
+  *assembled prompt*; clean-boot trims the *fixed boot + tool-schema base* re-read every
+  turn. Measurement prerequisite (token telemetry attribution fix): part5 §1 +
+  `docs/architecture/adr/0071-token-telemetry-attribution-and-clean-boot.md`.
+- `docs/adr/0002-disable-slash-commands-semantics.md` — the defense-in-depth semantics
+  the clean-boot skill flags follow (master-off + `Skill(<name>)` allowlist).
+- `legacy/scripts/observability/show-context-monitor.sh` — operator-facing tool.
+- `legacy/scripts/tests/context-window-control-test.sh` — 22-assertion test
+  suite covering autotrim algorithm, monitor JSON, and operator tool.

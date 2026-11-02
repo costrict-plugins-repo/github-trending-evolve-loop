@@ -1,0 +1,38 @@
+{
+  "name": "variance-analysis",
+  "catalog": "on-demand",
+  "archetype": "evaluate",
+  "agent": "evolve-variance-analysis",
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/scout-report.md"
+    ],
+    "signals": []
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/variance-analysis-report.md"
+    ],
+    "signals": [
+      "variance.material_count"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Budget vs Actual",
+      "Classification",
+      "Drivers",
+      "Reforecast Impact"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "accounting-close"
+      }
+    ]
+  },
+  "after": "triage"
+}

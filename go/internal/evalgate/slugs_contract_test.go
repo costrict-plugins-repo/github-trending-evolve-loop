@@ -1,0 +1,44 @@
+package evalgate
+
+import (
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+)
+
+func TestSlugParserContract(t *testing.T) {
+	union := scoutProducerUnion(t)
+	for _, tok := range []string{
+		"## Selected Tasks",
+		"**Slug:**",
+		"## Decision Trace",
+		"finalDecision",
+		"selected",
+	} {
+		if !strings.Contains(union, tok) {
+			t.Errorf("scout producer templates no longer declare %q — SelectedSlugs (Gate A's block input) "+
+				"may silently mis-extract; reconcile slugs.go with agents/evolve-scout*.md", tok)
+		}
+	}
+}
+
+func scoutProducerUnion(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed; cannot locate agents/")
+	}
+	agentsDir := filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "agents")
+	var b strings.Builder
+	for _, name := range []string{"evolve-scout.md", "evolve-scout-reference.md"} {
+		data, err := os.ReadFile(filepath.Join(agentsDir, name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		b.Write(data)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}

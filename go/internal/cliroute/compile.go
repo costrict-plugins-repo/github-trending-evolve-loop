@@ -1,0 +1,309 @@
+package cliroute
+
+import (
+	"errors"
+	"fmt"
+	"io/fs"
+	"maps"
+	"slices"
+	"sort"
+	"strings"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/llmroute"
+	"github.com/mickeyyaya/evolve-loop/go/internal/phasecontract"
+	"github.com/mickeyyaya/evolve-loop/go/internal/policy"
+)
+
+type CompileOption func(*compiler)
+
+func WithToolCapable(fn func(driver string) bool) CompileOption {
+	return func(c *compiler) { c.toolCapable = fn }
+}
+
+func WithOverrides(o Overrides) CompileOption {
+	return func(c *compiler) { c.overrides = o }
+}
+
+func Compile(p policy.Policy, cat Catalog, profs ProfileSource, opts ...CompileOption) (Table, []Finding) {
+	c := &compiler{pol: p, cat: cat, agentKeys: map[string]string{}}
+	for _, opt := range opts {
+		opt(c)
+	}
+	t := Table{pol: p, catalog: cat, floors: p.Floors(), overrides: c.overrides}
+	t.profiles = c.snapshotProfiles(profs)
+	if p.CLIRouting != nil {
+		c.block = *p.CLIRouting
+		t = c.compileDeclared(t)
+	}
+	t.findings = slices.Clone(c.findings)
+	return t, slices.Clone(c.findings)
+}
+
+type compiler struct {
+	block       policy.CLIRouting
+	pol         policy.Policy
+	cat         Catalog
+	toolCapable func(string) bool
+	overrides   Overrides
+	names       []string
+	agentKeys   map[string]string
+	findings    []Finding
+}
+
+func (c *compiler) compileDeclared(t Table) Table {
+	t.declared = true
+	t.clis = c.compileCLIs()
+	c.checkFloors(t.floors, t.clis)
+	t.chains = c.compileSharedChains()
+	agentChains, models := c.compileAgents()
+	maps.Copy(t.chains, agentChains)
+	t.models = models
+	t.bounds = c.compileLadderBounds()
+	t.orders = c.compileOrders()
+	t.tiers = c.compileTiers(t.clis)
+	t.shares = c.compileShares(t.tiers)
+	t.stop = c.compileAfterChain()
+	t.roles = c.agentRoles()
+	t.agentKeys = maps.Clone(c.agentKeys)
+	c.checkTwoSources()
+	c.checkAgents(t)
+	c.checkProfileLessLaunches(t)
+	return t
+}
+
+func (c *compiler) add(severity Severity, key, format string, args ...any) {
+	f := Finding{Severity: severity, Key: key, Message: fmt.Sprintf(format, args...)}
+	if !slices.Contains(c.findings, f) {
+		c.findings = append(c.findings, f)
+	}
+}
+
+func (c *compiler) snapshotProfiles(profs ProfileSource) map[string]loadedProfile {
+	snapshot := map[string]loadedProfile{}
+	if profs == nil {
+		c.add(SeverityError, "profiles", "no profile source was given, so no agent can be checked or resolved")
+		return snapshot
+	}
+	names, err := profs.List()
+	if err != nil && errors.Is(err, fs.ErrNotExist) && c.pol.CLIRouting == nil {
+		c.add(SeverityWarn, "profiles", "the profiles directory does not exist, so every agent routes with no profile, as before the routing table: %v", err)
+		return snapshot
+	}
+	if err != nil {
+		c.add(SeverityError, "profiles", "listing the profiles failed: %v", err)
+		return snapshot
+	}
+	sort.Strings(names)
+	c.names = names
+	for _, name := range names {
+		p, err := profs.Get(name)
+		snapshot[name] = loadedProfile{profile: p, err: err}
+		c.checkModelMismatchTrigger(name, p)
+	}
+	return snapshot
+}
+
+func (c *compiler) isProfile(name string) bool {
+	_, found := slices.BinarySearch(c.names, name)
+	return found
+}
+
+func (c *compiler) driver(key, entry string) (string, bool) {
+	d := llmroute.DefaultDriverForFamily(strings.TrimSpace(entry))
+	if !llmroute.KnownDriver(d) {
+		c.add(SeverityError, key, "unknown family or driver %q (families: claude, codex, agy, ollama; or a registered driver)", entry)
+		return "", false
+	}
+	if c.toolCapable != nil && !c.toolCapable(d) {
+		c.add(SeverityError, key, "%s cannot use tools, so it cannot run a phase", d)
+		return "", false
+	}
+	return d, true
+}
+
+func (c *compiler) compileCLIs() []string {
+	var out []string
+	for _, entry := range c.block.CLIs {
+		d, ok := c.driver("cli_routing.clis", entry)
+		if ok && !slices.Contains(out, llmroute.Family(d)) {
+			out = append(out, llmroute.Family(d))
+		}
+	}
+	return out
+}
+
+func (c *compiler) checkFloors(floors policy.Floors, clis []string) {
+	seen := map[string]string{}
+	for _, family := range floors.Families() {
+		key := "cli_routing.floors." + family
+		if !llmroute.KnownDriver(llmroute.DefaultDriverForFamily(family)) {
+			c.add(SeverityError, key, "unknown family %q (families: claude, codex, agy, agy-claude, ollama)", family)
+			continue
+		}
+		if !slices.Contains(clis, family) {
+			c.add(SeverityError, "cli_routing.clis", "%s must be listed: the floor agents %v run only on %s", family, floors[family], family)
+		}
+		for _, agent := range floors[family] {
+			if prev, taken := seen[agent]; taken {
+				c.add(SeverityError, key, "names agent %s, which the %s floor already holds", agent, prev)
+				continue
+			}
+			seen[agent] = family
+		}
+	}
+}
+
+func (c *compiler) compileChain(key string, entries []string) ([]string, bool) {
+	if len(entries) == 0 {
+		c.add(SeverityError, key, "an empty chain runs nothing; list at least one CLI")
+		return nil, false
+	}
+	var out []string
+	for _, entry := range entries {
+		if d, ok := c.driver(key, entry); ok && !slices.Contains(out, d) {
+			out = append(out, d)
+		}
+	}
+	return out, len(out) > 0
+}
+
+func (c *compiler) compileSharedChains() map[string][]string {
+	chains := map[string][]string{}
+	if c.block.Default != nil {
+		if chain, ok := c.compileChain("cli_routing.default", c.block.Default); ok {
+			chains[ruleDefault] = chain
+		}
+	}
+	for _, role := range sortedKeys(c.block.Work) {
+		key := "cli_routing.work." + role
+		if !slices.Contains(knownRoles, role) {
+			c.add(SeverityError, key, "unknown role %q (roles: %s)", role, strings.Join(knownRoles, ", "))
+			continue
+		}
+		if chain, ok := c.compileChain(key, c.block.Work[role]); ok {
+			chains[workPrefix+role] = chain
+		}
+	}
+	return chains
+}
+
+func (c *compiler) compileAgents() (map[string][]string, map[string]string) {
+	chains, models := map[string][]string{}, map[string]string{}
+	for _, key := range sortedKeys(c.block.Agents) {
+		path := "cli_routing.agents." + key
+		agent, ok := c.agentOf(key)
+		if !ok {
+			c.add(SeverityError, path, "%q is neither a tracked profile nor a phase of the merged catalog", key)
+			continue
+		}
+		if prev, taken := c.agentKeys[agent]; taken {
+			c.add(SeverityError, path, "names agent %s, which agents.%s already sets", agent, prev)
+			continue
+		}
+		c.agentKeys[agent] = key
+		rule := c.block.Agents[key]
+		c.checkEffort(path, rule.Effort)
+		if rule.Effort != "" && agent != key {
+			c.add(SeverityError, path+".effort", "an effort is keyed by the agent name: set it on agents.%s, not on the alias %s", agent, key)
+		}
+		if !inheritsChain(rule) {
+			if chain, ok := c.compileChain(path, rule.CLI); ok {
+				chains[agentsPrefix+agent] = chain
+			}
+		}
+		if rule.Model == "" {
+			continue
+		}
+		if !slices.Contains(policy.TierNames(), rule.Model) {
+			c.add(SeverityError, path+".model", "unknown tier %q (tiers: %s)", rule.Model, strings.Join(policy.TierNames(), ", "))
+			continue
+		}
+		models[agent] = rule.Model
+	}
+	return chains, models
+}
+
+func (c *compiler) agentOf(key string) (string, bool) {
+	if c.isProfile(key) {
+		return key, true
+	}
+	return c.agentOfPhase(key)
+}
+
+func (c *compiler) agentOfPhase(phase string) (string, bool) {
+	if c.cat == nil {
+		return "", false
+	}
+	spec, ok := c.cat.Get(phasecontract.RegistryKey(phase))
+	if !ok {
+		return "", false
+	}
+	agent := strings.TrimPrefix(spec.AgentName(), "evolve-")
+	return agent, c.isProfile(agent)
+}
+
+func (c *compiler) compileTiers(clis []string) map[string][]string {
+	out := map[string][]string{}
+	for _, tier := range sortedKeys(c.block.Tiers) {
+		key := "cli_routing.tiers." + tier
+		if !slices.Contains(policy.TierNames(), tier) {
+			c.add(SeverityError, key, "unknown tier %q (tiers: %s)", tier, strings.Join(policy.TierNames(), ", "))
+			continue
+		}
+		rule := c.block.Tiers[tier]
+		c.checkEffort(key, rule.Effort)
+		switch {
+		case len(rule.CLIs) > 0:
+			out[tier] = c.ceilingFamilies(key, rule.CLIs, clis)
+		case rule.Effort == "":
+			c.add(SeverityError, key, "an empty ceiling leaves no CLI at %s", tier)
+			out[tier] = []string{}
+		}
+	}
+	return out
+}
+
+func (c *compiler) checkEffort(key, effort string) {
+	if effort == "" {
+		return
+	}
+	if err := policy.ValidateEffort(effort); err != nil {
+		c.add(SeverityError, key+".effort", "%v", err)
+	}
+}
+
+func (c *compiler) ceilingFamilies(key string, entries, clis []string) []string {
+	families := []string{}
+	for _, entry := range entries {
+		d, ok := c.driver(key, entry)
+		if !ok {
+			continue
+		}
+		if fam := llmroute.Family(d); slices.Contains(clis, fam) {
+			families = append(families, fam)
+		} else {
+			c.add(SeverityError, key, "%s is not in clis %v", fam, clis)
+		}
+	}
+	return families
+}
+
+func (c *compiler) compileAfterChain() bool {
+	switch c.block.AfterChain {
+	case "", afterChainOn:
+		return false
+	case afterChainOff:
+		return true
+	}
+	c.add(SeverityError, "cli_routing.after_chain", "unknown value %q (values: %s, %s)", c.block.AfterChain, afterChainOn, afterChainOff)
+	return false
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}

@@ -1,0 +1,66 @@
+package bridge
+
+import (
+	"context"
+	"strings"
+	"testing"
+)
+
+func namedCaptureCfg(t *testing.T, name string) *Config {
+	t.Helper()
+	return &Config{
+		CLI: "claude-tmux", Workspace: t.TempDir(), Agent: "models",
+		SessionName: name, Realization: RealizeFor("claude-tmux", LaunchIntent{}),
+	}
+}
+
+func TestCaptureModelPicker_OpensImmediately(t *testing.T) {
+	t.Parallel()
+	picker := "Select model\n1. Default  Opus 4.8\n2. Sonnet  Sonnet 4.6\n3. Haiku  Haiku 4.5"
+	sess := NamedSessionName("mp1")
+	tx := &fakeTmux{existing: map[string]bool{sess: true}, paneSeq: []string{picker}}
+	cfg := namedCaptureCfg(t, "mp1")
+
+	pane, err := CaptureModelPicker(context.Background(), cfg, recipeDeps(tx), "claude-tmux")
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if !strings.Contains(pane, "Select model") {
+		t.Fatalf("pane missing picker: %q", pane)
+	}
+	if !tx.sentContains("Escape") {
+		t.Fatalf("Escape never sent; sends=%v", tx.sentKeys)
+	}
+}
+
+func TestCaptureModelPicker_NeverOpensErrors(t *testing.T) {
+	t.Parallel()
+	sess := NamedSessionName("mp2")
+	tx := &fakeTmux{existing: map[string]bool{sess: true}, paneSeq: []string{"just a prompt ❯"}}
+	cfg := namedCaptureCfg(t, "mp2")
+
+	if _, err := CaptureModelPicker(context.Background(), cfg, recipeDeps(tx), "claude-tmux"); err == nil {
+		t.Fatal("expected error when picker never opens")
+	}
+	if !tx.sentContains("Escape") {
+		t.Fatalf("Escape not sent on failure path; sends=%v", tx.sentKeys)
+	}
+}
+
+func TestCaptureModelPicker_UnknownCLI(t *testing.T) {
+	t.Parallel()
+	cfg := &Config{Workspace: t.TempDir()}
+	if _, err := CaptureModelPicker(context.Background(), cfg, recipeDeps(&fakeTmux{}), "no-such-cli"); err == nil {
+		t.Fatal("expected manifest error for unknown CLI")
+	}
+}
+
+func TestContainsAnySubstring(t *testing.T) {
+	t.Parallel()
+	if !containsAnySubstring("foo Switch Model bar", modelPickerMarkers) {
+		t.Fatal("should match agy marker")
+	}
+	if containsAnySubstring("no markers here", modelPickerMarkers) {
+		t.Fatal("should not match")
+	}
+}

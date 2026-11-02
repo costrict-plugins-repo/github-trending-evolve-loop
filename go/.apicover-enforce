@@ -1,0 +1,866 @@
+# apicover enforced packages (ADR-0050 Phase 5).
+#
+# One `go list` package pattern per line. Packages listed here have reached the
+# Phase 5 public-API Definition of Done — 0 uncovered exported symbols, no
+# false-greens (named-but-0%), >=85% line coverage, godoc on every export,
+# every .go < 800 LOC — and are gated HARD in CI: a regression that adds an
+# unnamed or never-asserted export fails the `go` workflow.
+#
+# The warning-only full sweep (.github/workflows/go.yml) still reports every
+# other internal/* package; graduate one by bringing it to DoD, then add its
+# pattern here. Blank lines and `#` comments are ignored.
+#
+# This file is the single source of truth: the CI enforce step (and any future
+# acs ship-gate predicate) read it, so the two enforcement surfaces cannot drift.
+
+./internal/bypass
+./internal/failuregrade
+./internal/auditchain
+./internal/auditcalibration
+./internal/phaseoutputs
+./internal/scopedelta
+./internal/skillcheck
+./internal/skilloverlay
+./internal/flagregistry
+./internal/soakreport
+
+# Phase 5 batch graduation (2026-06-16): 35 packages already at the public-API
+# DoD (0 uncovered, 0 false-green, godoc complete, >=85% cover, every .go <800).
+# Verified with integration-tagged coverage (matches CI's measurement).
+./internal/acsrunner
+./internal/adapters/flock
+./internal/adapters/storage
+./internal/adapters/yamlcodec
+./internal/atomicwrite
+./internal/backfill
+./internal/bedrock
+./internal/binaryguard
+./internal/bridge/keyspec
+./internal/bridge/panestream
+./internal/panewatch
+./internal/bridge/phaseidentity
+./internal/changedpkgs
+./internal/ciparity
+./internal/codequality
+./internal/detectnested
+./internal/directives
+./internal/evalgate
+./internal/gitexec
+./internal/goalhash
+./internal/guardslog
+./internal/logfilter
+./internal/mergegate
+./internal/paths
+./internal/phaseblock
+./internal/phaseintegrity
+./internal/phaseio
+./internal/phaseorder
+./internal/phases/debugger
+./internal/phases/flakererunscan
+./internal/phases/registry
+./internal/phases/secretleakscan
+./internal/phases/specrunner
+# Per-phase latency evidence: the single-source timing schema (Entry) + Read +
+# Rollup + HumanMS, consumed by core (writer), dossier, and `evolve cycle timing`.
+./internal/phasetiming
+./internal/phasewatchdog
+./internal/plane
+./internal/verifylock
+./internal/policy
+./internal/projecthash
+./internal/quotareset
+./internal/quotastate
+./internal/redteamcheck
+./internal/releaseconsistency
+./internal/runlease
+./internal/selfsha
+./internal/sessionrecord
+./internal/setup
+./internal/shipwindow
+./internal/sysexec
+./internal/systemprompt
+./internal/textutil
+./internal/topngate
+./internal/triagecap
+
+# Phase 5 godoc batch (2026-06-16)
+./internal/gc
+./internal/faillearn
+./internal/semvercheck
+./internal/versionbump
+./internal/changeloggen
+./internal/phases/scout
+./internal/phases/intent
+./internal/phases/triage
+./internal/phasecoherence
+
+# Phase 5 adapters/bridge graduation (2026-06-16): the lone apicover-clean adapter
+# that sat just under the floor (84.6%); lifted to 88.5% with two meaningful
+# nil-resolver fallback tests (SetContractResolver(nil) restores built-in-only
+# resolution; zero-value Adapter degrades to built-in instead of nil-panicking).
+./internal/adapters/bridge
+
+# Phase 5 named-return-type batch (2026-06-16): 10 packages already at 100% line
+# coverage whose single flagged export is a type RETURNED by a constructor but
+# never NAMED in a test (Result/Phase/PhaseConfig/AutoModel/VerifyContext/Guard).
+# Each gets one meaningful test that names the type via a `want := T{...}` /
+# `var x T = New(...)` binding AND asserts a real contract (full-struct equality,
+# phase identity, leak detection, auto-model expansion).
+./internal/verifyeval
+./internal/pruneephemeral
+./internal/posteditvalidate
+./internal/phases/swarmplan
+./internal/phases/build
+./internal/phaseconfig
+./internal/llmroute
+./internal/kerneltest
+./internal/ledgerverify
+./internal/guards/treediff
+./internal/detectcli
+
+# Phase 5 gap=1 tail batch (2026-06-16): 21 packages each with ONE exported symbol
+# never named in a test (all already >=85% cover). 18 get one meaningful test that
+# names AND exercises the symbol: a TYPE (want := T{...} / var x T = New(...)), a
+# CONST asserted via its real consumer (SkipExitCode/SealKind/SeverityFatal), or a
+# VAR (CanonicalTiers filter). The other 3 had a DEAD exported error sentinel
+# (ErrUnknownPhase/ErrCycleNonPositive/ErrUnknown — zero references tree-wide, the
+# real failure path returns exit codes); those were DELETED (YAGNI) rather than
+# pinned with a meaningless errors.Is test.
+./internal/acssuite
+./internal/adapters/ledger
+./internal/adapters/observer
+./internal/aggregator
+./internal/bridge/inbox
+./internal/capability
+./internal/cycleclassify
+./internal/cyclehealth
+./internal/cyclesimulator
+./internal/doctor
+./internal/fleet
+./internal/fleetbudget
+./internal/log
+./internal/marketplacepoll
+./internal/modelcatalog
+./internal/phaseregistrar
+./internal/phases/retro
+./internal/phases/swarmrunner
+./internal/phases/tdd
+./internal/releasepipeline
+./internal/resolvellm
+./internal/verdictcache
+
+# Phase 5 gap=2 tail batch (2026-06-16): 19 packages each with TWO exported
+# symbols never named in a test (all already >=90% cover). 15 get meaningful
+# tests that name AND exercise each symbol (types via want:=T{...}/var x T=New(),
+# consts/vars via their real consumer, funcs/methods by direct invocation). The
+# other 4 packages had a DEAD exported error sentinel / unwired enum member
+# (ErrAutoResumeExhausted/MissingInputError/ErrUsage — zero refs; the real paths
+# return exit codes — and EventSameCycleStreak — emitted by nothing, the breaker
+# uses EventCircuitBreakerTripped); those were DELETED (YAGNI) rather than pinned
+# with a meaningless test.
+./internal/adapters/sandbox
+./internal/budgethistory
+./internal/checkpoint
+./internal/clihealth
+./internal/consensusdispatch
+./internal/core/evidence
+./internal/cyclecost
+./internal/cycleoutcome
+./internal/dispatchevents
+./internal/failureadapter
+./internal/fanoutdispatch
+./internal/modelquery
+./internal/panetrust
+./internal/phaseinventory
+./internal/phases/audit
+./internal/phases/buildplanner
+./internal/phasestream
+./internal/preflight
+./internal/releasepreflight
+./internal/research
+./internal/profiles
+
+# Phase 5 gap=3 tail batch (2026-06-16): 10 packages each with THREE exported
+# symbols never named in a test (all already >=90% cover). Each gets one
+# meaningful apicover_named_test.go — types via full-struct equality / interface
+# satisfaction+exercise (Skipper, InlinePromptProvider, BaseRunner), JSON-tag
+# round-trips (Journal/LedgerEntry), output structs via their real producer
+# (ClaimResult/PromoteResult/RecoverResult, Result/PrefixManifest/PrefixRule via
+# Run), consts via consumer (ExitMissingBin/DefaultTTL/FullOrchestrator), funcs
+# by invocation (NewWithDefaultRunnerStage/NewForProject/ApplyArchetypeDefaults/
+# Roots), methods invoked (Class.IsValid). No dead exports in this tier.
+./internal/bridge/capabilities
+./internal/commitprefixgate
+./internal/inboxmover
+./internal/phases/runner
+./internal/phases/ship
+./internal/phasespec
+./internal/prompts
+./internal/rollback
+./internal/routingeval
+./internal/routingtest
+./internal/skillinventory
+
+# Phase 5 gap=4 tail batch (2026-06-16): 8 packages each with FOUR exported
+# symbols never named in a test (all already >=93% cover). One meaningful
+# apicover_named_test.go per package — config routing structs via Load JSON
+# field-mapping; bridge/channel Policy/Producer/Supervisor via real producers
+# (OnEvent/Run/Ask); evalqualitycheck Result/ClassifiedLine/Diversity via
+# Check/CheckDiversity; failurelog consts via Prune/Record consumers + structs
+# full-equality; guards Chain/DocDelete/Quota/Ship via core.Guard satisfaction +
+# Decide; looppreflight consts/var via resolve() + MarshalJSON methods invoked
+# directly; recovery Decision/PhaseOutcome/StallAction/StallPolicy via Recover/
+# Decide; reflection consts via Validate/AcceptedByAggregator + structs. No dead
+# exports in this tier.
+./internal/bridge/channel
+./internal/config
+./internal/evalqualitycheck
+./internal/failurelog
+./internal/guards
+./internal/looppreflight
+./internal/recovery
+./internal/reflection
+
+# tracked-state answer for repo-wide scanners (ADR-0084 invariant 1, 2026-08-10
+# new-package graduation): stdlib+git leaf; TrackedFiles/TrackedSet asserted
+# end-to-end against a real git fixture by apicover_named_test.go.
+./internal/repostate
+
+# retro→inbox preventive-actions autofiler (cycle-657, new-package graduation):
+# stdlib-only leaf; ParsePreventiveActions/FileActions/PreventiveAction all
+# asserted by the white-box suite at internal/retrofile/retrofile_test.go.
+./internal/retrofile
+
+# Phase 5 gap=5-7 tail batch (2026-06-16): 5 packages (5-7 unnamed exports
+# each, all >=95% cover). phaseobserver: Scope enum (since ADR-0103 unit 12 aliases of the
+# observerengine spellings) + DefaultProcessAlive (live pgid probe); the ExitFatal member was
+# deleted (zero consumers tree-wide). deliverable: 4 Verify
+# error codes via real fixtures + NewVerifier/NewVerifierWithCatalog. subagent:
+# 5 *Result structs bound from their producers + TierHaiku via ResolveModelTier.
+# bridge/recipe: Result/StepResult/StepStatus/SessionDriver/SendKind/AwaitKind/
+# OnTimeoutAbort via Engine.Run. envchain: 7 Key/Def/Max env consts driven
+# through their real IntMin/Int getters (resolver contract reproduced; envchain
+# cannot import its core/cyclehealth consumers). No dead exports.
+./internal/phaseobserver
+./internal/deliverable
+./internal/subagent
+./internal/bridge/recipe
+./internal/envchain
+
+# Phase 5 heavy tier batch (2026-06-17): the 5 highest-gap packages (11-14
+# unnamed exports each). bridge: FakeTmuxController.PaneCommand/JiggleWindow
+# (false-green fixed by real invocation) + PaneCommander + Report/ArtifactRef/
+# FileRef via BuildReport + DoctorReport/DoctorResult/AuthInfo/BinaryInfo/
+# DeepProbe via Engine.Doctor. phasecontract: render/sentinel consts via their
+# producers + SynthesizesContract + CatalogResolver + VerdictSentinel + the 5
+# builtin Report vars (Audit/Build/Intent/Scout/Triage) wired into the registry.
+# router: DefaultShipFloor/FailureInsertPhases/IsFailureInsert/HandoffsFromSignals
+# + BenchedCLI/CarryoverTodo/MintSpec/PhaseCard/PhasePolicy/Planner/RoutingStrategy
+# via the strategy engine + clamp. interaction: 9 Result consts via the Rollup
+# producer->consumer path + Rollup + CorrectionAction + InteractionRule. swarm:
+# 14 merge-train/kill/registry interface seams + report structs via their real
+# impls/producers. No dead exports.
+./internal/bridge
+./internal/bridge/clicontrol
+./internal/usageprobe
+./internal/usageevidence
+./internal/phasecontract
+./internal/router
+./internal/interaction
+./internal/swarm
+
+# Phase 5 FINAL — internal/core graduation (2026-06-17): the central package
+# (193 exports). 3 cohesive test files name + exercise the last 62 uncovered
+# symbols: apicover_shiperror_test.go (4 ShipError protocol types + 34 ship-error
+# /stage consts, table-driven through NewShipError+AsShipError with per-code Class
+# transcribed from the live ship call-sites); apicover_ports_test.go (Bridge/Guard
+# /Ledger/Storage ports via the in-package fakes + GuardInput/GuardDecision/
+# BatchAccrual/TriageThroughputEntry DTOs + LedgerEntry.UnmarshalJSON); and
+# apicover_misc_test.go (Failure/PhaseAdvisor + their Option seams, Observer/
+# StateMachine/StateUpdater/WorktreeProvisioner/ThroughputRecorder, SealResult,
+# VerdictReason, Orchestrator.FailureAdviserWired, PhaseBoundaryCheckpointer var,
+# CycleStateFile/PhaseSwarmPlan consts). This completes the tail: ALL internal
+# packages are now in the apicover hard-fail gate.
+./internal/core
+
+# Decoupling campaign (2026-06-21): internal/cyclestate is the zero-dependency
+# domain-vocabulary leaf extracted from core (Phase type + verdict/cycle-outcome
+# constants + IsVerdict). core re-exports via alias; cyclestate_test.go names +
+# exercises every export. Bottom-up: the most-depended-on symbols now depend on
+# nothing themselves.
+./internal/cyclestate
+
+# Decoupling campaign (2026-06-21): internal/shiperr is the zero-dependency leaf
+# holding the ship→orchestrator error protocol (ShipError + Code/Class/Stage
+# vocab + NewShipError/AsShipError). Extracted from core so BOTH the ship phase
+# (constructs) and core (matches) import it one-directionally — no cycle. core
+# re-exports via aliases; shiperr tests name+exercise every export.
+./internal/shiperr
+
+# Decoupling campaign (2026-06-21): internal/cli/guardcmd holds the guard/gate
+# CLI handlers (guard, commit-gate, commit-prefix-gate, eval, preflight,
+# postedit-validate) extracted from the cmd/evolve package main. registry.go
+# routes to guardcmd.Run*; shared helpers via cmd/evolve/cmdutil.
+./internal/cli/guardcmd
+
+# Decoupling campaign (2026-06-21): internal/cli/opscmd holds the release/ops CLI
+# handlers (doctor, changelog-gen, version-bump, marketplace-poll, release-*,
+# rollback) extracted from cmd/evolve package main. Shared helpers via cmdutil.
+./internal/cli/opscmd
+
+# Decoupling campaign (2026-06-21): internal/cli/phasecmd holds the phase-subsystem
+# CLI handlers (phase/phases/serve-phase/phase-order/inventory/observer/watchdog)
+# extracted from cmd/evolve package main. Shared helpers via cmdutil; registry
+# snapshot idiom via registry.SnapshotForTest.
+./internal/cli/phasecmd
+
+# bash->Go migration Wave B0 (2026-06-18): tree-state SHA extracted from ship's
+# computeTreeStateSHA into a shared leaf so the commit-gate attestation reader and
+# the audit-binding verifier hash via ONE impl. SHA + RunError named/exercised by
+# treestate_test.go (table seam + real-git/shell parity).
+./internal/treestate
+# treedelta — the byte-exact change between a base and a tree; the carry across a rebase (ADR-0105 B3/B4) proves identity with it.
+./internal/treedelta
+# shipmanifest — the one selection of "which paths Ship commits": declared report manifest, porcelain parsing, the staging pathspec.
+./internal/shipmanifest
+
+# bash->Go migration Wave B1 (2026-06-18): commit-gate-runner.sh ported to a
+# native gate (lang-detect + reviewer precondition + lint lanes + tree-SHA-bound
+# attestation). Every export named: Exit* consts (exit-code contract), Options/
+# Result/Attestation/Runner via behavior+composite tests, Options.Run + Marshal
+# via behavior tests, plus a differential-parity test proving the Go writer emits
+# a byte-identical attestation to the bash runner before B2 deletes it.
+./internal/commitgate
+./internal/installer
+
+# cycle-9 ACS predicate package (2026-06-19): consolidate-fanout-cluster.
+# Completeness invariant: every ./acs/cycle<N>/ package must be enrolled.
+./acs/cycle9
+
+# cycle-10 ACS predicate package (2026-06-19): test-seam-registry-sweep.
+# Completeness invariant: every ./acs/cycle<N>/ package must be enrolled.
+./acs/cycle10
+
+# cycle-11 ACS predicate package (2026-06-19): consolidate-observer-inactivity-cluster.
+# Completeness invariant: every ./acs/cycle<N>/ package must be enrolled.
+./acs/cycle11
+
+# cycle-12 ACS predicate package (2026-06-19): consolidate-bridge-cluster.
+# Completeness invariant: every ./acs/cycle<N>/ package must be enrolled.
+./acs/cycle12
+
+# cycle-13 ACS predicate package (2026-06-19): consolidate-checkpoint-cluster.
+# Completeness invariant: every ./acs/cycle<N>/ package must be enrolled.
+./acs/cycle13
+
+# Concurrent evolve-loop Layer-1 (2026-06-18): runscope is the single-source
+# Value Object for all run/cycle/lane-scoped names (worktree branches+dirs, tmux
+# session prefixes). Composes the projecthash lane + sessionrecord run-token
+# leaves; retires the duplicated minting sites. Every export named/exercised by
+# runscope_test.go (table-driven projections + back-compat token pin).
+./internal/runscope
+
+# Concurrent evolve-loop Layer-2 Slice 3 (2026-06-18): registry-scoped orphan
+# reaping is gated by fresh per-run leases so a dead run cannot reap live peers.
+./internal/sessionreaper
+
+# Concurrent evolve-loop Layer-2 Slice 4 (2026-06-18): cross-process LLM-CLI
+# admission control via flock'd holder-set JSON. Acquire/DefaultTTL named by
+# apicover_named_test.go; max<=0 unbounded path is byte-identical to today.
+./internal/cliadmit
+
+# Advisor-decided cycle budget (2026-06-18): cyclebudget is the pure decision core
+# for completion-driven loop termination (advisor/backlog decides when to stop, cap
+# bounds runaway) — the EVOLVE_CYCLE_BUDGET off/advisory/enforce dial. Every export
+# (Stage + consts + String/ParseStage, Decision, Next) named+exercised by
+# cyclebudget_test.go (table-driven across all stages + completion/cap precedence).
+./internal/cyclebudget
+
+# Cycle Dossier (ADR-0055): durable per-cycle history record.
+./internal/committedset
+./internal/dossier
+
+# Post-push GitHub CI watch (cycle-748 push-ci-watch-remote-parity): Watch +
+# GHFetcher named+exercised by ciwatch_test.go through faked fetcher/exec seams.
+./internal/ciwatch
+
+# Cycle Dossier ACS gate (ADR-0055 D3); rehomed from cycle2 (v20 collision).
+./acs/cycle6
+# ADR-0054 campaign planner: deterministic plan verification/rendering and the
+# dependency-level engine are both public internal APIs consumed by cmd/evolve.
+./internal/campaign
+./internal/dag
+
+# Cycle-6 merge rehomes the branch's original cycle1/cycle3 acceptance suites
+# so main's v20 suites retain their canonical cycle numbers.
+./acs/cycle8
+./acs/cycle14
+
+# cycle-17 ACS predicate package (2026-06-19): campaign-verify-comma-rejection,
+# fix-preliminary-study-metadata, cmd-campaign-dispatch-coverage.
+# Completeness invariant: every ./acs/cycle<N>/ package must be enrolled.
+./acs/cycle17
+# Completeness invariant: every ./acs/cycle<N>/ package must be enrolled.
+./acs/cycle15
+
+# flag-reduction campaign cycle-14: internal/ipcenv is the IPC-protocol const
+# leaf for EVOLVE_FLEET / EVOLVE_FLEET_SCOPE / EVOLVE_WORKTREE_ROOT — zero
+# intra-repo imports, no flagregistry row (protocol, not operator dial).
+./internal/ipcenv
+
+# release-flow hardening (2026-06-24): releasetargets parses .goreleaser.yml (the
+# SSOT for the release matrix) for the release-verify-binaries gate.
+./internal/releasetargets
+
+# token-telemetry campaign S1 (2026-07-07): tokenusage is the zero-wiring leaf
+# that scans Claude Code transcript JSONL to recover a launch's real token
+# usage (cwd-exact + content-verified attribution, streamed-delta dedup,
+# best-effort SourceNone on a missing transcript). Every export
+# (Source/SourceNone/SourceTranscript, Window, Result, ScanConfigRoot) is
+# named+exercised by scanner_test.go and apicover_named_test.go.
+./internal/tokenusage
+
+# cycle-593 ACS predicate package (2026-07-07): token-telemetry-s1-transcript-scanner.
+# Completeness invariant: every ./acs/cycle<N>/ package must be enrolled.
+./acs/cycle593
+
+# statefile RMW single-source (cycle-659, new-package graduation): statemap is
+# the lock-owning leaf that consolidates the three duplicate state.json
+# read-modify-write copies (ship/reset/repin) into one implementation importing
+# only internal/adapters/flock + stdlib. ReadStateMap/WriteStateMap/
+# UpdateStateMap are named+exercised by statemap_test.go + statemap_extra_test.go.
+./internal/adapters/statemap
+
+# cycle-659 ACS predicate package (2026-07-10): statefile-rmw-flock-single-source.
+# Completeness invariant: every ./acs/cycle<N>/ package must be enrolled.
+./acs/cycle659
+
+# recurrence ledger (cycle-661, new-package graduation): the deterministic leaf
+# that counts lesson `pattern:` recurrences and escalates the linked open inbox
+# item's weight (idempotent per cycle) or hands an orphan pattern to the autofile
+# seam exactly once. Entry/Ledger/InboxItem/Escalator/Autofiler/EscalationPolicy +
+# NewLedger/Load/Save/Count/Patterns/RecordClosure/Target are named+exercised by
+# ledger_test.go + apicover_named_test.go. Imports only stdlib + atomicwrite + flock.
+# cycle-662 (chronicle-s1-recurrence-index) graduates BackfillFromLessons (historical
+# backfill over lessons/*.yaml), IsGeneric + Ledger.IsGenericPattern (classification
+# de-noise), exercised by backfill_c662_test.go + generic_c662_test.go.
+# ReadSnapshot (Load's lockless decode) and Ledger.ItemCounts (the inbox rank's id linkage, ADR-0121) are named by snapshot_test.go.
+./internal/recurrence
+
+# cycle-661 ACS predicate package (2026-07-11): recurrence-ledger-weight-escalation.
+# Completeness invariant: every ./acs/cycle<N>/ package must be enrolled.
+./acs/cycle661
+
+# One-binary S1 (2026-07-14): apicover core folded from cmd/apicover (package
+# main) into this importable package so the evolve binary — the `evolve apicover`
+# subcommand and the audit's in-process API-gate (ciparity.apicoverEnforceChanged
+# Default now calls apicover.Run directly, deleting the runtime `go build -o
+# bin/apicover`) — shares one measurement impl. apicover_named_test.go names the
+# lone entry (Main) no moved test covered; the run/classify/cover/enumerate/
+# ignore/refs tests cover the rest. Graduated at 18/18 covered, 86.7% line.
+./internal/apicover
+# inboxbatch (2026-07-16): deterministic backlog grouping for triage —
+# graduated at package creation per the new-package graduation guard.
+./internal/inboxbatch
+# coherence (2026-07-17, ADR-0072): the verdict-coherence signal (recorded
+# verdict vs on-disk audit+acs) that the system-failure floor gates on.
+# Graduated at package creation per the new-package graduation guard.
+./internal/coherence
+# mintregistry (2026-07-20, cycle-967 Variant A2): the shared active-mints
+# registry — registrar-written, tree-diff-guard-read — that distinguishes a
+# concurrent lane's sanctioned phase mint from a deliverable leak.
+# Graduated at package creation per the new-package graduation guard.
+./internal/mintregistry
+
+# failure-disposition-router S3 (cycle-1062, new-package graduation): the
+# deterministic disposition floors (guard-abort / recurrence>=3 force console;
+# an advisory LLM route may raise, never lower) plus the intent staging writer
+# that appends .evolve/escalations/pending-actions.jsonl and NEVER writes
+# .evolve/inbox/ (a mid-flight inbox write races inboxmover.Claim's os.Rename).
+# Decision/Intent/Decide/StageIntent/LoadIntents/PendingActionsPath + the route
+# and action vocabulary are named+exercised by dispositionrouter_test.go +
+# apicover_named_test.go. Imports only stdlib + adapters/flock.
+./internal/dispositionrouter
+./internal/continuation
+
+# docs floor (cycle-1141, ADR-0077, new-package graduation): the stdlib-only
+# decision leaf that mechanizes operating-policy §3 rule 2 — an
+# architecture-labeled change with no docs/ touch WARNs at the build handoff
+# floor. Config/Input/Verdict/Status* + Evaluate + LabelArchitecture are
+# named+exercised by docsfloor_test.go.
+./internal/docsfloor
+
+# gc config leaf (cycle-1141, decoupling campaign): Policy/RunsPolicy/
+# WorktreesPolicy + WithDefaults extracted from internal/gc so internal/policy
+# (the config SSOT) no longer depends on the retention ENGINE — the inverted
+# edge that closed a policy→gc→phasecontract→phasespec→policy import cycle.
+# gc re-exports via aliases; gcpolicy_test.go names+exercises every export.
+./internal/gcpolicy
+
+# go-package-pattern scope rule leaf (2026-07-30, flaky-predicate-authoring-lint):
+# IsPackagePattern/IsRecursive/Key + ModulePrefix/WholeModule extracted from the
+# private copies that had grown in internal/acssuite (run-time predicate scope
+# demotion) and internal/evalqualitycheck (authoring-time flaky-shape lint). Two
+# copies of one scope rule is a drift surface: a shape the authoring lint stopped
+# recognizing would have silently stopped being demoted at run time too. Zero
+# non-stdlib deps by design — neither caller may drag in the other's tree.
+# gopkgpattern_test.go names+exercises every export.
+./internal/gopkgpattern
+
+# reachabilityprobe (cycle-1225, tdd-structural-test-reachability-probe): pure
+# compiler-probe check flagging a frozen structural-test pin whose referenced
+# package already (transitively) imports the pinning package — the cycle-644
+# unbuildable-import-cycle shape. apicover_named_test.go names+exercises every
+# export (ImportGraph, CallSite, Violation, CheckCallSite).
+./internal/reachabilityprobe
+
+# ACS predicate packages (./acs/cycle<N>) are NOT enrolled — the "completeness
+# invariant" cycles 1141/1144/1145 asserted here does not exist. Two reasons,
+# both load-bearing:
+#
+#  1. apicover enforces the public-API DoD (every export named + exercised).
+#     An acs package exports NOTHING — it is `//go:build acs` test predicates —
+#     so there is no API surface to enforce and enrollment measures nothing.
+#  2. Enrollment ROUTES the package into the build handoff floor's enforced
+#     coverage run (build_floor_reviewer.go), which — unlike the plain
+#     selfcheck path with goTestExcludedByBuildTags — reads the untagged
+#     "build constraints exclude all Go files … [setup failed]" SETUP result as
+#     a TEST failure. That is the cycle-1145 gate-block (fingerprint
+#     build|gate-block|866df5da1e50): every cycle whose base diff carried an
+#     enrolled acs package red-lined its own handoff over a package that is
+#     green under `-tags acs`.
+#
+# The ./acs/cycle9..661 entries above predate the handoff-time enforced run and
+# are left untouched (removing them is a CI-scope change, not this fix); the
+# floor's buildTagVisiblePackages filter keeps them from re-triggering (2).
+# Pinned by TestAPICoverEnforceDoesNotEnrollModernACSPackages.
+./internal/regressiontia
+
+# context-fill telemetry (cycle-1269, new-package graduation): stdlib+cyclestate
+# leaf that derives a context-window fill ratio from the TokenUsage counts
+# phase-timing.json already persists (FillRatio/IsHot/WindowSizeForTier/
+# HotThreshold/ErrInvalidWindow), named+exercised by contextfill_test.go and
+# apicover_named_test.go. Pure derivation only — the Stage dial, phasetiming
+# persistence and prompt hint are deferred follow-ups.
+./internal/contextfill
+
+# Build explanation documentation contract: deterministic Build-floor
+# validation, strict report parsing, and hash-bound downstream verification.
+./internal/explanationdocs
+./internal/reportdoc
+
+# SSOT digest projector (cycle-1391, new-package graduation): parses
+# "<!-- digest:role=ROLE -->...<!-- /digest -->" markers out of an SSOT
+# instruction source and returns only the requested role's tagged blocks.
+# Named+exercised by digest_test.go and apicover_named_test.go. Consumer:
+# go/internal/systemprompt.Resolve prefers profile.digest_file when present.
+./internal/digest
+
+# fill-vs-verdict correlation (cycle-1402, new-package graduation): part (3) of
+# the context-fill-telemetry inbox item — the pure join/bucket over
+# contextfill.HotThreshold plus the real-corpus Load, consumed by
+# `evolve context-fill correlate` (cmd/evolve/cmd_contextfillcorrelate.go).
+# Named+exercised by apicover_named_test.go and contextfillcorrelate_test.go.
+./internal/contextfillcorrelate
+./internal/dashboard
+# treefence — the read-only phase worktree fence (ADR-0097). Consumer: phases/runner.
+./internal/treefence
+# recoveryguard — the recovery agent's kernel fence (ADR-0106). Consumer: core correction ladder.
+./internal/recoveryguard
+# triagedecision — the host derivation of triage's decision from its report (ADR-0106 H1). Consumer: deliverable.HostEffects.
+./internal/triagedecision
+
+# ADR-0099 slice 2 (2026-09-09): the document deliverable contract engine — every export named + executed.
+./internal/solutioncheck
+
+# Centralized model-attempt telemetry (2026-09-11, new-package graduation):
+# durable schema, locked append/import, canonical reader, and performance
+# aggregation. Every export is named and exercised by the package's behavioral
+# tests plus apicover_named_test.go.
+./internal/llmcalls
+
+# ADR-0101 Signal Center (2026-09-13): the leaf event stream. 100% API + 100% line
+# coverage are both gated (line coverage via .cover-strict / make cover-strict).
+./internal/signalcenter
+./internal/core/outcome
+
+# ADR-0101 S2b (2026-09-13): the contract gate's Signal Center producer — one event per
+# gate decision under module gate.contract. 100% API + 100% line coverage gated.
+./internal/deliverable/gatesignal
+
+# ADR-0103 unit 02 (2026-09-13): failure diagnostics + the delivery-failure classifier
+# (internal/core/failurediag). 100% API + 100% line coverage gated.
+./internal/core/failurediag
+
+# ADR-0103 unit 03 (2026-09-13): the carryover-todo lifecycle — mint admission, closeout merges,
+# retirements and the state.json persist (internal/core/carryover). 100% API + 100% line coverage gated.
+./internal/core/carryover
+# ADR-0103 unit 03b (2026-09-13): the failure-learning engine — the failed-approach recorder, the
+# deterministic floor, the remediation filer and the recurrence closure (internal/core/failurelearning).
+# 100% API + 100% line coverage gated.
+./internal/core/failurelearning
+
+# ADR-0103 unit 07 (2026-09-14): the ship landing — the fleet ff-merge, the push with its inline
+# push-race repair and the post-push head read, the shared git probes, the ship-binding witness
+# (internal/phases/ship/landing). 100% API + 100% line coverage gated.
+./internal/phases/ship/landing
+# ADR-0103 unit 08 (2026-09-14): config resolution — the routing-config Loader, its registry/env/policy
+# dials, validators and codes; ./internal/config is enforced by the routing-tier row above (the
+# Phase 5 gap=4 tail batch). 100% API + 100% line coverage gated.
+# ADR-0103 unit 12 (2026-09-14): the phase-observer engine — the stream-json tail/decoder, the stall
+# rules, the incident responder and the envelope/report sinks (internal/observerengine).
+# 100% API + 100% line coverage gated.
+./internal/observerengine
+# ADR-0103 unit 09 (2026-09-14): the audit's defect/prescription ledger — schema, writer, readers and
+# the continuation disposition gate (internal/core/defectledger). 100% API + 100% line coverage gated.
+./internal/core/defectledger
+# ADR-0103 unit 06 (2026-09-14): the inbox lifecycle mover — claim, promote, quarantine release, the
+# cycle drain, orphan recovery and the processed-record primitives (internal/inboxmover/lifecycle).
+# 100% API + 100% line coverage gated.
+./internal/inboxmover/lifecycle
+# ADR-0103 unit 10 (2026-09-14): the launch-outcome classifier — the one exit-code table (sentinel, ledger
+# cause code, BRIDGE_EXIT_* projection as Outcome.Signal) and the cause-line miners
+# (internal/bridge/launchoutcome). 100% API + 100% line coverage gated.
+./internal/bridge/launchoutcome
+# ADR-0103 unit 11 (2026-09-14): the phase runner's verdict engine — the settle ladder, the teardown
+# reconcile arms, the stale-leftover gate, the ACS deterministic floor, the verdict-source rule and the
+# ship guard (internal/phases/runner/verdict). 100% API + 100% line coverage gated.
+./internal/phases/runner/verdict
+# ADR-0103 unit 04 (2026-09-14): the two rune-cap text rules the advisor prompt and the carryover
+# lifecycle project (internal/textcap). 100% API + 100% line coverage gated.
+./internal/textcap
+
+# ADR-0103 unit 04 (2026-09-14): the phase advisor — the routing/plan prompt composer, the bridge
+# launcher with its profile fallback chain and redacted captures, and the plan/proposal parser with
+# the mint recursion guard (internal/core/advisor). 100% API + 100% line coverage gated.
+./internal/core/advisor
+# ADR-0103 unit 13 (2026-09-14): the loop wave engine — the wave gate, one dispatch body, the min-width
+# repair, the fleet-config reload, the freshness-gated launcher, quota/budget sizing and the plan source
+# (internal/loopwave). 100% API + 100% line coverage gated.
+./internal/loopwave
+# ADR-0103 unit 13 (2026-09-14): the batch-chaining driver, the boundary binary-refresh engine and the
+# pure chain decisions (internal/loopchain). 100% API + 100% line coverage gated.
+./internal/loopchain
+# ADR-0103 unit 14 (2026-09-14): the CI-parity gates — go vet, acs-durable, the serialized integration
+# tier with its cross-lane lock and clean-env retake, apicover -enforce in-process and new-package
+# graduation (internal/phases/audit/ciparitygate). 100% API + 100% line coverage gated.
+./internal/phases/audit/ciparitygate
+# ADR-0103 unit 16 (2026-09-14): the evolve subagent run execution path — request admission,
+# cli/tier/capability resolution, prompt delivery and staging, the bridge exec port, artifact
+# verification and the agent_subprocess ledger record (internal/subagent/subagentrun).
+# 100% API + 100% line coverage gated.
+./internal/subagent/subagentrun
+
+# bridgechain — the CLI/tier fallback chain as a property of the bridge handle
+# (Decorator over core.Bridge, wrapped once at the composition root); the runner's
+# cli-health projections live here so both walks share one implementation.
+./internal/bridgechain
+# addedtests — the ONE derivation of "which test packages did this tree add and
+# under which build tags"; consumers: the ship repo-contract gate and the build floor.
+./internal/addedtests
+./internal/commentaudit
+# auditledger — the one reader of auditor ledger rows; consumers: ship, cmd/evolve composition, releasepreflight, core ship recovery (ADR-0105 B1).
+./internal/auditledger
+# lanerouting — the one predicate for "no lane can change this path": protected surface OR the build profile's sandbox deny list.
+./internal/lanerouting
+# repocontract — the one decision on whether ship's repo-contract fixed scanner pack runs for a tree (gate word and evolve-loop's module); consumers: the ship gate and the build floor.
+./internal/repocontract
+# gittest — the one owner of git-backed test fixtures: quiet-maintenance repos, retried teardown that names its holder.
+./internal/gittest
+# sizeratchet — the one repo-wide 50-line function limit: a go/ast walk against a checked-in offender list that may only shrink.
+./internal/sizeratchet
+# rawgitratchet — ratchet refusing new raw git fixtures in tests outside internal/gittest; baseline.json may only shrink.
+./internal/rawgitratchet
+# testmainexit — finds TestMain functions whose deferred cleanup os.Exit skips (a leaked temp dir per run).
+./internal/testmainexit
+# the loop's own writes to tracked inbox items, landed or discarded at a sync (internal/inboxstamps).
+./internal/inboxstamps
+# acsverdict — the one spelling of the acs-verdict.json name, its path, the harness-red prefix and the no-predicates id, shared by both verdict writers (acssuite, acsrunner).
+./internal/acsverdict
+# cliroute — the one CLI routing table (policy.json cli_routing) and the resolver every launch path calls; the legacy projection is pinned by testdata/legacy-plans.golden.jsonl.
+./internal/cliroute
+# cliroutetest — the legacy dispatch-plan scenarios and the golden record format the runner generates and cliroute replays.
+./internal/cliroute/cliroutetest
+# cliupdate — the boundary CLI updater: each subscribed family's manifest updater, the smoke test of a changed version, and the cli-updates.json record cli-version-drift reads.
+./internal/cliupdate
+# inboxrank — the one computed inbox priority: score = sum of policy-weighted features (base, class, unblocks, recurrence, age, goal), ordered with the declared-surface, filing-date and id tie-breaks (ADR-0121).
+./internal/inboxrank
+# rankinputs — the rank's inputs for one evolve dir: its policy's inbox_priority block and its recurrence ledger's item counts, one loader for every consumer (ADR-0121, plan P2).
+./internal/inboxrank/rankinputs
+# inboxsplit — splits one mixed inbox item into a console part that keeps every protected file and a lane part, and accepts the split through the inbox writers (ADR-0139, plan O2c).
+./internal/inboxsplit
+# inboxcurator — the deterministic inbox curator: the add-time intake (origin, kind, fix surface, an unexplained console route) and the overlap measure (shared fix surface and token Jaccard of title and acceptance), plan P3.
+./internal/inboxcurator
+# wtcheckpoint — evolve checkpoint: refs/checkpoints snapshots of uncommitted worktree work (save, list, restore, prune, push).
+./internal/wtcheckpoint
+# tmuxtest — the one owner of a test process's tmux server: its own evolve-bridge-t<pid> socket, a /bin/sh pane shell and no user config, killed at exit.
+./internal/tmuxtest
+# fakeclitest — the one owner of fake command-line tools in tests: a hard link to the running test binary that runs the script through its interpreter, so no new executable is scanned on first run.
+./internal/fakeclitest
+# landed — whether a worktree's changes since a merge-base are already in origin/main (per-path three-way proof); the one predicate evolve worktree cleanup --dev uses, and the one the checkpoint prune converges onto.
+./internal/landed
+# ledgerartifacts — the ledger's write-once content-addressed evidence store (.evolve/ledger-artifacts/sha256/<2>/<62>) and the legacy-path aliases evidence restore records; gc hard-protects it.
+./internal/ledgerartifacts
+# codereview — the code-review phase's kernel half: parses the review's findings through reportdoc and records them in the defect ledger, plus the REVIEW_FINDINGS signal (ADR-0124).
+./internal/codereview
+# qualityindex — the quality index the code-review loop and the audit share: the dimensions, the threshold resolver, the Scores and Review Plan grammars and Qualifies (ADR-0124).
+./internal/qualityindex
+# convergence — the convergence policy's pure decision (ADR-0126): the next rung of a repeat-until-accepted loop, keep-best, concentration, headroom; replayed against L2's rounds in testdata/l2-rounds.json.
+./internal/convergence
+# stelint — the ASD-STE100 lint behind evolve docs ste-lint and the build floor's STE WARN: the house word table parsed from docs/conventions/ste100-writing.md, the sentence, paragraph and word rules for Markdown and for Go log and error text.
+./internal/stelint
+# wave — evolve wave: the wave records and notes under .evolve/waves/, the facts reader over cycle state, signals, landing intents and dossiers, the goal composer and the watch event diff.
+./internal/wave
+# wavemeasure — the pure measures of one wave run for evolve wave status: the sized and realized width, the utilization, the conflict rate and the admission-wait count (O7).
+./internal/wavemeasure
+
+# lane H2 (2026-10-08): the one kill path for dispatch processes (internal/proctree).
+./internal/proctree
+
+# lane E4 (2026-10-09): the one filter grammar of the event channels (internal/events/filter).
+./internal/events/filter
+# channel — one event channel as an append-only log: segments named by their base cursor, the locked append with torn-tail repair and rotation, Read with the cursor rules and Last (ADR-0127, plan E2).
+./internal/events/channel
+# E3 (ADR-0127): the kernel wake of the event channels (internal/events/wake).
+./internal/events/wake
+# publisher — the Signal Center listener that appends each event to the channels whose route matches it: the lossless path, the best-effort queue, the gap records and the dispatch stamp (ADR-0127, plan E6).
+./internal/events/publisher
+# lane LQ-3 (2026-10-09): the overlap proof of the landing queue (internal/overlap, ADR-0128, plan Q3).
+./internal/overlap
+# E5 (ADR-0127): the channel reader and the last will of the event channels (internal/events/reader).
+./internal/events/reader
+# E10 (ADR-0127): the root wiring that subscribes one Publisher to the Center of each root process and returns its closer (internal/events/rootwire).
+./internal/events/rootwire
+# derived — the one catalog of the generated outputs, their markers, regions and inputs, the conflict class and the regeneration (ADR-0128, plan Q1).
+./internal/derived
+# R2 (ADR-0130): the attempt postmortem, a retry carries the evidence of the attempt that it replaces (internal/attemptpostmortem).
+./internal/attemptpostmortem
+# testhost — a missing host tool skips a local test and fails a macOS CI test (internal/testhost).
+./internal/testhost
+# M1 (ADR-0129): the skeleton of cycle agent messaging, unwired (internal/agentmsg and its subpackages).
+./internal/agentmsg
+./internal/agentmsg/address
+./internal/agentmsg/boot
+./internal/agentmsg/broker
+./internal/agentmsg/delivery
+./internal/agentmsg/envelope
+./internal/agentmsg/identity
+./internal/agentmsg/memstore
+./internal/agentmsg/outbox
+./internal/agentmsg/policy
+# M2 (ADR-0129): the channel-log store adapter of cycle agent messaging, unwired (internal/agentmsg/channelstore).
+./internal/agentmsg/channelstore
+# cover-changed (2026-10-11): the gate that refuses a changed function below 100% (internal/covchanged).
+./internal/covchanged
+./internal/coverstrict
+# practicewatch — the CLI practice watch (ADR-0133, plan M1): fetch each configured source, normalize, hash, compare with .evolve/practice/<id>.json, file one inbox research item per changed source.
+./internal/practicewatch
+# gotooltest — the one owner of how a test runs the go tool: the CPU limit of a nested run and one build for each test binary.
+./internal/gotooltest
+# runnertest — the shared settle-sleep and empty-artifact kit of the phase tests (plan T15).
+./internal/phases/runner/runnertest
+# paralleltest — the one parallel-by-default guard of the package test trees: serial lists, helper and method following.
+./internal/paralleltest
+./internal/testkey
+./internal/testverdict
+# codeindex — the backend-neutral layer of the evolve code verb (plan K1): Hit, Backend, Capabilities, the Backends chain and its factory builder.
+./internal/codeindex
+# codeindextest — the fake backend and the conformance suite that every codeindex backend passes.
+./internal/codeindex/codeindextest
+# usagelog - the append-only record of each evolve code call and its summary by phase (plan K3, D6).
+./internal/codeindex/usagelog
+# trail — the one adapter that runs the trail-code binary behind codeindex.Backend (plan K1, D3, D4).
+./internal/adapters/codeindex/trail
+# treewalk - the before/after walk that fails a test run for any file or empty directory it leaves behind.
+./internal/treewalk
+# kbgraph - the read-only graph projection over cycle dossiers and inbox items (slice 1).
+./internal/kbgraph
+# lanebudget — the lane CPU budget of each go test a lane runs (wave-orchestrator plan O9).
+./internal/lanebudget
+# admission — admission by package cell, with the hub cell at capacity 1 (ADR-0139 O3, ADR-0134 S14): the conflict rule, the module graph and the hub set.
+./internal/admission
+# orchestrator — the rolling pool under the orchestrator and the lane lease (ADR-0139 O4, O5): admission by cell for each free slot, one deadline timer over a heap, and the stop through the launch context only.
+./internal/orchestrator
+./internal/acspathscan
+# gotypes — the type-checked Go index behind codeindex.Backend for callers and api, standard library only (ADR-0140, plan G1).
+./internal/adapters/codeindex/gotypes
+# envscope - the one scan rule of the envtaint read set, shared with commentaudit.
+./internal/envscope
+./internal/handoff
+# evidence - the resolvers of the handoff evidence pointers (ADR-0141, plan H3).
+./internal/handoff/evidence
+
+# exit - the pass, retry or cap decision of a handoff round (ADR-0141, plan H4).
+./internal/handoff/exit
+
+# request - the request builders of the handoff pairs (ADR-0141, plan H2).
+./internal/handoff/request
+# retryladder - the deterministic failure classifier of the retry ladder (ADR-0142, plan L1).
+./internal/retryladder
+# CI telemetry commands (C0b): no exported API beyond Record/Sample/Counters, all named by tests.
+./cmd/testrusage
+./cmd/hostsampler
+# lanetime - the report of where the time of a wave goes (plan wave-latency-2026-10, W0).
+./internal/lanetime
+# mergewindow - the merge window rule of evolve pr window, read from the routing table of required.yml (plan pr-merge-latency-2026-10, P2).
+./internal/mergewindow
+# ledgertip - the one encoding of .evolve/ledger.tip that the ledger writers and the verifier share.
+./internal/ledgertip
+# builddiff - the host-derived diff metrics and Changes table of the build report.
+./internal/builddiff
+# researchindex - the generated dated entries of docs/research-index.md.
+./internal/researchindex
+# auditcascade - the escalation rule of the auditor tier cascade (inbox auditor-tier-cascade, shadow stage).
+./internal/auditcascade
+# recoveryretro - the host-written retrospective documents of a recovery and of a judgment lesson (ADR-0151).
+./internal/recoveryretro
+# agentcmd - evolve agent: one read-only phase agent from the command line, with no cycle (ADR-0152).
+./internal/cli/agentcmd
+# qualitypanel - the quality index readings of ADR-0153 and their Signal Center events.
+./internal/qualitypanel
+# pipelinerates - the pipeline quality index readers PQ1, PQ3, PQ4 and CQ2 of ADR-0153.
+./internal/pipelinerates
+# codeshape - the code quality index readers CQ1, CQ3, CQ4 and CQ5 of ADR-0153.
+./internal/codeshape
+# isolation - the conformance matrix and the ISOLATION_ codes of the agent cell (ADR-0154).
+./internal/isolation
+# faketmux - the fake tmux of the hermetic e2e matrix: each pane is a detached process that reads a FIFO and writes a screen file, so a tmux driver runs with no tmux server.
+./internal/faketmux
+
+# dispatchcred - the pipeline dispatch credential that no agent cell can read (ADR-0154 I-3).
+./internal/dispatchcred
+# agentclass - the agent class of each evolve verb: the one table of the class gate, agent capabilities and the bridge (ADR-0156).
+./internal/agentclass
+# inputindex - the artifact index inputs/index.json of each phase cell and its lineage (ADR-0154 I-4, I-5).
+./internal/inputindex
+# contextcmd - the evolve context verbs that read the cell index of a phase agent (cell-context-index.md §7).
+./internal/cli/contextcmd
+# guidance - the rule registry reader, the build of guidance/index.md, guidance/index.json and the L0 region of AGENTS.md, and the check of the registry.
+./internal/guidance
+./internal/heldproposal
+./internal/inboxfile
+# launchrecord - the bridge launch record of evolve agent run, which the commit gate reads to attest a review run (ADR-0154 X11).
+./internal/launchrecord
+./internal/integration
+./internal/fixability
+# cyclespend - the LLM spend of one cycle from llm-calls.ndjson (ADR-0158).
+./internal/cyclespend
+# selfheal - the incident detector of the self-healing loop: typed incident records from signals, cycle state, CI runs and usage readings (ADR-0155 X12).
+./internal/selfheal
+# shipjournal - the one format of .evolve/ship-journal.jsonl that the ship phase writes and selfheal reads (ADR-0155 X14).
+./internal/shipjournal
+# auditfix - the audit_fix rung handler: the auditor applies a small prescribed patch and a fresh seat reviews it (ADR-0158).
+./internal/auditfix
+# auditfixports - the production ports of the audit_fix rung: the fixer and review seats through evolve agent run, the gates and the git worktree (ADR-0158).
+./internal/auditfixports
+# citelemetry - the critical-path report that joins the jobs, steps, test JSON, rusage and sampler records of one CI run (ci-wall-time plan C1).
+./internal/citelemetry
+# gateclass - the surface tiers and the gate classifier of I-10: it flags a cycle diff that changes a kernel surface or weakens a gate (ADR-0155 X15).
+./internal/gateclass
+# agentrequest - the request channel of a cell: the validator, the judgement and the dispatch of a phase agent request (llm-isolation.md §7.2.1).
+./internal/agentrequest
+# coversplit - the coverage runs of a test package split from the package it tests: the go/.cover-split list, the plan, the profile merge and the guard that every split is listed.
+./internal/coversplit
+# shiptest - the shared real-git fixtures of the ship tests and the black-box ship scenarios split from internal/phases/ship.
+./internal/phases/ship/shiptest
+./internal/supersede

@@ -1,0 +1,51 @@
+package opscmd
+
+import (
+	"bytes"
+	"strings"
+	"testing"
+)
+
+func TestCmd_ReleasePreflight_Help(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	rc := RunReleasePreflight([]string{"--help"}, nil, &stdout, &stderr)
+	if rc != 0 {
+		t.Fatalf("rc = %d, want 0", rc)
+	}
+	if !strings.Contains(stdout.String(), "release-preflight") {
+		t.Errorf("help missing keyword: %s", stdout.String())
+	}
+}
+
+func TestCmd_ReleasePreflight_NoTarget(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	rc := RunReleasePreflight(nil, nil, &stdout, &stderr)
+	if rc != 10 {
+		t.Fatalf("rc = %d, want 10", rc)
+	}
+}
+
+func TestCmd_ReleasePreflight_UnknownFlag(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	rc := RunReleasePreflight([]string{"--bogus", "1.0.0"}, nil, &stdout, &stderr)
+	if rc != 10 {
+		t.Fatalf("rc = %d, want 10", rc)
+	}
+}
+
+func TestCmd_ReleasePreflight_ExtraPositional(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	rc := RunReleasePreflight([]string{"1.0.0", "extra"}, nil, &stdout, &stderr)
+	if rc != 10 {
+		t.Fatalf("rc = %d, want 10", rc)
+	}
+}
+
+func TestCmd_ReleasePreflight_MissingProjectRoot(t *testing.T) {
+	t.Setenv("EVOLVE_PROJECT_ROOT", t.TempDir())
+	var stdout, stderr bytes.Buffer
+	rc := RunReleasePreflight([]string{"1.0.0", "--dry-run", "--skip-tests"}, nil, &stdout, &stderr)
+	if rc != 1 {
+		t.Fatalf("rc = %d, want 1", rc)
+	}
+}

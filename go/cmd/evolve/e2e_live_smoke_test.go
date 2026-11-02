@@ -1,0 +1,70 @@
+//go:build e2e
+
+package main
+
+import (
+	"os"
+	"strings"
+	"testing"
+	"time"
+)
+
+func cheapModelFor(driver string) string {
+	base := strings.TrimSuffix(strings.TrimSuffix(driver, "-tmux"), "-p")
+	if v := os.Getenv("EVOLVE_E2E_LIVE_MODEL_" + strings.ToUpper(base)); v != "" {
+		return v
+	}
+	switch base {
+	case "claude":
+		return "haiku"
+	case "codex":
+		return codexTierModels()["fast"]
+	case "agy":
+		return "gemini-3.5-flash"
+	case "ollama":
+		return "llama3.1:8b"
+	default:
+		return "fast"
+	}
+}
+
+func TestE2ELiveSmoke(t *testing.T) {
+	t.Parallel()
+	liveGate(t, "EVOLVE_E2E_LIVE_SMOKE")
+	repoRoot := mustRepoRoot(t)
+	evolveBin := buildBinary(t, t.TempDir(), "evolve", "./cmd/evolve", repoRoot)
+
+	targets := append([]liveCLI{
+		{Driver: "ollama-tmux", Binary: "ollama", CheapTier: "fast", Family: "local"},
+	}, liveHeadlessCLIs...)
+
+	for _, cli := range targets {
+		cli := cli
+		t.Run(cli.Driver, func(t *testing.T) {
+			if ok, why := liveCLIAvailable(cli); !ok {
+				t.Skip(why)
+			}
+			smokeOneCLI(t, repoRoot, evolveBin, cli)
+		})
+	}
+}
+
+func smokeOneCLI(t *testing.T, repoRoot, evolveBin string, cli liveCLI) {
+	t.Helper()
+	timeout := envDurationSeconds("EVOLVE_E2E_LIVE_SMOKE_TIMEOUT_S", 3*time.Minute)
+	size, out, err := liveBridgeLaunch(t, evolveBin, cli.Driver, cheapModelFor(cli.Driver), timeout)
+
+	if err != nil {
+		if isTransient(out, err) {
+			t.Skipf("%s live smoke hit a transient/provider failure (quarantined):\nerr=%v\n%s", cli.Driver, err, lastN(out, 800))
+		}
+		t.Fatalf("%s live smoke failed (contract):\nerr=%v\n%s", cli.Driver, err, lastN(out, 1500))
+	}
+	if size < 0 {
+		t.Fatalf("%s live smoke: artifact not written\n%s", cli.Driver, lastN(out, 1200))
+	}
+	if size == 0 {
+		t.Errorf("%s live smoke: artifact is empty", cli.Driver)
+	}
+	t.Logf("[live-smoke] %s OK — artifact %d bytes", cli.Driver, size)
+}

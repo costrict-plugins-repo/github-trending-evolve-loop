@@ -1,0 +1,38 @@
+{
+  "name": "threat-model",
+  "catalog": "on-demand",
+  "archetype": "plan",
+  "agent": "evolve-threat-model",
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/scout-report.md"
+    ],
+    "signals": []
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/threat-model.md"
+    ],
+    "signals": [
+      "threat.count",
+      "threat.severity_max"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Threats",
+      "Mitigations"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "security"
+      }
+    ]
+  },
+  "after": "triage",
+  "optional": true
+}

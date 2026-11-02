@@ -1,0 +1,182 @@
+# ADR-0099 — Deliverable kinds: solution cycles on the same spine
+
+- **Status:** Accepted (2026-09-09). Slice 1 (the kernel half — `deliverable_kind` / `goal_type`
+  signals, the AND-able conditional rule, the solution recipes) landed as #539; slice 2 (the
+  document deliverable contract, `internal/solutioncheck` projected as build floor,
+  `evolve solution check` and audit gate, the kind on the Task Contract, the first
+  `.evolve/domain.json` reader, the `solution(<slug>)` commit prefix) as #543; slice 3 (this
+  PR — the solution-skill personas preloaded by a signal-keyed overlay rule whose signals core
+  projects at dispatch, and the scout/triage header lines in the dispatched personas)
+  completes the ADR. Amended 2026-10-01 (routing a document lane: the bugfix phases' admission,
+  the advisor's lane scope, the re-plan's item count and the one tdd decision; see the end).
+- **Driving evidence:** the operator's 2026-09-09 directive — the factory must produce non-code
+  solutions *in this repo, through the same pipeline*: intent and scout unchanged in role, build
+  delivering several candidate strategies, audit reviewing them, the **advisor** deciding the
+  cycle's shape, and TDD recognised as the code-specific phase. Exploration (2026-09-09) found the
+  spine, trust kernel, ledger, ship-as-commit, dossier and lesson schemas already
+  deliverable-agnostic; what is hard-bound to code is the *evidence layer* (tdd writes Go
+  predicates, the build floor runs `go test`, the ACS gate reads `go test -tags acs`, the
+  commit-gate lanes are Go-only, the builder/tdd/auditor personas are 55–90 % code wording).
+  Two dormant assets shaped the design: the 15 shipped domain phases of
+  [domain-phase-catalog.md](../domain-phase-catalog.md), whose `scout.goal_type` triggers had
+  **no producer** (handoff JSON has been extinct since ~cycle 215 and nothing wrote the signal to
+  a report header), and the `.evolve/domain.json` adapter documented in
+  `docs/reference/configuration.md` with **zero Go readers**.
+- **Related:** [ADR-0060](0060-data-driven-transition-kernel.md) (the floor is quantified over
+  roles, never phase names — this ADR adds one more config-evaluated condition to it),
+  [ADR-0098](0098-task-contract-block.md) (the task contract carries the kind in slice 2),
+  [ADR-0084](0084-gate-integrity-invariants.md) (machine-graded contracts: the document floor
+  is deterministic and the rubric judgment stays in audit).
+
+## Decision
+
+1. **One new kernel-trusted signal.** `deliverable_kind ∈ {code, document}` is declared by scout
+   (`deliverable_kind:` header line in `scout-report.md`, next to a `goal_type:` line naming a
+   `phase-registry.json:config.goal_recipes` key) and refined by triage (`deliverable_kind:` next
+   to `cycle_size_estimate:` in `triage-report.md`; a mixed `top_n` is `code`). The kernel parses
+   both from the report headers (`router.scoutFromReportFallback`,
+   `router.triageFromReportFallback`) — the same trusted path `cycle_size_estimate` takes —
+   and lifts them onto `RoutingSignals` (typed `Scout.GoalType`, `Scout.DeliverableKind`,
+   `Triage.DeliverableKind`; routable as `scout.goal_type`, `scout.deliverable_kind`,
+   `triage.deliverable_kind` and the projected `deliverable_kind`). `RoutingSignals.DeliverableKind()`
+   is triage > scout > **`code`**: the absent default is the conservative side, so a rule
+   `deliverable_kind != document` holds at plan time and is released only by a digested document
+   declaration (the post-scout RePlan). An unrecognised kind word normalises to undeclared
+   (`router.NormalizeDeliverableKind`) and can never release anything.
+2. **The advisor shapes the cycle; config releases the pin.** `config.CondRule` gains AND-ed
+   clauses (`a!=b && c!=d`; the head clause keeps the legacy shape so every existing consumer is
+   byte-identical; a malformed clause fails the whole rule). The registry's
+   `conditional_mandatory.tdd` becomes `cycle_size!=trivial && deliverable_kind!=document`.
+   `router.tddPinned` and `shouldRun` read it unchanged; the advisor's rubric renders one
+   exemption line per clause. Three solution recipes (`strategy-options`, `business-plan`,
+   `partnership-deal`) compose the document-side acceptance from the existing catalog —
+   `scope-baseline` (deliverables · acceptance criteria · exclusions) before build,
+   `adversarial-review` / `premise-challenge` after — so the advisor selects and justifies
+   rather than a Go switch deciding.
+3. **Domain phases fire.** With a producer for `scout.goal_type`, the shipped overlays'
+   `insert_when` triggers evaluate live (`TestDomainPhaseTrigger_FiresOnScoutGoalType` reads the
+   real `forces-analysis` overlay). D2 fail-closed semantics are preserved: an undeclared goal
+   type is *absent* on the generic plane, so an `ne` trigger never fires on it.
+4. **Slice 2 (deliverable contract, floor, CLI, task contract).** For `document` cycles the
+   deliverable is `solutions/<slug>/` with `options/<n>-<name>.md` (≥ 2), `recommendation.md`
+   and `assumptions-and-evidence.md`, declared as config
+   (`phase-registry.json:config.deliverable_kinds.document`) and checked by ONE deterministic,
+   LLM-free engine (`internal/solutioncheck`) projected three ways: a build-floor check composed
+   into `DefaultBuildFloorChecks`, `evolve solution check <dir>` (the eval `[code]` grader and
+   the agent's self-check), and an audit gate line. `inboxbatch.Item.DeliverableKind` rides the
+   ADR-0098 task contract into the tdd/build/audit prompts; `.evolve/domain.json` gets its first
+   Go reader (project default kind). Ship is unchanged: commit + push under a `solution(<slug>)`
+   prefix (vocabulary only — the commit-prefix gate passes the parenthesised form through); the EGPS gate stays satisfied by the always-present
+   regression suite, and the solution floor + contract gate are the deterministic acceptance.
+5. **Slice 3 (prompt layer).** `solution-scout`, `solution-build` (diverge into ≥ 2 distinct
+   options with the inspirer lenses → comparison matrix → recommendation; every number sourced)
+   and `solution-audit` (rubric-judge per option with `path:line` evidence, numbers traced to
+   `assumptions-and-evidence.md`, adversarial steelman of the non-recommended options) are
+   skills selected by a policy overlay rule extended with a `when` signal selector; the advisor
+   may add more. The scout's Implementation-First rule becomes kind-conditional.
+   The signals the `when` selector reads are core's projection at dispatch (`PhaseRequest.Signals`:
+   declared kind > project default > `code`; `scout.goal_type` when declared), keyed by the
+   kernel's routable field names — the runner copies, never digests; every compiled-default skill
+   is protected surface.
+6. **No flags.** The kind is a typed value in config and report headers dispatched through
+   existing seams (the conditional rule, the overlay rule, the floor engine composition).
+
+## Rejected
+
+- A global `EvidenceStrategy` mode switch in Go — contradicts "the advisor decides" and would
+  be a second router.
+- Go-test predicates over documents — forces the acceptance runtime onto solution authors and
+  contradicts "TDD is the code-specific phase".
+- LLM-rubric-only acceptance — no machine-graded contract (ADR-0084 invariant 2).
+- Separate solution repos — the operator chose in-repo; the project-shape detection that would
+  have needed is deferred with them.
+
+## Consequences
+
+- `router`, `config`, `phaseio`, `core` (advisor digest, shadow rows), `routingtest` fixtures
+  carry the two new fields; `TestEvalCondition_PresentEmptyString` and
+  `TestTriggerFires_AbsentFieldFailsClosed` still hold (typed value when declared, generic-plane
+  semantics otherwise).
+- `docs/architecture/phase-registry.json` is the registry the loop loads (`cmd_cycle.go`); the
+  runtime plane's ignored `.evolve/phase-registry.json` copy is a dead June artifact.
+- Persona edits (scout/triage header lines and task bullets) landed with slice 3 in the
+  DISPATCHED personas (`agents/evolve-scout.md`'s operational body above the strip marker,
+  `agents/evolve-triage.md`). A cycle whose reports declare nothing stays `code` for the
+  integrity floor; overlay selection may already follow the project default kind from
+  `.evolve/domain.json` (core's `dispatchSignals`: declared > project default > `code`, one
+  kernel digest per dispatch, copied onto `PhaseRequest.Signals` — the runner digests nothing).
+
+## Amendment (2026-10-01) — routing a document lane
+
+Cycle 1692 was the first live document deliverable (lane `netflix-margin-device-experience`, scout
+`goal_type: strategy-options`, `deliverable_kind: document`). Its plan ran scout, triage,
+premise-challenge, fault-localization, bug-reproduction, tdd, build and error-handling-scan. Four
+defects produced that shape (inbox item `document-lane-planned-bugfix-phases`, F42):
+
+- the advisor planned before scout from the wave's goal text and never saw the lane's item, although
+  `lane-scope.json` names it before any phase runs;
+- nothing in the registry said a bugfix phase does not admit a document, so a document lane whose
+  scout declared `goal_type: bugfix` would still run them (the 2026-09-28 `insert-when-gates-plan`
+  clamp keys on the trigger, not on the kind);
+- the post-scout re-plan read `scout.item_count=0` and proposed ending the cycle, because the scout
+  report fallback never counted tasks (every report-only cycle, code or document, digested 0);
+- the tdd decision was recorded `forced-on:tdd` although the plan, not the enable, ran it, while the
+  item's own acceptance said tdd does not run for a document, so the audit graded a routing decision
+  as a lane defect.
+
+Decisions:
+
+1. **A phase declares the deliverable kinds it does not admit in its own `phase.json`**, as a
+   `routing.skip_when` clause `{"field": "deliverable_kind", "op": "eq", "value": "document"}`. The
+   router needs no list of its own: `skip-when-gates-plan` already removes a planned non-floor phase
+   whose `skip_when` fires, and the trigger path already subtracts `skip_when`. Every
+   bugfix-category phase declares it (fault-localization, now categorized `bugfix`,
+   bug-reproduction, error-handling-scan, flake-rerun-scan, incident-postmortem);
+   `TestBugfixCategoryPhases_DeclareTheyDoNotAdmitADocument` keeps a new bugfix phase from omitting
+   it. The kind read is the kernel's projected `deliverable_kind` (triage > scout > `code`), so a
+   lane whose reports declare nothing keeps the code side.
+2. **The advisor sees the lane's item and the admission rules.** The plan and re-plan input carry
+   `RouteInput.LaneItems` (id, kind, deliverable kind, acceptance) read from the lane pin and the
+   item's live inbox record, rendered as the prompt's "Lane scope" section after the goal; an
+   unresolvable item is named with the reason. The rubric now projects each phase's `skip_when`,
+   so the advisor reads "deliverable_kind == document → skip fault-localization" from the same data
+   the walk evaluates.
+3. **A removal is a coded signal.** Each registry gate that removes a planned phase
+   (`skip-when-gates-plan`, `insert-when-gates-plan`) emits `ORCHESTRATOR_PLAN_PHASE_GATED` (WARN,
+   kind `advisor.warning`, fields `phase`, `rule`, `next_phase`) where the routing decision is
+   recorded, so it reaches the loop log.
+4. **tdd admits a document; the registry does not require it there.** Decided once, in
+   `conditional_mandatory.tdd` (`cycle_size!=trivial && deliverable_kind!=document`): on a document
+   the pin is released, so whether tdd runs is routing's call, and when it runs it writes the eval's
+   graders RED-first (cycle 1692's audit-repair round used exactly those), never Go predicates.
+   "Never" was rejected: the audit-FAIL re-entry and the retrospective retry both go to tdd
+   (ADR-0093, `legal_successors`), so forbidding it would need a transition-kernel change and would
+   drop the graders the repair round relied on. The decision projects three ways:
+   - the walk records a plan-driven phase as `plan:<phase>`; `forced-on:<phase>` now means only that
+     the enable forced it on the trigger path, where no plan exists;
+   - the Task Contract of a document cycle states the rule and its result for this cycle
+     ("TDD: not required for this cycle (phase-registry.json conditional_mandatory.tdd = …): routing
+     decides whether tdd runs, not this item's acceptance"), computed by `router.TddPinned` from the
+     registry, so the auditor never grades tdd's routing as an acceptance criterion;
+   - item authors: a document item's acceptance says nothing about whether tdd runs.
+5. **The scout report fallback counts tasks**: `ScoutSignals.ItemCount` is the number of `### `
+   task headings in the report's `## Selected Tasks` (or `## Proposed Tasks`) section, so the
+   re-plan's `scout.item_count` is real for every report-only cycle. The re-plan stays `shadow`;
+   this removes the defect that made raising it unsafe, it does not raise it.
+
+Not changed: the plan-time floor clamp still forces tdd into the initial plan on the conservative
+side (signals are empty before scout), so a document lane runs tdd unless the post-scout re-plan,
+still shadow, drops it.
+
+## Amendment (2026-10-21) — a floor-forced tdd lapses on a document lane
+
+The plan-time clamp still forces tdd with empty signals. Each entry that the clamp turns on now records its rule in `forced_by`.
+
+- At tdd's turn, the walk reads the entry. A tdd entry with `forced_by: ship-requires-tdd` lapses when `router.TddPinned` no longer holds, for example after scout declares a document deliverable. The decision carries the `tdd-pin-released` clamp (`tdd=run` to `tdd=skip`).
+- A tdd that the advisor itself planned still runs on a document lane. A code lane keeps the plan-time force.
+- The re-plan stays `shadow`. The lapse needs no re-plan, because the clamp records which entries it forced.
+- The plan in `routing-plan.json` keeps `forced_by`, so a resumed cycle skips the released tdd too (`skipsOnResume`).
+
+Rejected: raising `router_replan` to `advisory`. That changes every post-scout plan, not only the tdd that the floor forced, and no soak shows that re-plans are sound yet.
+
+Pinned by `TestDocumentLane_AFloorForcedTDDLapsesOnceScoutDeclaresADocument`, `TestCodeLane_AFloorForcedTDDStillRuns`, `TestClampPlanToFloor_RecordsWhichEntriesTheFloorForced`, `TestDocumentLane_TheOrchestratorNeverDispatchesAFloorForcedTDDAfterThePlanRoundTrips` and `TestSkipsOnResume_AReleasedFloorForcedTDDIsSkipped`.

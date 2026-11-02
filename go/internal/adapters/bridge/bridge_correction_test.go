@@ -1,0 +1,86 @@
+package bridge
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+)
+
+func TestInjectCorrectionPrefix(t *testing.T) {
+	if got := injectCorrectionPrefix("BODY", ""); got != "BODY" {
+		t.Errorf("empty directive must pass through, got %q", got)
+	}
+	got := injectCorrectionPrefix("BODY", "fix the Verdict section")
+	if !strings.HasPrefix(got, "## Correction\n\n") {
+		t.Errorf("missing Correction header: %q", got)
+	}
+	if !strings.Contains(got, "fix the Verdict section") || !strings.HasSuffix(got, "BODY") {
+		t.Errorf("directive/body not assembled: %q", got)
+	}
+}
+
+func TestCorrectionDirectiveComposesWithRules(t *testing.T) {
+	var req core.BridgeRequest
+	req.SystemPrompt = "RULE TEXT"
+	req.CorrectionDirective = "rewrite the Verdict section"
+
+	withRules := injectRulesPrefix("BODY", req.SystemPrompt)
+	composed := injectCorrectionPrefix(withRules, req.CorrectionDirective)
+
+	corrIdx := strings.Index(composed, "## Correction")
+	rulesIdx := strings.Index(composed, "## Rules")
+	bodyIdx := strings.Index(composed, "BODY")
+	if corrIdx != 0 {
+		t.Fatalf("correction block must lead; composed=%q", composed)
+	}
+	if !(corrIdx < rulesIdx && rulesIdx < bodyIdx) {
+		t.Fatalf("order must be correction<rules<body; got corr=%d rules=%d body=%d", corrIdx, rulesIdx, bodyIdx)
+	}
+	if !strings.Contains(composed, "rewrite the Verdict section") {
+		t.Fatalf("directive text missing: %q", composed)
+	}
+
+	var off core.BridgeRequest
+	off.SystemPrompt = "RULE TEXT"
+	if got := injectCorrectionPrefix(injectRulesPrefix("BODY", off.SystemPrompt), off.CorrectionDirective); got != withRules {
+		t.Fatalf("empty directive must be a no-op; got %q want %q", got, withRules)
+	}
+}
+
+func TestLaunch_InjectsCorrectionBlock(t *testing.T) {
+	fe := &fakeEngine{}
+	_, err := withEngine(fe).Launch(context.Background(), core.BridgeRequest{
+		CLI: "claude-tmux", Profile: "/p", Prompt: "PERSONA-BODY",
+		Workspace: t.TempDir(), ArtifactPath: "/a.md", Agent: "build",
+		CorrectionDirective: "rewrite the Verdict section per the contract",
+	})
+	if err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	got := fe.gotReq.Prompt
+	if !strings.HasPrefix(got, "## Correction") {
+		t.Errorf("correction block must lead the materialized prompt:\n%s", truncate(got, 300))
+	}
+	if !strings.Contains(got, "rewrite the Verdict section per the contract") {
+		t.Errorf("directive text missing from launched prompt:\n%s", truncate(got, 300))
+	}
+	if ci, bi := strings.Index(got, "## Correction"), strings.Index(got, "PERSONA-BODY"); ci >= bi {
+		t.Errorf("correction must precede the body; corr=%d body=%d", ci, bi)
+	}
+}
+
+func TestLaunch_NoCorrectionBlock_WhenDirectiveEmpty(t *testing.T) {
+	fe := &fakeEngine{}
+	_, err := withEngine(fe).Launch(context.Background(), core.BridgeRequest{
+		CLI: "claude-tmux", Profile: "/p", Prompt: "BODY",
+		Workspace: t.TempDir(), ArtifactPath: "/a.md", Agent: "build",
+	})
+	if err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if strings.Contains(fe.gotReq.Prompt, "## Correction") {
+		t.Errorf("empty directive must produce no correction block:\n%s", truncate(fe.gotReq.Prompt, 300))
+	}
+}

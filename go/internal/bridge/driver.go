@@ -1,0 +1,105 @@
+package bridge
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+	"sync"
+)
+
+type Driver interface {
+	Name() string
+
+	Launch(ctx context.Context, cfg *Config, deps Deps) (int, error)
+}
+
+type CLIPreflight interface {
+	Preflight(ctx context.Context, cfg *Config, deps Deps) error
+}
+
+type DeepProber interface {
+	DeepProbeArgs(m Manifest) []string
+}
+
+func headlessProbeArgs(m Manifest) []string {
+	model := m.ModelTierMap["fast"]
+	if model == "" {
+		model = m.DefaultModel
+	}
+	if model != "" {
+		return []string{"-p", "Reply only: PROBE_OK", "--model", model}
+	}
+	return []string{"-p", "Reply only: PROBE_OK"}
+}
+
+func (claudePDriver) DeepProbeArgs(m Manifest) []string {
+	return headlessProbeArgs(m)
+}
+
+var (
+	driverMu sync.RWMutex
+	drivers  = map[string]Driver{}
+)
+
+func Register(d Driver) {
+	if d == nil {
+		panic("bridge: Register requires a non-nil Driver")
+	}
+	name := d.Name()
+	if name == "" {
+		panic("bridge: Register requires a non-empty Driver.Name()")
+	}
+	driverMu.Lock()
+	defer driverMu.Unlock()
+	if _, exists := drivers[name]; exists {
+		panic(fmt.Sprintf("bridge: duplicate Register(%q) — each driver registers exactly once", name))
+	}
+	drivers[name] = d
+}
+
+func LookupDriver(cli string) (Driver, bool) {
+	driverMu.RLock()
+	defer driverMu.RUnlock()
+	d, ok := drivers[cli]
+	return d, ok
+}
+
+var bareDriverMap = map[string]string{
+	"claude": "claude-tmux",
+	"codex":  "codex-tmux",
+	"agy":    "agy-tmux",
+	"ollama": "ollama-tmux",
+}
+
+var errRetiredGemini = errors.New("the bare driver name gemini is retired: name an agy driver (agy, agy-tmux or agy-claude-tmux)")
+
+func DriverFor(cli string) (string, error) {
+	if cli == "gemini" {
+		return "", errRetiredGemini
+	}
+	if _, ok := LookupDriver(cli); ok {
+		return cli, nil
+	}
+	if mapped, ok := bareDriverMap[cli]; ok {
+		return mapped, nil
+	}
+	return cli, nil
+}
+
+func DriverNames() []string {
+	driverMu.RLock()
+	defer driverMu.RUnlock()
+	out := make([]string, 0, len(drivers))
+	for n := range drivers {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func ResetDriversForTesting() {
+	driverMu.Lock()
+	defer driverMu.Unlock()
+	drivers = map[string]Driver{}
+}

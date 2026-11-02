@@ -1,0 +1,107 @@
+//go:build integration
+
+package bridge
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestExecRunner_Real(t *testing.T) {
+	t.Parallel()
+	var out bytes.Buffer
+	code, err := execRunner(itBoundedContext(t, itLaunchDeadline), "sh", "", []string{"-c", "exit 0"}, os.Environ(), nil, &out, &out)
+	if err != nil || code != 0 {
+		t.Fatalf("exit 0: code=%d err=%v", code, err)
+	}
+	code, err = execRunner(itBoundedContext(t, itLaunchDeadline), "sh", "", []string{"-c", "exit 7"}, nil, nil, &out, &out)
+	if err != nil || code != 7 {
+		t.Fatalf("exit 7: code=%d err=%v, want (7,nil)", code, err)
+	}
+	code, err = execRunner(itBoundedContext(t, itLaunchDeadline), "/no/such/binary-cov-xyz", "", nil, nil, nil, &out, &out)
+	if err == nil || code != -1 {
+		t.Fatalf("missing binary: code=%d err=%v, want (-1, err)", code, err)
+	}
+	ctxCancel, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	code, err = execRunner(ctxCancel, "sh", "", []string{"-c", "sleep 10"}, nil, nil, &out, &out)
+	if code != -1 || err != nil {
+		t.Fatalf("ctx-cancel mid-Wait: code=%d err=%v, want (-1, nil)", code, err)
+	}
+	if ctxCancel.Err() == nil {
+		t.Fatal("ctx should be Done after the kill — the fix's ctx.Err() gate depends on it")
+	}
+	dir := t.TempDir()
+	out.Reset()
+	code, err = execRunner(itBoundedContext(t, itLaunchDeadline), "sh", dir, []string{"-c", "pwd"}, nil, nil, &out, &out)
+	if err != nil || code != 0 {
+		t.Fatalf("pwd: code=%d err=%v", code, err)
+	}
+	gotPwd, _ := filepath.EvalSymlinks(strings.TrimSpace(out.String()))
+	wantPwd, _ := filepath.EvalSymlinks(dir)
+	if gotPwd != wantPwd {
+		t.Fatalf("subprocess cwd = %q, want dir %q", gotPwd, wantPwd)
+	}
+}
+
+func TestExecTmux_Real(t *testing.T) {
+	t.Parallel()
+	requireTmux(t)
+	tx := execTmux{}
+	ctx := context.Background()
+	sess := fmt.Sprintf("evolve-bridge-covtest-%d", os.Getpid())
+	defer func() { _ = tx.KillSession(ctx, sess) }()
+
+	if tx.HasSession(ctx, sess) {
+		t.Fatalf("session %s should not exist yet", sess)
+	}
+	if err := tx.NewSession(ctx, sess, 80, 24); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if !tx.HasSession(ctx, sess) {
+		t.Fatal("HasSession should be true after NewSession")
+	}
+	if err := tx.SendKeys(ctx, sess, "echo cov-marker", true); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+	if err := tx.SendKeys(ctx, sess, "", true); err != nil {
+		t.Fatalf("SendKeys(enter): %v", err)
+	}
+	time.Sleep(250 * time.Millisecond)
+	if _, err := tx.CapturePane(ctx, sess, 0); err != nil {
+		t.Fatalf("CapturePane visible: %v", err)
+	}
+	if _, err := tx.CapturePane(ctx, sess, 200); err != nil {
+		t.Fatalf("CapturePane scrollback: %v", err)
+	}
+	bufFile := filepath.Join(t.TempDir(), "buf.txt")
+	if err := os.WriteFile(bufFile, []byte("paste-cov\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.LoadBuffer(ctx, sess, bufFile); err != nil {
+		t.Fatalf("LoadBuffer: %v", err)
+	}
+	if err := tx.PasteBuffer(ctx, sess); err != nil {
+		t.Fatalf("PasteBuffer: %v", err)
+	}
+	if err := tx.KillSession(ctx, sess); err != nil {
+		t.Fatalf("KillSession: %v", err)
+	}
+	if tx.HasSession(ctx, sess) {
+		t.Fatal("HasSession should be false after KillSession")
+	}
+}
+
+func TestStripANSI(t *testing.T) {
+	t.Parallel()
+	in := "\x1b[31mred\x1b[0m plain \x1b]0;title\x07end"
+	if got := stripANSI(in); got != "red plain end" {
+		t.Fatalf("stripANSI = %q, want %q", got, "red plain end")
+	}
+}

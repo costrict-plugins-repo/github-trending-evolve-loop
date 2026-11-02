@@ -1,0 +1,178 @@
+{
+  "name": "retrospective",
+  "role": "retrospective",
+  "cli": "codex-tmux",
+  "cli_fallback": [
+    "claude-tmux"
+  ],
+  "model_tier_default": "deep",
+  "model_tier_overrides": {
+    "systemic_failure": "deep",
+    "first_observation": "balanced"
+  },
+  "allowed_tools": [
+    "Read",
+    "Read(skills/loop/lesson-template.yaml)",
+    "Grep",
+    "Glob",
+    "Bash(git status:*)",
+    "Bash(git status)",
+    "Bash(git log:*)",
+    "Bash(git diff:*)",
+    "Bash(git show:*)",
+    "Bash(git ls-files:*)",
+    "Bash(git rev-parse:*)",
+    "Bash(ls:*)",
+    "Bash(cat:*)",
+    "Bash(head:*)",
+    "Bash(tail:*)",
+    "Bash(wc:*)",
+    "Bash(find:*)",
+    "Bash(test:*)",
+    "Bash(diff:*)",
+    "Bash(sha256sum:*)",
+    "Bash(shasum:*)",
+    "Bash(jq:*)",
+    "Write(.evolve/runs/cycle-*/retrospective-report.md)",
+    "Write(.evolve/runs/cycle-*/disposition.json)",
+    "Write(.evolve/runs/cycle-*/failure-decision.json)",
+    "Write(.evolve/runs/cycle-*/handoff-retrospective.json)",
+    "Write(.evolve/runs/cycle-*/lessons-digest.md)",
+    "Write(.evolve/runs/cycle-*/carryover-todos.json)",
+    "Write(.evolve/runs/cycle-*/workers/*)",
+    "Write(.evolve/instincts/lessons/*.yaml)",
+    "Edit(.evolve/runs/cycle-*/retrospective-report.md)",
+    "Edit(.evolve/runs/cycle-*/handoff-retrospective.json)",
+    "Edit(.evolve/runs/cycle-*/lessons-digest.md)",
+    "Edit(.evolve/runs/cycle-*/carryover-todos.json)",
+    "Edit(.evolve/runs/cycle-*/workers/*)",
+    "Edit(.evolve/instincts/lessons/*.yaml)",
+    "WebSearch",
+    "WebFetch",
+    "Bash(scripts/research/kb-search.sh:*)",
+    "Bash(evolve phase verify:*)"
+  ],
+  "disallowed_tools": [
+    "Bash(git commit:*)",
+    "Bash(git push:*)",
+    "Bash(git reset:*)",
+    "Bash(git checkout:*)",
+    "Bash(git merge:*)",
+    "Bash(git rebase:*)",
+    "Bash(git worktree:*)",
+    "Bash(gh release:*)",
+    "Bash(gh pr:*)",
+    "Bash(rm:*)",
+    "Bash(mv:*)",
+    "Bash(curl:*)",
+    "Bash(wget:*)",
+    "Bash(npm:*)",
+    "Bash(pip:*)",
+    "Bash(brew:*)",
+    "Bash(jq -i:*)",
+    "Bash(jq --in-place:*)",
+    "Edit(skills/**)",
+    "Edit(agents/**)",
+    "Edit(scripts/**)",
+    "Edit(.claude-plugin/**)",
+    "Edit(CHANGELOG.md)",
+    "Edit(README.md)",
+    "Edit(CLAUDE.md)",
+    "Edit(.evolve/state.json)",
+    "Edit(.evolve/ledger.jsonl)",
+    "Edit(.evolve/profiles/**)",
+    "Edit(.evolve/evals/**)",
+    "Edit(.evolve/instincts/personal/**)",
+    "Edit(.evolve/instincts/archived/**)",
+    "Write(skills/**)",
+    "Write(agents/**)",
+    "Write(scripts/**)",
+    "Write(.claude-plugin/**)",
+    "Write(CHANGELOG.md)",
+    "Write(README.md)",
+    "Write(CLAUDE.md)",
+    "Write(.evolve/state.json)",
+    "Write(.evolve/ledger.jsonl)",
+    "Write(.evolve/profiles/**)",
+    "Write(.evolve/evals/**)",
+    "Write(.evolve/instincts/personal/**)",
+    "Write(.evolve/instincts/archived/**)"
+  ],
+  "add_dir": [
+    "."
+  ],
+  "max_budget_usd": 1.5,
+  "max_turns": 30,
+  "output_artifact": ".evolve/runs/cycle-{cycle}/retrospective-report.md",
+  "challenge_token_required": true,
+  "settings_scope": "project",
+  "extra_flags_by_cli": {
+    "claude-tmux": [
+      "--strict-mcp-config",
+      "--exclude-dynamic-system-prompt-sections",
+      "--disable-slash-commands"
+    ]
+  },
+  "parallel_subtasks": [
+    {
+      "name": "instinct",
+      "prompt_template": "You are retrospective-instinct for cycle {cycle}. Read .evolve/runs/cycle-{cycle}/build-report.md and audit-report.md to extract REUSABLE PATTERNS that apply across cycles (e.g., 'always read module exports before importing', 'bash 3.2 fails on declare -A'). Output one or more '## Lesson: <title>' blocks; under each, 2-4 sentences explaining the lesson and where it would apply. DO NOT update gene pool or analyze cycle-specific failures."
+    },
+    {
+      "name": "gene",
+      "prompt_template": "You are retrospective-gene for cycle {cycle}. Examine the cycle outcome (PASS/FAIL/WARN from audit-report.md) and propose updates to the gene pool: which heuristics worked, which underperformed. Output '## Lesson: <title>' blocks framing each as a gene-pool insight (e.g., 'gene XYZ should weight verbose-test-output higher when audit phase failed on regression'). DO NOT extract general patterns or write to instincts."
+    },
+    {
+      "name": "failure",
+      "prompt_template": "You are retrospective-failure for cycle {cycle}. Examine failedApproaches in .evolve/state.json and any FAIL-class artifacts. Output '## Lesson: <title>' blocks framing each as a failure pattern with reproduction steps and root-cause hypothesis. DO NOT analyze success patterns or update gene pool. If cycle PASSED with no failedApproaches, output a single '## Lesson: No failures this cycle' block."
+    }
+  ],
+  "sandbox": {
+    "enabled": true,
+    "write_subpaths": [
+      ".evolve/runs/cycle-*",
+      ".evolve/instincts/lessons"
+    ],
+    "read_only_repo": true,
+    "deny_subpaths": [
+      ".git",
+      "skills",
+      "agents",
+      "scripts",
+      ".claude-plugin",
+      ".evolve/state.json",
+      ".evolve/ledger.jsonl",
+      ".evolve/profiles",
+      ".evolve/evals",
+      ".evolve/instincts/personal",
+      ".evolve/instincts/archived",
+      "CHANGELOG.md",
+      "README.md",
+      "CLAUDE.md"
+    ],
+    "allow_network": true
+  },
+  "parallel_eligible": true,
+  "output_contract": {
+    "schema": "schemas/handoff/audit-report.schema.json",
+    "expected_artifacts": [
+      "retrospective-report.md",
+      ".evolve/runs/cycle-N/handoff-retrospective.json"
+    ]
+  },
+  "model_tier_envelope": {
+    "min": "balanced",
+    "default": "deep",
+    "max": "deep"
+  },
+  "allowed_clis": [
+    "all"
+  ],
+  "research_quota": {
+    "web_search": 3,
+    "web_fetch": 5,
+    "kb_search": 20
+  },
+  "stream_output": true,
+  "generated_from": "hand-authored"
+}

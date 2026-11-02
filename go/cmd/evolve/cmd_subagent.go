@@ -1,0 +1,519 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"github.com/mickeyyaya/evolve-loop/go/cmd/evolve/cmdutil"
+	"github.com/mickeyyaya/evolve-loop/go/internal/envchain"
+	"github.com/mickeyyaya/evolve-loop/go/internal/ipcenv"
+	"github.com/mickeyyaya/evolve-loop/go/internal/paths"
+	"github.com/mickeyyaya/evolve-loop/go/internal/policy"
+	"github.com/mickeyyaya/evolve-loop/go/internal/subagent"
+)
+
+const subagentUsage = `Usage: evolve subagent <subcommand> [arguments]
+
+Subcommands:
+  cache-prefix       Write deterministic cache-prefix file (sibling fan-out)
+                     ( --cycle N --agent NAME --workspace PATH --out PATH
+                       [--project-root PATH] )
+  resolve-tier       Resolve model tier per agent profile + env overrides
+                     ( --profile PATH --cycle N [--project-root PATH]
+                       [--worktree PATH] )
+  check-token        Verify artifact contains challenge token
+                     ( check-token <artifact_path> <token> )
+                     Exit 0 = OK, 2 = integrity fail.
+  check-ctx-advisory Emit token-budget advisory when over profile threshold
+                     ( check-ctx-advisory <profile_json> <tokens> )
+                     Always exits 0; advisory printed to stderr.
+  validate-profile   Validate agent profile JSON + adapter capabilities +
+                     dispatch plan log; runs adapter with VALIDATE_ONLY=1
+                     ( validate-profile [--dispatch-plan-log PATH] <agent> )
+                     Reads the profiles and the adapters of
+                     EVOLVE_PLUGIN_ROOT, else of the project root.
+  run                Execute one phase agent end-to-end (v2 cache-prefix
+                     prompt + adapter exec + verify + ledger).
+                     ( run <agent> <cycle> <workspace_path> )
+                     Prompt read from stdin (or PROMPT_FILE_OVERRIDE).
+                     Honors MODEL_TIER_HINT, ADVERSARIAL_AUDIT.
+                     (LEGACY_AGENT_DISPATCH is retired — bridge is the only path.)
+  dispatch-parallel  Fan-out N workers per profile.parallel_subtasks[],
+                     run via fanoutdispatch + aggregator merge.
+                     ( dispatch-parallel <agent> <cycle> <workspace_path> )
+                     Refuses if profile.parallel_eligible != true.
+                     Config via .evolve/policy.json fanout.{concurrency,
+                     cache_prefix_enabled,track_workers,test_executor}.
+`
+
+func runSubagent(args []string, _ io.Reader, stdout, stderr io.Writer) int {
+	if len(args) < 1 {
+		fmt.Fprint(stderr, subagentUsage)
+		return 2
+	}
+	switch args[0] {
+	case "-h", "--help", "help":
+		fmt.Fprint(stdout, subagentUsage)
+		return 0
+	case "cache-prefix":
+		return runSubagentCachePrefix(args[1:], stdout, stderr)
+	case "resolve-tier":
+		return runSubagentResolveTier(args[1:], stdout, stderr)
+	case "check-token":
+		return runSubagentCheckToken(args[1:], stdout, stderr)
+	case "check-ctx-advisory":
+		return runSubagentCheckCtxAdvisory(args[1:], stdout, stderr)
+	case "validate-profile":
+		return runSubagentValidateProfile(args[1:], stdout, stderr)
+	case "run":
+		return runSubagentRun(args[1:], stdout, stderr)
+	case "dispatch-parallel":
+		return runSubagentDispatchParallel(args[1:], stdout, stderr)
+	default:
+		fmt.Fprintf(stderr, "evolve subagent: unknown subcommand %q\n\n%s", args[0], subagentUsage)
+		return 2
+	}
+}
+
+func resolveWorkspaceArg(workspace, projectRoot string) (string, error) {
+	if workspace == "" || projectRoot == "" || filepath.IsAbs(workspace) {
+		return workspace, nil
+	}
+	resolved := filepath.Join(projectRoot, workspace)
+	rel, err := filepath.Rel(projectRoot, resolved)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("workspace %q escapes project root %q", workspace, projectRoot)
+	}
+	return resolved, nil
+}
+
+func runSubagentCachePrefix(args []string, stdout, stderr io.Writer) int {
+	var (
+		cycleStr, agent, workspace, out, projectRoot string
+	)
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch a {
+		case "--help", "-h":
+			fmt.Fprintln(stdout, "Usage: evolve subagent cache-prefix --cycle N --agent NAME --workspace PATH --out PATH [--project-root PATH]")
+			return 0
+		case "--cycle":
+			i++
+			cycleStr = nextArg(args, i)
+		case "--agent":
+			i++
+			agent = nextArg(args, i)
+		case "--workspace":
+			i++
+			workspace = nextArg(args, i)
+		case "--out":
+			i++
+			out = nextArg(args, i)
+		case "--project-root":
+			i++
+			projectRoot = nextArg(args, i)
+		default:
+			fmt.Fprintf(stderr, "evolve subagent cache-prefix: unknown arg %q\n", a)
+			return 2
+		}
+	}
+	if cycleStr == "" || agent == "" || workspace == "" || out == "" {
+		fmt.Fprintln(stderr, "evolve subagent cache-prefix: --cycle, --agent, --workspace, --out are required")
+		return 2
+	}
+	cycle, err := strconv.Atoi(cycleStr)
+	if err != nil {
+		fmt.Fprintf(stderr, "evolve subagent cache-prefix: --cycle must be int: %v\n", err)
+		return 2
+	}
+	if projectRoot == "" {
+		projectRoot = envOrCwd("EVOLVE_PROJECT_ROOT")
+	}
+	workspace, err = resolveWorkspaceArg(workspace, projectRoot)
+	if err != nil {
+		fmt.Fprintf(stderr, "evolve subagent cache-prefix: %v\n", err)
+		return 2
+	}
+	if err := subagent.WriteCachePrefix(subagent.CachePrefixRequest{
+		Cycle:       cycle,
+		Agent:       agent,
+		Workspace:   workspace,
+		OutPath:     out,
+		ProjectRoot: projectRoot,
+	}, subagent.CachePrefixOptions{}); err != nil {
+		fmt.Fprintf(stderr, "evolve subagent cache-prefix: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func runSubagentResolveTier(args []string, stdout, stderr io.Writer) int {
+	var (
+		profile, cycleStr, projectRoot, worktree string
+	)
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch a {
+		case "--help", "-h":
+			fmt.Fprintln(stdout, "Usage: evolve subagent resolve-tier --profile PATH --cycle N [--project-root PATH] [--worktree PATH]")
+			fmt.Fprintln(stdout, "Honors MODEL_TIER_HINT and .evolve/policy.json workflow settings.")
+			return 0
+		case "--profile":
+			i++
+			profile = nextArg(args, i)
+		case "--cycle":
+			i++
+			cycleStr = nextArg(args, i)
+		case "--project-root":
+			i++
+			projectRoot = nextArg(args, i)
+		case "--worktree":
+			i++
+			worktree = nextArg(args, i)
+		default:
+			fmt.Fprintf(stderr, "evolve subagent resolve-tier: unknown arg %q\n", a)
+			return 2
+		}
+	}
+	if profile == "" || cycleStr == "" {
+		fmt.Fprintln(stderr, "evolve subagent resolve-tier: --profile and --cycle are required")
+		return 2
+	}
+	cycle, err := strconv.Atoi(cycleStr)
+	if err != nil {
+		fmt.Fprintf(stderr, "evolve subagent resolve-tier: --cycle must be int: %v\n", err)
+		return 2
+	}
+	if projectRoot == "" {
+		projectRoot = envOrCwd("EVOLVE_PROJECT_ROOT")
+	}
+	wc := loadWorkflowConfig(filepath.Join(projectRoot, ".evolve"))
+	tier, err := subagent.ResolveModelTier(
+		subagent.ResolveModelTierRequest{
+			ProfilePath:            profile,
+			Cycle:                  cycle,
+			ProjectRoot:            projectRoot,
+			WorktreePath:           worktree,
+			ModelTierHint:          os.Getenv("MODEL_TIER_HINT"),
+			AuditorTierOverride:    wc.AuditorTierOverride,
+			DiffComplexityDisabled: wc.DiffComplexityDisable,
+		},
+		subagent.ResolveModelTierOptions{},
+	)
+	if err != nil {
+		fmt.Fprintf(stderr, "evolve subagent resolve-tier: %v\n", err)
+		return 1
+	}
+	fmt.Fprintln(stdout, tier)
+	return 0
+}
+
+func runSubagentCheckToken(args []string, stdout, stderr io.Writer) int {
+	if cmdutil.HasHelp(args) {
+		fmt.Fprintln(stdout, "Usage: evolve subagent check-token <artifact_path> <token>")
+		return 0
+	}
+	if len(args) != 2 {
+		fmt.Fprintln(stderr, "evolve subagent check-token: expected <artifact_path> <token>")
+		return 2
+	}
+	res := subagent.CheckToken(args[0], args[1])
+	if !res.OK {
+		fmt.Fprintf(stderr, "[subagent-run] INTEGRITY-FAIL: %s\n", res.Reason)
+		return 2
+	}
+	fmt.Fprintf(stderr, "[subagent-run] %s\n", res.Reason)
+	return 0
+}
+
+func runSubagentCheckCtxAdvisory(args []string, stdout, stderr io.Writer) int {
+	if cmdutil.HasHelp(args) {
+		fmt.Fprintln(stdout, "Usage: evolve subagent check-ctx-advisory <profile_json> <tokens>")
+		return 0
+	}
+	if len(args) != 2 {
+		fmt.Fprintln(stderr, "evolve subagent check-ctx-advisory: expected <profile_json> <tokens>")
+		return 2
+	}
+	tokens, err := strconv.Atoi(args[1])
+	if err != nil {
+		fmt.Fprintf(stderr, "evolve subagent check-ctx-advisory: tokens must be int: %v\n", err)
+		return 2
+	}
+	res, err := subagent.CheckCtxAdvisory(args[0], tokens)
+	if err != nil {
+		fmt.Fprintf(stderr, "[subagent-run] WARN: %v\n", err)
+		return 0
+	}
+	if res.Emit {
+		fmt.Fprintf(stderr, "[subagent-run] INFO: %s\n", res.Message)
+	}
+	return 0
+}
+
+func runSubagentValidateProfile(args []string, stdout, stderr io.Writer) int {
+	if cmdutil.HasHelp(args) {
+		fmt.Fprintln(stdout, "Usage: evolve subagent validate-profile [--dispatch-plan-log PATH] <agent>")
+		fmt.Fprintln(stdout, "Reads <plugin root>/.evolve/profiles and <plugin root>/adapters (EVOLVE_PLUGIN_ROOT, else the project root).")
+		return 0
+	}
+	dispatchPlanLog, args, parsed := parseValidateProfileFlags(args, stderr)
+	if !parsed {
+		return 2
+	}
+	if len(args) != 1 {
+		fmt.Fprintln(stderr, "evolve subagent validate-profile: expected <agent>")
+		return 2
+	}
+	agent := args[0]
+
+	layout := paths.ResolveFromEnv()
+	router, routed := rootRouter(layout, "evolve subagent validate-profile", io.Discard, stderr)
+	if !routed {
+		return exitRoutingRefused
+	}
+
+	res, err := subagent.ValidateProfile(context.Background(),
+		subagent.ValidateProfileRequest{
+			Agent:           agent,
+			ProfilesDir:     layout.ProfilesDir,
+			AdaptersDir:     layout.AdaptersDir,
+			CapabilityDir:   layout.CapabilityDir,
+			ProjectRoot:     layout.ProjectRoot,
+			WorktreePath:    os.Getenv("WORKTREE_PATH"),
+			DispatchPlanLog: dispatchPlanLog,
+		},
+		subagent.ValidateProfileOptions{ResolveLLM: roleResolver(router)},
+	)
+	if err != nil {
+		fmt.Fprintf(stderr, "[subagent-run] FAIL: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stderr, "[dispatch-resolve] cli=%s source=%s model=%s\n",
+		res.CLI, res.CLIResolutionSrc, res.Model)
+	fmt.Fprintf(stderr, "[subagent-run] cli_resolution: source=%s target_cli=%s\n",
+		res.CLIResolutionSrc, res.CLI)
+	for _, w := range res.Warns {
+		fmt.Fprintln(stderr, w)
+	}
+	fmt.Fprintf(stderr, "[subagent-run] profile valid: %s\n", agent)
+	return 0
+}
+
+func printSubagentRunHelp(stdout io.Writer) int {
+	fmt.Fprintln(stdout, "Usage: evolve subagent run <agent> <cycle> <workspace_path>")
+	fmt.Fprintln(stdout, "Prompt: read from stdin or set PROMPT_FILE_OVERRIDE")
+	fmt.Fprintln(stdout, "Env: MODEL_TIER_HINT, ADVERSARIAL_AUDIT,")
+	fmt.Fprintln(stdout, "     WORKTREE_PATH")
+	fmt.Fprintln(stdout, "Config: .evolve/policy.json workflow settings")
+	fmt.Fprintln(stdout, "Note: LEGACY_AGENT_DISPATCH is retired — the bridge is the only dispatch path.")
+	return 0
+}
+
+func parseValidateProfileFlags(args []string, stderr io.Writer) (string, []string, bool) {
+	var dispatchPlanLog string
+	for len(args) > 0 && strings.HasPrefix(args[0], "--") {
+		a := args[0]
+		switch {
+		case a == "--dispatch-plan-log" && len(args) > 1:
+			dispatchPlanLog = args[1]
+			args = args[2:]
+		case strings.HasPrefix(a, "--dispatch-plan-log="):
+			dispatchPlanLog = strings.TrimPrefix(a, "--dispatch-plan-log=")
+			args = args[1:]
+		default:
+			fmt.Fprintf(stderr, "evolve subagent validate-profile: unknown flag: %s\n", a)
+			return "", nil, false
+		}
+	}
+	return dispatchPlanLog, args, true
+}
+
+func runSubagentRun(args []string, stdout, stderr io.Writer) int {
+	if cmdutil.HasHelp(args) {
+		return printSubagentRunHelp(stdout)
+	}
+	if len(args) != 3 {
+		fmt.Fprintln(stderr, "evolve subagent run: expected <agent> <cycle> <workspace>")
+		return 2
+	}
+	agent := args[0]
+	cycle, err := strconv.Atoi(args[1])
+	if err != nil {
+		fmt.Fprintf(stderr, "evolve subagent run: cycle must be integer: %v\n", err)
+		return 2
+	}
+	workspace := args[2]
+
+	layout := paths.ResolveFromEnv()
+	workspace, err = resolveWorkspaceArg(workspace, layout.ProjectRoot)
+	if err != nil {
+		fmt.Fprintf(stderr, "evolve subagent run: %v\n", err)
+		return 2
+	}
+
+	var promptReader io.Reader
+	if override := os.Getenv("PROMPT_FILE_OVERRIDE"); override != "" {
+		f, err := os.Open(override)
+		if err != nil {
+			fmt.Fprintf(stderr, "[subagent-run] FAIL: PROMPT_FILE_OVERRIDE missing: %s\n", override)
+			return 1
+		}
+		defer func() { _ = f.Close() }()
+		promptReader = f
+	} else {
+		promptReader = os.Stdin
+	}
+
+	flags := readSubagentRunFlags()
+	wc := loadWorkflowConfig(layout.EvolveDir)
+	router, routed := rootRouter(layout, "evolve subagent run", stderr, stderr)
+	if !routed {
+		return exitRoutingRefused
+	}
+
+	signals, closeSignals := newRoleSignalCenter(roleSubagent, layout.ProjectRoot, layout.EvolveDir, stderr)
+	defer closeSignals()
+
+	res, err := subagent.Run(context.Background(), subagent.RunRequest{
+		Agent:                  agent,
+		Cycle:                  cycle,
+		WorkspacePath:          workspace,
+		ProfilesDir:            layout.ProfilesDir,
+		AdaptersDir:            layout.AdaptersDir,
+		CapabilityDir:          layout.CapabilityDir,
+		ProjectRoot:            layout.ProjectRoot,
+		PluginRoot:             layout.PluginRoot,
+		WorktreePath:           os.Getenv("WORKTREE_PATH"),
+		LedgerPath:             layout.LedgerFile,
+		PromptReader:           promptReader,
+		ModelTierHint:          os.Getenv("MODEL_TIER_HINT"),
+		AuditorTierOverride:    wc.AuditorTierOverride,
+		DiffComplexityDisabled: wc.DiffComplexityDisable,
+		AdversarialAudit:       flags.adversarialAudit,
+		LegacyAgentDispatch:    flags.legacyAgentDispatch,
+		DispatchDepth:          subagent.ReadDispatchDepth(os.Getenv),
+		ChallengeTokenOverride: os.Getenv(subagent.FanoutWorkerTokenEnv),
+	}, subagent.RunOptions{Signals: signals, ResolveLLM: roleResolver(router)})
+	if err != nil {
+		fmt.Fprintf(stderr, "[subagent-run] FAIL: %v\n", err)
+		return 1
+	}
+	for _, w := range res.Warns {
+		fmt.Fprintln(stderr, w)
+	}
+	return renderRunOutcome(res, agent, cycle, stderr)
+}
+
+func renderRunOutcome(res subagent.RunResult, agent string, cycle int, stderr io.Writer) int {
+	fmt.Fprintf(stderr, "[subagent-run] verdict=%s agent=%s cycle=%d artifact=%s exit=%d duration_ms=%d\n",
+		res.Verdict, agent, cycle, res.ArtifactPath, res.ExitCode, res.DurationMS)
+	switch res.Verdict {
+	case subagent.VerdictPASS:
+		return 0
+	case subagent.VerdictIntegrityFail:
+		return 2
+	default:
+		return 1
+	}
+}
+
+func runSubagentDispatchParallel(args []string, stdout, stderr io.Writer) int {
+	if cmdutil.HasHelp(args) {
+		fmt.Fprintln(stdout, "Usage: evolve subagent dispatch-parallel <agent> <cycle> <workspace_path>")
+		fmt.Fprintln(stdout, "Config: .evolve/policy.json fanout.{concurrency,cache_prefix_enabled,track_workers,test_executor},")
+		fmt.Fprintln(stdout, "     WORKTREE_PATH")
+		return 0
+	}
+	if len(args) != 3 {
+		fmt.Fprintln(stderr, "evolve subagent dispatch-parallel: expected <agent> <cycle> <workspace>")
+		return 2
+	}
+	agent := args[0]
+	cycle, err := strconv.Atoi(args[1])
+	if err != nil {
+		fmt.Fprintf(stderr, "evolve subagent dispatch-parallel: cycle must be integer: %v\n", err)
+		return 2
+	}
+	workspace := args[2]
+
+	layout := paths.ResolveFromEnv()
+	workspace, err = resolveWorkspaceArg(workspace, layout.ProjectRoot)
+	if err != nil {
+		fmt.Fprintf(stderr, "evolve subagent dispatch-parallel: %v\n", err)
+		return 2
+	}
+
+	pol, err := policy.Load(filepath.Join(layout.EvolveDir, "policy.json"))
+	if err != nil {
+		fmt.Fprintf(stderr, "[dispatch-parallel] WARN: policy load: %v; using defaults\n", err)
+		pol = policy.Policy{}
+	}
+	fc := pol.FanoutConfig()
+
+	res, err := subagent.DispatchParallel(context.Background(), subagent.DispatchParallelRequest{
+		Agent:              agent,
+		Cycle:              cycle,
+		WorkspacePath:      workspace,
+		ProfilesDir:        layout.ProfilesDir,
+		AdaptersDir:        layout.AdaptersDir,
+		CapabilityDir:      layout.CapabilityDir,
+		ProjectRoot:        layout.ProjectRoot,
+		PluginRoot:         layout.PluginRoot,
+		LedgerPath:         layout.LedgerFile,
+		WorktreePath:       os.Getenv("WORKTREE_PATH"),
+		Concurrency:        fc.Concurrency,
+		CachePrefixEnabled: *fc.CachePrefixEnabled,
+		TrackWorkers:       *fc.TrackWorkers,
+		TestExecutor:       fc.TestExecutor,
+		DispatchDepth:      subagent.ReadDispatchDepth(os.Getenv),
+	}, subagent.DispatchParallelOptions{})
+	if err != nil {
+		fmt.Fprintf(stderr, "[subagent-run] FAIL: %v\n", err)
+		if strings.Contains(err.Error(), "not parallel_eligible") {
+			return 2
+		}
+		return 1
+	}
+	fmt.Fprintf(stderr,
+		"[dispatch-parallel] DONE agent=%s cycle=%d workers=%d fanout_rc=%d agg_rc=%d aggregate=%s tier=%s\n",
+		agent, cycle, res.WorkerCount, res.FanoutExitCode, res.AggregatorExit, res.AggregatePath, res.QualityTier,
+	)
+	if res.FanoutExitCode != 0 || res.AggregatorExit != 0 {
+		return 1
+	}
+	return 0
+}
+
+func nextArg(args []string, i int) string {
+	if i >= len(args) {
+		return ""
+	}
+	return args[i]
+}
+
+func envOrCwd(env string) string { return cmdutil.EnvOrCwd(env) }
+
+func sourceRoot() string {
+	if v := os.Getenv(ipcenv.WorktreeRootKey); v != "" {
+		return paths.AbsoluteRoot(ipcenv.WorktreeRootKey, v, nil)
+	}
+	return envOrCwd("EVOLVE_PROJECT_ROOT")
+}
+
+type subagentRunFlags struct {
+	adversarialAudit    bool
+	legacyAgentDispatch bool
+}
+
+func readSubagentRunFlags() subagentRunFlags {
+	return subagentRunFlags{
+		adversarialAudit:    envchain.Bool("ADVERSARIAL_AUDIT", nil, true),
+		legacyAgentDispatch: envchain.Bool("LEGACY_AGENT_DISPATCH", nil, false),
+	}
+}

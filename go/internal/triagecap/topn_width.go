@@ -1,0 +1,83 @@
+package triagecap
+
+import (
+	"path/filepath"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/fleet"
+)
+
+type FleetCandidate struct {
+	ID     string
+	Weight float64
+	Files  []string
+}
+
+func SelectFleetWidthTopN(ranked []FleetCandidate, count int) []FleetCandidate {
+	if len(ranked) == 0 {
+		return nil
+	}
+	if count < 2 {
+		return []FleetCandidate{ranked[0]}
+	}
+
+	todos := make([]fleet.Todo, len(ranked))
+	byID := make(map[string]FleetCandidate, len(ranked))
+	for i, c := range ranked {
+		todos[i] = fleet.Todo{ID: c.ID, Files: c.Files}
+		byID[c.ID] = c
+	}
+	buckets, _ := fleet.Partition(todos, count)
+
+	var out []FleetCandidate
+	for _, b := range buckets {
+		if len(b) == 0 {
+			continue
+		}
+		out = append(out, byID[b[0].ID])
+	}
+	return out
+}
+
+func WidenTopNToFleetWidth(committed, backlog []FleetCandidate, count int) []FleetCandidate {
+	if count < 2 {
+		return committed
+	}
+	out := make([]FleetCandidate, len(committed))
+	copy(out, committed)
+
+	claimed := map[string]bool{}
+	seenID := make(map[string]bool, len(committed))
+	for _, c := range committed {
+		seenID[c.ID] = true
+		for _, f := range c.Files {
+			claimed[filepath.Clean(f)] = true
+		}
+	}
+	if len(out) >= count {
+		return out
+	}
+
+	for _, c := range backlog {
+		if len(out) >= count {
+			break
+		}
+		if seenID[c.ID] || overlapsClaimed(c.Files, claimed) {
+			continue
+		}
+		out = append(out, c)
+		seenID[c.ID] = true
+		for _, f := range c.Files {
+			claimed[filepath.Clean(f)] = true
+		}
+	}
+	return out
+}
+
+func overlapsClaimed(files []string, claimed map[string]bool) bool {
+	for _, f := range files {
+		if claimed[filepath.Clean(f)] {
+			return true
+		}
+	}
+	return false
+}

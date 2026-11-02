@@ -1,0 +1,90 @@
+package core
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/phaseio"
+)
+
+func TestPhaseRequest_JSONRoundTrip(t *testing.T) {
+	t.Parallel()
+	in := PhaseRequest{
+		Cycle:       104,
+		ProjectRoot: "/tmp/x",
+		Workspace:   "/tmp/x/.evolve/runs/cycle-104",
+		Worktree:    "/tmp/x/.evolve/worktrees/cycle-104",
+		GoalHash:    "abc123",
+		Context:     map[string]string{"intent": "rewrite as Go"},
+		Env:         map[string]string{"EVOLVE_PROJECT_ROOT": "/tmp/x"},
+		BuildExplanation: &phaseio.ExplanationView{
+			SchemaVersion:   1,
+			ContractVersion: 1,
+			Status:          "required",
+			Cycle:           104,
+			Reason:          "material behavior changed",
+			DocumentPath:    "docs/explain/builds/cycle-104.md",
+			DocumentSHA256:  "document-sha",
+		},
+	}
+	raw, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var out PhaseRequest
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.Cycle != in.Cycle || out.GoalHash != in.GoalHash || out.Workspace != in.Workspace {
+		t.Errorf("round-trip mismatch:\n in=%+v\nout=%+v", in, out)
+	}
+	if out.Context["intent"] != "rewrite as Go" {
+		t.Errorf("Context lost: %+v", out.Context)
+	}
+	if out.BuildExplanation == nil || out.BuildExplanation.DocumentSHA256 != "document-sha" {
+		t.Errorf("BuildExplanation lost: %+v", out.BuildExplanation)
+	}
+}
+
+func TestPhaseResponse_JSONShape(t *testing.T) {
+	t.Parallel()
+	r := PhaseResponse{
+		Phase:        "scout",
+		Verdict:      "PASS",
+		ArtifactsDir: "/tmp/x/.evolve/runs/cycle-104",
+		CostUSD:      0.42,
+		Tokens:       TokenUsage{Input: 1000, Output: 500, CacheRead: 200},
+		DurationMS:   12345,
+		Diagnostics: []Diagnostic{
+			{Severity: "WARN", Message: "research quota near"},
+		},
+	}
+	raw, _ := json.Marshal(r)
+	for _, want := range []string{
+		`"phase":"scout"`,
+		`"verdict":"PASS"`,
+		`"artifacts_dir":"/tmp/x/.evolve/runs/cycle-104"`,
+		`"cost_usd":0.42`,
+		`"duration_ms":12345`,
+		`"diagnostics"`,
+	} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("missing %q in: %s", want, raw)
+		}
+	}
+}
+
+func TestVerdict_Recognised(t *testing.T) {
+	t.Parallel()
+	for _, v := range []string{VerdictPASS, VerdictFAIL, VerdictWARN, VerdictSKIPPED} {
+		if !IsVerdict(v) {
+			t.Errorf("IsVerdict(%q) = false; want true", v)
+		}
+	}
+	for _, v := range []string{"", "ok", "FAIL ", "pass"} {
+		if IsVerdict(v) {
+			t.Errorf("IsVerdict(%q) = true; want false", v)
+		}
+	}
+}

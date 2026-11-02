@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "cli": "codex",
+  "binary": "codex",
+  "probe_unsandboxed_reason": "A version or doctor probe of codex reads its sign-in and writes its state under CODEX_HOME (~/.codex by default). The phase sandbox grants no write outside the cell, so the probe runs outside it.",
+  "install_roots": ["/opt/homebrew/Caskroom/codex"],
+  "env_passthrough": ["CODEX_HOME", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "no_proxy", "all_proxy", "SSL_CERT_FILE"],
+  "model_family": "gpt",
+  "capabilities": ["tools", "edit"],
+  "home_reads": ["~/.codex"],
+  "context_window": 200000,
+  "binary_min_version": "0.13.0",
+  "transport": "headless",
+  "default_tier": "full",
+  "tier_dependencies": {
+    "full": [
+      "codex"
+    ]
+  },
+  "prompt_marker": null,
+  "default_model": "",
+  "default_args": [],
+  "interactive_prompts": [],
+  "stub": false,
+  "note": "default_model empty: codex picks the model compatible with active auth. This headless manifest declares NO model_tier_map of its own: model_tier_map_from points at the codex FAMILY table (codex-tmux.json) and LoadManifest adopts it \u2014 one declaration per family, never per transport (inbox codex-tier-map-single-source; the old copy here sat three model generations stale). The headless driver resolves its -m through the shared bridge.resolveTierModel ladder over that table.",
+  "model_tier_map_from": "codex-tmux"
+}

@@ -1,0 +1,212 @@
+{
+  "name": "auditor",
+  "role": "auditor",
+  "cli": "claude-tmux",
+  "cli_fallback": [
+    "claude-p"
+  ],
+  "model_tier_default": "deep",
+  "model_tier_overrides": {
+    "security_sensitive": "deep",
+    "adversarial_audit": "deep"
+  },
+  "allowed_tools": [
+    "Bash(evolve phase verify:*)",
+    "Bash(verify-eval.sh:*)",
+    "Bash(cycle-health-check.sh:*)",
+    "Bash(eval-quality-check.sh:*)",
+    "Bash(guards-test.sh:*)",
+    "Bash(ship-integration-test.sh:*)",
+    "Bash(subagent-run-test.sh:*)",
+    "Bash(merge-lesson-test.sh:*)",
+    "Bash(role-gate-test.sh:*)",
+    "Bash(phase-gate-precondition-test.sh:*)",
+    "Bash(cycle-state.sh get:*)",
+    "Bash(cycle-state.sh exists)",
+    "Bash(cycle-state.sh exists:*)",
+    "Bash(cycle-state.sh dump)",
+    "Bash(cycle-state.sh dump:*)",
+    "Bash(cycle-state.sh path)",
+    "Bash(cycle-state.sh path:*)",
+    "Bash(cycle-state.sh prune-expired-failures:*)",
+    "Bash(run-cycle.sh:*)",
+    "Bash(release-pipeline-test.sh:*)",
+    "Bash(preflight-test.sh:*)",
+    "Bash(changelog-gen-test.sh:*)",
+    "Bash(marketplace-poll-test.sh:*)",
+    "Bash(rollback-test.sh:*)",
+    "Bash(probe-tool.sh:*)",
+    "Bash(probe-tool-test.sh:*)",
+    "Bash(postedit-validate.sh:*)",
+    "Bash(postedit-validate-test.sh:*)",
+    "Bash(claude-adapter-test.sh:*)",
+    "Bash(run-all-regression-tests.sh:*)",
+    "Bash(run-all-regression-tests-test.sh:*)",
+    "Bash(show-cycle-cost.sh:*)",
+    "Bash(show-cycle-cost-test.sh:*)",
+    "Bash(release.sh:*)",
+    "Bash(subagent-run.sh:*)",
+    "Read",
+    "Grep",
+    "Glob",
+    "Bash(git status:*)",
+    "Bash(git log:*)",
+    "Bash(git diff:*)",
+    "Bash(git show:*)",
+    "Bash(git ls-files:*)",
+    "Bash(git rev-parse:*)",
+    "Bash(ls:*)",
+    "Bash(cat:*)",
+    "Bash(head:*)",
+    "Bash(tail:*)",
+    "Bash(wc:*)",
+    "Bash(find:*)",
+    "Bash(test:*)",
+    "Bash(diff:*)",
+    "Bash(sha256sum:*)",
+    "Bash(shasum:*)",
+    "Bash(pytest:*)",
+    "Bash(python -m pytest:*)",
+    "Bash(npm test:*)",
+    "Bash(npm run test:*)",
+    "Write(.evolve/runs/cycle-*/audit-report.md)",
+    "Write(.evolve/runs/cycle-*/handoff-auditor.json)",
+    "Write(.evolve/runs/cycle-*/auditor-stdout.log)",
+    "Write(.evolve/runs/cycle-*/workers/*)",
+    "Edit(.evolve/runs/cycle-*/audit-report.md)",
+    "Edit(.evolve/runs/cycle-*/handoff-auditor.json)",
+    "Edit(.evolve/runs/cycle-*/workers/*)",
+    "Bash(run-acs-suite.sh:*)",
+    "Bash(validate-predicate.sh:*)",
+    "WebSearch",
+    "WebFetch",
+    "Bash(scripts/research/kb-search.sh:*)"
+  ],
+  "disallowed_tools": [
+    "Edit(skills/**)",
+    "Edit(agents/**)",
+    "Edit(scripts/**)",
+    "Edit(.claude-plugin/**)",
+    "Edit(.evolve/state.json)",
+    "Edit(.evolve/ledger.jsonl)",
+    "Edit(.evolve/profiles/**)",
+    "Edit(.evolve/evals/**)",
+    "Edit(CLAUDE.md)",
+    "Write(skills/**)",
+    "Write(agents/**)",
+    "Write(scripts/**)",
+    "Write(.claude-plugin/**)",
+    "Write(.evolve/state.json)",
+    "Write(.evolve/ledger.jsonl)",
+    "Write(.evolve/profiles/**)",
+    "Write(.evolve/evals/**)",
+    "Write(CLAUDE.md)",
+    "Bash(git commit:*)",
+    "Bash(git push:*)",
+    "Bash(git reset:*)",
+    "Bash(git checkout:*)",
+    "Bash(git merge:*)",
+    "Bash(git rebase:*)",
+    "Bash(jq -i:*)",
+    "Bash(jq --in-place:*)",
+    "Bash(rm*)",
+    "Bash(mv*)",
+    "$include_policy:no-inline-script-exec",
+    "Bash(cp:*)",
+    "Bash(PATH=:*)",
+    "Bash(export PATH:*)",
+    "Bash(cycle-state.sh clear)",
+    "Bash(cycle-state.sh clear:*)",
+    "Bash(cycle-state.sh init:*)",
+    "Bash(cycle-state.sh init)",
+    "Bash(cycle-state.sh set-worktree:*)",
+    "Bash(cycle-state.sh set-worktree)",
+    "Bash(cycle-state.sh advance:*)",
+    "Bash(cycle-state.sh set-agent:*)"
+  ],
+  "add_dir": [
+    "."
+  ],
+  "max_budget_usd": 2.5,
+  "max_turns": 40,
+  "turn_budget_hint": 30,
+  "output_artifact": ".evolve/runs/cycle-{cycle}/audit-report.md",
+  "challenge_token_required": true,
+  "settings_scope": "project",
+  "extra_flags_by_cli": {
+    "claude-tmux": [
+      "--strict-mcp-config",
+      "--exclude-dynamic-system-prompt-sections",
+      "--disable-slash-commands",
+      "--plugin-dir",
+      ".evolve/plugin"
+    ],
+    "codex-tmux": []
+  },
+  "sandbox": {
+    "enabled": true,
+    "write_subpaths": [
+      ".evolve/runs/cycle-*"
+    ],
+    "read_only_repo": true,
+    "deny_read_subpaths": [
+      "docs/private"
+    ],
+    "deny_subpaths": [
+      ".git",
+      "scripts",
+      "skills",
+      "agents",
+      ".claude-plugin",
+      ".evolve/state.json",
+      ".evolve/ledger.jsonl",
+      ".evolve/profiles",
+      ".evolve/evals",
+      "docs/private"
+    ],
+    "allow_network": true
+  },
+  "consensus": {
+    "enabled": false,
+    "_doc": "v8.54.0+: cross-CLI consensus auditing. When enabled (via EVOLVE_CONSENSUS_AUDIT=1 or --consensus-audit flag on dispatcher), the audit phase fans out across cli_voters[] and aggregates via aggregator.sh's cross-cli-vote merge mode (MAJORITY-PASS with FAIL-VETO). Defeats same-vendor sycophancy at the cost of N x audit budget. See docs/architecture/multi-llm-review.md for protocol details.",
+    "cli_voters": [
+      "claude",
+      "codex"
+    ],
+    "quorum": 2,
+    "require_min_tier": "hybrid"
+  },
+  "parallel_eligible": true,
+  "context_anchors": [
+    "scout-report.md:proposed_tasks",
+    "scout-report.md:acceptance_criteria",
+    "build-report.md:diff_summary",
+    "build-report.md:test_results",
+    "build-report.md:explanation_documentation"
+  ],
+  "context_clear_trigger_tokens": 20000,
+  "output_contract": {
+    "schema": "schemas/handoff/audit-report.schema.json",
+    "expected_artifacts": [
+      "audit-report.md",
+      ".evolve/runs/cycle-N/handoff-auditor.json"
+    ]
+  },
+  "model_tier_envelope": {
+    "min": "deep",
+    "default": "deep",
+    "max": "deep"
+  },
+  "cross_family_with": "builder",
+  "allowed_clis": [
+    "claude"
+  ],
+  "_note": "Cross-family with builder (builder=codex/OpenAI, auditor=claude/Anthropic -> different families, adversarial-audit invariant satisfied). NO cli_fallback by design: the only non-claude option was codex, which would collide with the codex builder and breach the builder!=auditor floor; agy is banned from all fallback chains (operator 2026-06-07). allowed_clis=all. codex-tmux remains reachable only via consensus mode (consensus.cli_voters); there the claude-only raw flags (--plugin-dir, --strict-mcp-config, ...) do NOT apply — codex realizes only -m <model> and runs the verification scripts via its own shell; extra_flags_by_cli.codex-tmux is intentionally empty. The claude-tmux flag set is active now that the auditor runs on claude.",
+  "research_quota": {
+    "web_search": 3,
+    "web_fetch": 5,
+    "kb_search": 20
+  },
+  "stream_output": true,
+  "generated_from": "hand-authored"
+}

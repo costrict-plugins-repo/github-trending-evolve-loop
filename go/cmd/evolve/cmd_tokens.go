@@ -1,0 +1,248 @@
+package main
+
+import (
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/cyclestate"
+	"github.com/mickeyyaya/evolve-loop/go/internal/llmcalls"
+	"github.com/mickeyyaya/evolve-loop/go/internal/paths"
+	"github.com/mickeyyaya/evolve-loop/go/internal/phasetiming"
+)
+
+type PhaseTokenTotal struct {
+	Phase      string                `json:"phase"`
+	Tokens     cyclestate.TokenUsage `json:"tokens"`
+	CycleCount int                   `json:"cycle_count"`
+}
+
+type TokensReport struct {
+	CyclesWalked   []int                 `json:"cycles_walked"`
+	Phases         []PhaseTokenTotal     `json:"phases"`
+	TotalTokens    cyclestate.TokenUsage `json:"total_tokens"`
+	WastedTokens   cyclestate.TokenUsage `json:"wasted_tokens"`
+	CacheHitRatio  float64               `json:"cache_hit_ratio"`
+	PhasesWithData int                   `json:"phases_with_data"`
+	PhasesRun      int                   `json:"phases_run"`
+	TripwireCount  int                   `json:"tripwire_count"`
+	Tripwires      []TripwireEvent       `json:"tripwires"`
+}
+
+type TripwireEvent struct {
+	Cycle      int    `json:"cycle"`
+	CLI        string `json:"cli"`
+	Agent      string `json:"agent"`
+	Phase      string `json:"phase"`
+	DurationMS int64  `json:"duration_ms"`
+	ExitCode   int    `json:"exit_code"`
+}
+
+func runTokens(args []string, _ io.Reader, stdout, stderr io.Writer) int {
+	if len(args) < 1 {
+		fmt.Fprintln(stderr, "evolve tokens: missing subcommand (try: report)")
+		return 10
+	}
+	switch args[0] {
+	case "report":
+		return runTokensReport(args[1:], stdout, stderr)
+	default:
+		fmt.Fprintf(stderr, "evolve tokens: unknown subcommand %q\n", args[0])
+		return 10
+	}
+}
+
+func runTokensReport(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("evolve tokens report", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var (
+		projectRoot string
+		evolveDir   string
+		last        int
+		jsonOut     bool
+	)
+	fs.StringVar(&projectRoot, "project-root", ".", "absolute path to the project root (default cwd)")
+	fs.StringVar(&evolveDir, "evolve-dir", "", "path to .evolve/ state directory (default <project-root>/.evolve)")
+	fs.IntVar(&last, "last", 8, "number of most-recent cycles to walk")
+	fs.BoolVar(&jsonOut, "json", false, "emit the TokensReport as JSON")
+	if err := fs.Parse(args); err != nil {
+		return 10
+	}
+	if last <= 0 {
+		fmt.Fprintf(stderr, "evolve tokens report: --last must be positive, got %d\n", last)
+		return 10
+	}
+	projectRoot = paths.AbsoluteRoot("--project-root", projectRoot, func(m string) {
+		fmt.Fprintf(stderr, "evolve tokens report: WARN: %s\n", m)
+	})
+	if evolveDir == "" {
+		evolveDir = filepath.Join(projectRoot, ".evolve")
+	}
+	runsDir := filepath.Join(evolveDir, "runs")
+
+	cycles := recentCyclesWithTiming(runsDir, last)
+	if len(cycles) == 0 {
+		fmt.Fprintf(stderr, "evolve tokens report: no cycle timing logs under %s\n", runsDir)
+		return 10
+	}
+
+	report := buildTokensReport(runsDir, cycles)
+	if jsonOut {
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(report); err != nil {
+			fmt.Fprintf(stderr, "evolve tokens report: encode: %v\n", err)
+			return 10
+		}
+		return 0
+	}
+	renderTokensReport(stdout, report)
+	return 0
+}
+
+func recentCyclesWithTiming(runsDir string, last int) []int {
+	matches, _ := filepath.Glob(filepath.Join(runsDir, "cycle-*", phasetiming.FileName))
+	seen := map[int]bool{}
+	var nums []int
+	for _, m := range matches {
+		n := cycleNumber(filepath.Base(filepath.Dir(m)))
+		if n <= 0 || seen[n] {
+			continue
+		}
+		seen[n] = true
+		nums = append(nums, n)
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(nums)))
+	if len(nums) > last {
+		nums = nums[:last]
+	}
+	sort.Ints(nums)
+	return nums
+}
+
+func buildTokensReport(runsDir string, cycles []int) TokensReport {
+	totals := map[string]cyclestate.TokenUsage{}
+	counts := map[string]int{}
+	report := TokensReport{CyclesWalked: cycles}
+	var cacheReadSum, cacheDenomSum int
+	for _, c := range cycles {
+		ws := filepath.Join(runsDir, fmt.Sprintf("cycle-%d", c))
+		tws := readCycleTripwires(runsDir, c)
+		report.Tripwires = append(report.Tripwires, tws...)
+		report.TripwireCount += len(tws)
+		entries, err := phasetiming.Read(ws)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			totals[e.Phase] = addTokenUsage(totals[e.Phase], e.Tokens)
+			counts[e.Phase]++
+			report.PhasesRun++
+			if e.Tokens != (cyclestate.TokenUsage{}) {
+				report.PhasesWithData++
+			}
+			report.TotalTokens = addTokenUsage(report.TotalTokens, e.Tokens)
+			if e.Verdict == "FAIL" {
+				report.WastedTokens = addTokenUsage(report.WastedTokens, e.Tokens)
+			}
+		}
+		s := phasetiming.Rollup(entries)
+		cacheReadSum += s.TotalTokens.CacheRead
+		cacheDenomSum += s.TotalTokens.Input + s.TotalTokens.CacheRead
+	}
+	if cacheDenomSum > 0 {
+		report.CacheHitRatio = float64(cacheReadSum) / float64(cacheDenomSum)
+	}
+	report.Phases = rankPhasesByInputTokens(totals, counts)
+	return report
+}
+
+func readCycleTripwires(runsDir string, cycle int) []TripwireEvent {
+	workspace := filepath.Join(runsDir, fmt.Sprintf("cycle-%d", cycle))
+	result, _ := llmcalls.ReadWorkspace(workspace)
+	var out []TripwireEvent
+	for _, rec := range result.Records {
+		if !rec.Tripwire {
+			continue
+		}
+		durationMS, exitCode := int64(0), 0
+		if rec.DurationMS != nil {
+			durationMS = *rec.DurationMS
+		}
+		if rec.ExitCode != nil {
+			exitCode = *rec.ExitCode
+		}
+		out = append(out, TripwireEvent{
+			Cycle: cycle, CLI: rec.CLI, Agent: rec.Agent, Phase: rec.Phase,
+			DurationMS: durationMS, ExitCode: exitCode,
+		})
+	}
+	return out
+}
+
+func stripControlBytes(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+func rankPhasesByInputTokens(totals map[string]cyclestate.TokenUsage, counts map[string]int) []PhaseTokenTotal {
+	rows := make([]PhaseTokenTotal, 0, len(totals))
+	for phase, tok := range totals {
+		rows = append(rows, PhaseTokenTotal{Phase: phase, Tokens: tok, CycleCount: counts[phase]})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Tokens.Input != rows[j].Tokens.Input {
+			return rows[i].Tokens.Input > rows[j].Tokens.Input
+		}
+		return rows[i].Phase < rows[j].Phase
+	})
+	return rows
+}
+
+func addTokenUsage(a, b cyclestate.TokenUsage) cyclestate.TokenUsage {
+	a.Input += b.Input
+	a.Output += b.Output
+	a.CacheRead += b.CacheRead
+	a.CacheWrite += b.CacheWrite
+	return a
+}
+
+func renderTokensReport(w io.Writer, r TokensReport) {
+	fmt.Fprintf(w, "Token usage report — cycles %v\n\n", r.CyclesWalked)
+	renderTripwires(w, r)
+	if len(r.Phases) == 0 {
+		fmt.Fprintln(w, "(no token usage recorded in this window)")
+		fmt.Fprintf(w, "Coverage: %d/%d phases with token data\n", r.PhasesWithData, r.PhasesRun)
+		return
+	}
+	fmt.Fprintf(w, "%-28s %10s %10s %10s %10s %6s\n", "PHASE", "INPUT", "OUTPUT", "CACHE_R", "CACHE_W", "CYCLES")
+	for _, p := range r.Phases {
+		fmt.Fprintf(w, "%-28s %10d %10d %10d %10d %6d\n",
+			truncate(p.Phase, 28), p.Tokens.Input, p.Tokens.Output, p.Tokens.CacheRead, p.Tokens.CacheWrite, p.CycleCount)
+	}
+	fmt.Fprintf(w, "\nTotal: input=%d output=%d cache_read=%d cache_write=%d\n",
+		r.TotalTokens.Input, r.TotalTokens.Output, r.TotalTokens.CacheRead, r.TotalTokens.CacheWrite)
+	fmt.Fprintf(w, "Wasted (FAIL verdicts): input=%d output=%d\n", r.WastedTokens.Input, r.WastedTokens.Output)
+	fmt.Fprintf(w, "Cache-hit ratio: %.1f%%\n", r.CacheHitRatio*100)
+	fmt.Fprintf(w, "Coverage: %d/%d phases with token data\n", r.PhasesWithData, r.PhasesRun)
+}
+
+func renderTripwires(w io.Writer, r TokensReport) {
+	if r.TripwireCount == 0 {
+		return
+	}
+	fmt.Fprintf(w, "⚠️  TRIPWIRE: %d success launch(es) of a family with its own usage collector resolved to source=none — token usage unmeasured\n", r.TripwireCount)
+	for _, t := range r.Tripwires {
+		fmt.Fprintf(w, "  TRIPWIRE cycle=%d cli=%s agent=%s phase=%s dur=%dms exit=%d\n",
+			t.Cycle, stripControlBytes(t.CLI), stripControlBytes(t.Agent), stripControlBytes(t.Phase), t.DurationMS, t.ExitCode)
+	}
+	fmt.Fprintln(w)
+}

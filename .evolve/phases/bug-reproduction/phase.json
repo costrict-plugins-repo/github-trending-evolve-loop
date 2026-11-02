@@ -1,0 +1,61 @@
+{
+  "name": "bug-reproduction",
+  "archetype": "evaluate",
+  "agent": "evolve-bug-reproduction",
+  "description": "Produce a FAIL_TO_PASS reproduction that demonstrably fails on the current tree, BEFORE any patch.",
+  "when_to_use": "bugfix cycles, after fault-localization (or triage), before tdd/build — reproduce-first anchors the fix and raises resolution rates.",
+  "categories": [
+    "bugfix"
+  ],
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/scout-report.md",
+      ".evolve/runs/cycle-{cycle}/fault-localization-report.md"
+    ],
+    "signals": []
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/bug-reproduction-report.md"
+    ],
+    "signals": [
+      "repro.failing",
+      "repro.test_path"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Reproduction",
+      "Verification"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "bugfix"
+      },
+      {
+        "field": "audit.failure_class",
+        "op": "eq",
+        "value": "code-audit-fail"
+      }
+    ],
+    "skip_when": [
+      {
+        "field": "cycle_size",
+        "op": "eq",
+        "value": "trivial"
+      },
+      {
+        "field": "deliverable_kind",
+        "op": "eq",
+        "value": "document"
+      }
+    ]
+  },
+  "stage": "pre-build",
+  "after": "fault-localization",
+  "writes_source": true
+}

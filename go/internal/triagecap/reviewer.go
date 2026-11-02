@@ -1,0 +1,119 @@
+package triagecap
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/adapters/storage"
+	"github.com/mickeyyaya/evolve-loop/go/internal/config"
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+	"github.com/mickeyyaya/evolve-loop/go/internal/phasecontract"
+)
+
+type CapReviewer struct {
+	stage    config.Stage
+	logf     func(format string, args ...any)
+	pkgsFn   func(projectRoot string) []string
+	windowFn func(ctx context.Context, projectRoot string) []core.TriageThroughputEntry
+	failsFn  func(projectRoot string) []FailEntry
+}
+
+func NewReviewer(stage config.Stage) core.DeliverableReviewer {
+	return newCapReviewer(stage)
+}
+
+func newCapReviewer(stage config.Stage) *CapReviewer {
+	return &CapReviewer{
+		stage:    stage,
+		logf:     func(f string, a ...any) { fmt.Fprintf(os.Stderr, f+"\n", a...) },
+		pkgsFn:   KnownPackages,
+		windowFn: readWindow,
+		failsFn:  readFailedApproaches,
+	}
+}
+
+func readWindow(ctx context.Context, projectRoot string) []core.TriageThroughputEntry {
+	if ctx.Err() != nil {
+		return nil
+	}
+	st, err := storage.New(filepath.Join(projectRoot, ".evolve")).ReadState(ctx)
+	if err != nil {
+		return nil
+	}
+	return st.TriageThroughput
+}
+
+func (r *CapReviewer) warnProseFloors(in core.ReviewInput, companionPath string, floors int, stage phasecontract.FlowStage) {
+	_, declared, err := ReadDeclaredFloors(companionPath)
+	if floors == 0 || (err == nil && declared) {
+		return
+	}
+	if err == nil {
+		r.logf("[triage-cap] WARN: floor-bearing triage report has no %s companion declaring committed_floors — prose counting is the fallback; declare {\"committed_floors\":[...]} to make the commitment authoritative", TriageDecisionName())
+	}
+	r.reportProseFloors(in, companionPath, stage)
+}
+
+func (r *CapReviewer) Review(ctx context.Context, in core.ReviewInput) core.ReviewResult {
+	if r.stage == config.StageOff || in.Phase != string(core.PhaseTriage) {
+		return core.ReviewResult{Approve: true}
+	}
+	data, err := os.ReadFile(filepath.Join(in.Workspace, TriageArtifactName()))
+	if err != nil {
+		r.logf("[triage-cap] ambiguity, failing open: %v", err)
+		return core.ReviewResult{Approve: true}
+	}
+	pkgs := r.pkgsFn(in.ProjectRoot)
+	companionPath := filepath.Join(in.Workspace, TriageDecisionName())
+	if msg := MissingCardFilesWarning(string(data), companionPath); msg != "" {
+		r.logf("[triage-cap] WARN: %s", msg)
+	}
+	r.warnMalformedCompanion(in, companionPath)
+	stage := phasecontract.FlowStageAt(in.ProjectRoot, os.Stderr)
+	if refused, ok := r.refuseProseFloors(in, companionPath, stage); ok {
+		return refused
+	}
+	floors := CommittedFloorCount(string(data), companionPath, pkgs)
+	r.warnProseFloors(in, companionPath, floors, stage)
+	window := r.windowFn(ctx, in.ProjectRoot)
+	k := K(window)
+	capacity := Cap(k)
+	if floors <= capacity {
+		return core.ReviewResult{Approve: true}
+	}
+
+	corrective := FloorDivergenceCorrective(string(data), companionPath, pkgs)
+	counted := CommittedFloorPackages(string(data), companionPath, pkgs)
+	countedList := "none package-resolved (aggregate items count 1 each)"
+	if len(counted) > 0 {
+		countedList = strings.Join(counted, ", ")
+	}
+	reason := fmt.Sprintf(
+		"triage overpacked: %d committed coverage floors exceed the capacity cap %d (= ceil(1.25×K), K=%d observed floors/turn over %d shipped cycles). Counting rule: each floor-bearing ## top_n item counts one floor per distinct package in floor-TARGET position (named before its ≥N%% target), minimum one; packages counted: %s. Preferred fix: declare the true commitment by writing %s with {\"committed_floors\":[...]} beside the report — the declaration overrides prose counting. Otherwise re-emit the triage report keeping at most %d coverage floors in ## top_n and move the remaining floor work to ## deferred — deferred items carry over to the next cycle automatically.",
+		floors, capacity, k, len(window), countedList, TriageDecisionName(), capacity)
+	if corrective != "" {
+		reason += " " + corrective
+	}
+	if r.stage != config.StageEnforce {
+		r.logf("[triage-cap] %s (stage=%s, would-block)", reason, r.stage)
+		return core.ReviewResult{Approve: true}
+	}
+	if cycle, ok := workspaceCycleID(in.Workspace); ok {
+		if older, newer, why, demote := demotionDecision(r.failsFn(in.ProjectRoot), cycle); demote {
+			if by, consumed := reliefConsumedBy(in.ProjectRoot, older, newer); consumed && by != cycle {
+				r.logf("[triage-cap] demotion relief for the c%d/c%d pair already consumed by cycle %d — enforcing (one-cycle relief)", older, newer, by)
+			} else {
+				r.logf("[triage-cap] DEMOTED to shadow for cycle %d — %s; gate defect suspected (ADR-0046 L2). Would-block: %s", cycle, why, reason)
+				if err := autoFileDemotionDefect(in.ProjectRoot, cycle, older, newer, why, RemedyPending); err != nil {
+					r.warn(in, CodeDemotionDefectUnwritten, err.Error())
+				}
+				return core.ReviewResult{Approve: true}
+			}
+		}
+	}
+	r.logf("[triage-cap] %s (stage=enforce, BLOCK)", reason)
+	return core.ReviewResult{Approve: false, Reason: reason}
+}

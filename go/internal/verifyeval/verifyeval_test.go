@@ -1,0 +1,386 @@
+package verifyeval
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func writeEval(t *testing.T, body string) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "eval.md")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+type fakeRunner struct {
+	scripts map[string]struct {
+		stdout, stderr string
+		exit           int
+		err            error
+	}
+	calls []string
+}
+
+func (f *fakeRunner) run() CmdRunner {
+	return func(_ context.Context, _, cmd string) (string, string, int, error) {
+		f.calls = append(f.calls, cmd)
+		s, ok := f.scripts[cmd]
+		if !ok {
+			return "", "", 0, nil
+		}
+		return s.stdout, s.stderr, s.exit, s.err
+	}
+}
+
+func TestVerify_HappyPath_PASS(t *testing.T) {
+	path := writeEval(t, "```bash\ngo test ./...\n```\n\n## Expected\n\nexit_code: 0\nstdout_contains: ok\n")
+	fr := &fakeRunner{scripts: map[string]struct {
+		stdout, stderr string
+		exit           int
+		err            error
+	}{
+		"go test ./...": {stdout: "ok  example.com/pkg 0.5s\n", exit: 0},
+	}}
+	res, err := Verify(Options{Path: path, Workspace: "/tmp", Runner: fr.run()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Verdict != "PASS" {
+		t.Errorf("Verdict=%q, want PASS; commands=%+v", res.Verdict, res.Commands)
+	}
+}
+
+func TestVerify_NarrowedGoTestWithNoMatches_FAIL(t *testing.T) {
+	const command = "go test -count=1 -run '^TestMissing$' ./internal/core"
+	path := writeEval(t, "```bash\n"+command+"\n```\n\n## Expected\n\nexit_code: 0\n")
+	runner := func(context.Context, string, string) (string, string, int, error) {
+		return "ok  example.com/project/internal/core  0.4s [no tests to run]\n", "", 0, nil
+	}
+
+	res, err := Verify(Options{Path: path, Workspace: "/tmp", Runner: runner})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Verdict != "FAIL" {
+		t.Fatalf("Verdict = %q, want FAIL; commands=%+v", res.Verdict, res.Commands)
+	}
+	if reason := res.Commands[0].Reason; !strings.Contains(reason, "matched no tests") {
+		t.Errorf("Reason = %q, want missing-test context", reason)
+	}
+}
+
+func TestVerify_NoExpectedSectionNonzeroExit_FAIL(t *testing.T) {
+	path := writeEval(t, "```bash\ngo test ./internal/core\n```\n")
+	runner := func(context.Context, string, string) (string, string, int, error) {
+		return "", "tests failed", 1, nil
+	}
+
+	res, err := Verify(Options{Path: path, Workspace: "/tmp", Runner: runner})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Verdict != "FAIL" {
+		t.Fatalf("Verdict = %q, want FAIL; commands=%+v", res.Verdict, res.Commands)
+	}
+	if reason := res.Commands[0].Reason; !strings.Contains(reason, "expected 0") {
+		t.Errorf("Reason = %q, want default exit-code context", reason)
+	}
+}
+
+func TestVerify_ExplicitNonzeroExit_PASS(t *testing.T) {
+	path := writeEval(t, "```bash\nprobe\n```\n\n## Expected\n\nexit_code: 3\n")
+	runner := func(context.Context, string, string) (string, string, int, error) {
+		return "", "expected rejection", 3, nil
+	}
+
+	res, err := Verify(Options{Path: path, Workspace: "/tmp", Runner: runner})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Verdict != "PASS" {
+		t.Fatalf("Verdict = %q, want PASS; commands=%+v", res.Verdict, res.Commands)
+	}
+}
+
+func TestVerify_ExitCodeMismatch_FAIL(t *testing.T) {
+	path := writeEval(t, "```bash\nrun\n```\n\n## Expected\n\nexit_code: 0\n")
+	fr := &fakeRunner{scripts: map[string]struct {
+		stdout, stderr string
+		exit           int
+		err            error
+	}{
+		"run": {exit: 1},
+	}}
+	res, _ := Verify(Options{Path: path, Workspace: "/tmp", Runner: fr.run()})
+	if res.Verdict != "FAIL" {
+		t.Errorf("Verdict=%q, want FAIL", res.Verdict)
+	}
+	if !strings.Contains(res.Commands[0].Reason, "exit_code=1") {
+		t.Errorf("Reason missing exit_code detail: %q", res.Commands[0].Reason)
+	}
+}
+
+func TestVerify_StdoutContainsMismatch_FAIL(t *testing.T) {
+	path := writeEval(t, "```bash\nrun\n```\n\n## Expected\n\nstdout_contains: hello\n")
+	fr := &fakeRunner{scripts: map[string]struct {
+		stdout, stderr string
+		exit           int
+		err            error
+	}{
+		"run": {stdout: "world"},
+	}}
+	res, _ := Verify(Options{Path: path, Workspace: "/tmp", Runner: fr.run()})
+	if res.Verdict != "FAIL" {
+		t.Errorf("Verdict=%q, want FAIL", res.Verdict)
+	}
+}
+
+func TestVerify_StdoutAbsent_Mismatch(t *testing.T) {
+	path := writeEval(t, "```bash\nrun\n```\n\n## Expected\n\nstdout_absent: FAIL\n")
+	fr := &fakeRunner{scripts: map[string]struct {
+		stdout, stderr string
+		exit           int
+		err            error
+	}{
+		"run": {stdout: "tests FAILed"},
+	}}
+	res, _ := Verify(Options{Path: path, Workspace: "/tmp", Runner: fr.run()})
+	if res.Verdict != "FAIL" {
+		t.Errorf("Verdict=%q, want FAIL", res.Verdict)
+	}
+}
+
+func TestVerify_StderrContains(t *testing.T) {
+	path := writeEval(t, "```bash\nrun\n```\n\n## Expected\n\nstderr_contains: panic\n")
+	fr := &fakeRunner{scripts: map[string]struct {
+		stdout, stderr string
+		exit           int
+		err            error
+	}{
+		"run": {stderr: "got a panic in goroutine 1"},
+	}}
+	res, _ := Verify(Options{Path: path, Workspace: "/tmp", Runner: fr.run()})
+	if res.Verdict != "PASS" {
+		t.Errorf("Verdict=%q, want PASS (stderr contained panic)", res.Verdict)
+	}
+}
+
+func TestVerify_RunnerError_FAIL(t *testing.T) {
+	path := writeEval(t, "```bash\nbad\n```\n```bash\ngood\n```\n\n## Expected\n\nexit_code: 0\n")
+	fr := &fakeRunner{scripts: map[string]struct {
+		stdout, stderr string
+		exit           int
+		err            error
+	}{
+		"bad":  {err: errors.New("spawn failed")},
+		"good": {exit: 0},
+	}}
+	res, _ := Verify(Options{Path: path, Workspace: "/tmp", Runner: fr.run()})
+	if res.Verdict != "FAIL" {
+		t.Errorf("Verdict=%q, want FAIL", res.Verdict)
+	}
+	if len(res.Commands) != 2 {
+		t.Errorf("expected 2 command results (continued past failure); got %d", len(res.Commands))
+	}
+}
+
+func TestVerify_MissingPath_Error(t *testing.T) {
+	if _, err := Verify(Options{Workspace: "/tmp"}); err == nil {
+		t.Error("Verify with empty Path: want error")
+	}
+}
+
+func TestVerify_MissingWorkspace_Error(t *testing.T) {
+	if _, err := Verify(Options{Path: "/tmp/x"}); err == nil {
+		t.Error("Verify with empty Workspace: want error")
+	}
+}
+
+func TestVerify_FileNotFound_Error(t *testing.T) {
+	if _, err := Verify(Options{Path: "/no/such/file.md", Workspace: "/tmp"}); err == nil {
+		t.Error("Verify on missing file: want error")
+	}
+}
+
+func TestVerify_NoScripts_Error(t *testing.T) {
+	path := writeEval(t, "## Expected\n\nexit_code: 0\n")
+	_, err := Verify(Options{Path: path, Workspace: "/tmp", Runner: (&fakeRunner{}).run()})
+	if err == nil || !strings.Contains(err.Error(), "no bash scripts") {
+		t.Fatalf("Verify() error = %v, want no-bash-scripts error", err)
+	}
+}
+
+func TestParseExpectedLine_AllKeys(t *testing.T) {
+	var e Expectations
+	parseExpectedLine("exit_code: 42", &e)
+	parseExpectedLine(`stdout_contains: "needle"`, &e)
+	parseExpectedLine("stdout_absent: 'noise'", &e)
+	parseExpectedLine("stderr_contains: err", &e)
+	parseExpectedLine("unknown_key: ignored", &e)
+	parseExpectedLine("no_colon_line", &e)
+
+	if e.ExitCode == nil || *e.ExitCode != 42 {
+		t.Errorf("ExitCode = %v, want 42", e.ExitCode)
+	}
+	if e.StdoutContains != "needle" {
+		t.Errorf("StdoutContains=%q, want needle", e.StdoutContains)
+	}
+	if e.StdoutAbsent != "noise" {
+		t.Errorf("StdoutAbsent=%q, want noise", e.StdoutAbsent)
+	}
+	if e.StderrContains != "err" {
+		t.Errorf("StderrContains=%q, want err", e.StderrContains)
+	}
+}
+
+func TestParseExpectedLine_MalformedExitCode(t *testing.T) {
+	var e Expectations
+	parseExpectedLine("exit_code: not-a-number", &e)
+	if e.ExitCode != nil {
+		t.Errorf("ExitCode = %v, want nil (malformed)", e.ExitCode)
+	}
+}
+
+func TestMatchExpectations_AllPathsDirect(t *testing.T) {
+	mkInt := func(n int) *int { return &n }
+	cases := []struct {
+		name      string
+		cr        CommandResult
+		e         Expectations
+		wantEmpty bool
+	}{
+		{"exit-pass", CommandResult{ExitCode: 0}, Expectations{ExitCode: mkInt(0)}, true},
+		{"exit-fail", CommandResult{ExitCode: 1}, Expectations{ExitCode: mkInt(0)}, false},
+		{"stdout-contains-pass", CommandResult{Stdout: "hello"}, Expectations{StdoutContains: "ell"}, true},
+		{"stdout-contains-fail", CommandResult{Stdout: "hi"}, Expectations{StdoutContains: "ell"}, false},
+		{"stdout-absent-pass", CommandResult{Stdout: "ok"}, Expectations{StdoutAbsent: "FAIL"}, true},
+		{"stdout-absent-fail", CommandResult{Stdout: "FAIL!"}, Expectations{StdoutAbsent: "FAIL"}, false},
+		{"stderr-contains-pass", CommandResult{Stderr: "warn"}, Expectations{StderrContains: "warn"}, true},
+		{"stderr-contains-fail", CommandResult{Stderr: "ok"}, Expectations{StderrContains: "warn"}, false},
+		{"all-empty-empty", CommandResult{}, Expectations{}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := matchExpectations(c.cr, c.e)
+			if c.wantEmpty && got != "" {
+				t.Errorf("want empty reason; got %q", got)
+			}
+			if !c.wantEmpty && got == "" {
+				t.Errorf("want non-empty reason; got empty")
+			}
+		})
+	}
+}
+
+func TestParseEval_BashBlockAfterExpected(t *testing.T) {
+	path := writeEval(t, "## Expected\nexit_code: 0\n\n## Setup\n```bash\nrun\n```\n")
+	cmds, _, err := parseEval(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, c := range cmds {
+		if c == "run" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("commands missing 'run'; got %v", cmds)
+	}
+}
+
+func TestParseEval_ScannerError(t *testing.T) {
+	huge := strings.Repeat("x", bufio.MaxScanTokenSize+1)
+	path := writeEval(t, "```bash\n"+huge+"\n```\n")
+	_, _, err := parseEval(path)
+	if err == nil {
+		t.Fatal("over-long line should surface a scanner error")
+	}
+	if !strings.Contains(err.Error(), "read") {
+		t.Errorf("error should name the read step, got %v", err)
+	}
+}
+
+func TestDefaultRunner_DefaultBuild(t *testing.T) {
+	if _, err := os.Stat("/bin/bash"); err != nil {
+		t.Skip("/bin/bash not present")
+	}
+	ctx := context.Background()
+
+	t.Run("zero exit + stdout captured", func(t *testing.T) {
+		stdout, stderr, exit, err := DefaultRunner(ctx, "", "echo marker-out")
+		if err != nil {
+			t.Fatalf("err=%v, want nil", err)
+		}
+		if exit != 0 {
+			t.Errorf("exit=%d, want 0", exit)
+		}
+		if !strings.Contains(stdout, "marker-out") {
+			t.Errorf("stdout=%q, want it to contain marker-out", stdout)
+		}
+		if stderr != "" {
+			t.Errorf("stderr=%q, want empty", stderr)
+		}
+	})
+
+	t.Run("non-zero exit maps to exitCode with nil err", func(t *testing.T) {
+		_, _, exit, err := DefaultRunner(ctx, "", "exit 7")
+		if err != nil {
+			t.Errorf("err=%v, want nil (exit-error mapped to exitCode)", err)
+		}
+		if exit != 7 {
+			t.Errorf("exit=%d, want 7", exit)
+		}
+	})
+
+	t.Run("stderr captured separately", func(t *testing.T) {
+		_, stderr, _, err := DefaultRunner(ctx, "", "echo oops 1>&2")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(stderr, "oops") {
+			t.Errorf("stderr=%q, want it to contain oops", stderr)
+		}
+	})
+
+	t.Run("workdir honored", func(t *testing.T) {
+		dir := t.TempDir()
+		stdout, _, exit, err := DefaultRunner(ctx, dir, "pwd")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if exit != 0 {
+			t.Errorf("exit=%d, want 0", exit)
+		}
+		if !strings.Contains(stdout, filepath.Base(dir)) {
+			t.Errorf("pwd=%q, want it to reflect workdir %q", strings.TrimSpace(stdout), dir)
+		}
+	})
+}
+
+func TestVerify_MultipleBashBlocks_AllRun(t *testing.T) {
+	path := writeEval(t, "```bash\nfirst\n```\n## Section\n```bash\nsecond\n```\n\n## Expected\n\nexit_code: 0\n")
+	fr := &fakeRunner{scripts: map[string]struct {
+		stdout, stderr string
+		exit           int
+		err            error
+	}{
+		"first":  {exit: 0},
+		"second": {exit: 0},
+	}}
+	res, _ := Verify(Options{Path: path, Workspace: "/tmp", Runner: fr.run()})
+	if len(res.Commands) != 2 {
+		t.Errorf("len=%d, want 2", len(res.Commands))
+	}
+	if res.Verdict != "PASS" {
+		t.Errorf("Verdict=%q, want PASS", res.Verdict)
+	}
+}

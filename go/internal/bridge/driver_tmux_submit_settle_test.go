@@ -1,0 +1,263 @@
+package bridge
+
+import (
+	"bytes"
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/interaction"
+)
+
+func recordingSleepDeps(tm TmuxController, stderr *bytes.Buffer, sleeps *[]time.Duration) Deps {
+	d := submitVerifyDeps(tm, stderr)
+	d.Sleep = func(dur time.Duration) { *sleeps = append(*sleeps, dur) }
+	return d
+}
+
+func writePrompt(t *testing.T, size int) string {
+	t.Helper()
+	pf := filepath.Join(t.TempDir(), "prompt.txt")
+	if err := os.WriteFile(pf, bytes.Repeat([]byte("line of prompt text\n"), size/20+1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return pf
+}
+
+func enterCount(seq []string) int {
+	n := 0
+	for _, s := range seq {
+		if s == "|true" {
+			n++
+		}
+	}
+	return n
+}
+
+func TestPastePrompt_WaitsForTheStablePaneBeforeEnter(t *testing.T) {
+	t.Parallel()
+	tm := &fakeTmux{paneSeq: []string{
+		"› [Pasted Content 1 +40 lines]",
+		"› [Pasted Content 1 +900 lines]",
+		"› [Pasted Content 1 +1750 lines]",
+		"› [Pasted Content 1 +1750 lines]",
+	}}
+	var stderr bytes.Buffer
+	var sleeps []time.Duration
+	deps := recordingSleepDeps(tm, &stderr, &sleeps)
+	pf := writePrompt(t, 35_000)
+	if _, err := pastePrompt(context.Background(), deps, "[t]", "s", pf, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := enterCount(tm.sentSeq); got != 1 {
+		t.Errorf("exactly one Enter after the paste settled, got %d: %v", got, tm.sentSeq)
+	}
+	if tm.paneIdx < 4 {
+		t.Errorf("Enter must wait for two agreeing captures; captures taken = %d", tm.paneIdx)
+	}
+	small := pasteSettleFor(2_000)
+	large := pasteSettleFor(35_000)
+	if !(large > small) || small < time.Second {
+		t.Errorf("the settle scales with size and never drops below the old 1 s: small=%v large=%v", small, large)
+	}
+	if len(sleeps) == 0 || sleeps[0] != large {
+		t.Errorf("the first sleep is the size-scaled settle %v: %v", large, sleeps)
+	}
+}
+
+func TestPastePrompt_StabilityWaitIsBounded(t *testing.T) {
+	t.Parallel()
+	tm := &countingTmux{}
+	var stderr bytes.Buffer
+	var sleeps []time.Duration
+	deps := recordingSleepDeps(tm, &stderr, &sleeps)
+	if _, err := pastePrompt(context.Background(), deps, "[t]", "s", writePrompt(t, 4_000), false); err != nil {
+		t.Fatal(err)
+	}
+	if got := enterCount(tm.sentSeq); got != 1 {
+		t.Errorf("Enter still pressed once at the cap, got %d", got)
+	}
+	if tm.captures > pasteStabilityMaxPolls+1 {
+		t.Errorf("the stability wait is bounded to %d polls, took %d captures", pasteStabilityMaxPolls, tm.captures)
+	}
+	if !strings.Contains(stderr.String(), "pane still changing") {
+		t.Errorf("giving up on stability is said out loud: %q", stderr.String())
+	}
+}
+
+func TestVerifySubmitted_BacksOffBetweenResends(t *testing.T) {
+	t.Parallel()
+	prompt := guardNudge
+	parked := parkedPane(prompt)
+	tm := &fakeTmux{paneSeq: []string{parked, parked, "● done\n\n" + tmuxPromptMarkerDefault + " "}}
+	var stderr bytes.Buffer
+	var sleeps []time.Duration
+	deps := recordingSleepDeps(tm, &stderr, &sleeps)
+	lp := tmuxLaunch{session: "s", name: "claude-tmux", inputLineMarker: tmuxPromptMarkerDefault}
+	out := verifySubmitted(context.Background(), deps, lp, "[t]", "prompt", parked, promptSubmitEcho(prompt))
+	if out.Result != "submitted_after_resend" || out.Resends != 3 {
+		t.Fatalf("outcome = %+v", out)
+	}
+	if len(sleeps) != 3 {
+		t.Fatalf("one settle per re-send: %v", sleeps)
+	}
+	if sleeps[0] < submitVerifySettle || sleeps[1] <= sleeps[0] || sleeps[2] <= sleeps[1] || sleeps[0]+sleeps[1]+sleeps[2] < 4*time.Second {
+		t.Errorf("the settles back off (strictly increasing, ≥ 4 s in total): %v", sleeps)
+	}
+}
+
+type countingTmux struct {
+	fakeTmux
+	captures int
+}
+
+func (c *countingTmux) CapturePane(_ context.Context, _ string, _ int) (string, error) {
+	c.captures++
+	return "› [Pasted Content 1 +" + strings.Repeat("x", c.captures) + "]", nil
+}
+
+func TestPastePrompt_UnreadablePromptAssumesALargePaste(t *testing.T) {
+	t.Parallel()
+	tm := &fakeTmux{paneSeq: []string{"› [Pasted Content 1 +40 lines]", "› [Pasted Content 1 +40 lines]"}}
+	var stderr bytes.Buffer
+	var sleeps []time.Duration
+	deps := recordingSleepDeps(tm, &stderr, &sleeps)
+	if _, err := pastePrompt(context.Background(), deps, "[t]", "s", filepath.Join(t.TempDir(), "gone.txt"), false); err != nil {
+		t.Fatalf("the fake load-buffer succeeded; the paste proceeds: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "prompt file unreadable") {
+		t.Errorf("the fault is said out loud: %q", stderr.String())
+	}
+	if len(sleeps) == 0 || sleeps[0] != pasteSettleMax {
+		t.Errorf("an unknown size settles as a large paste (%v): %v", pasteSettleMax, sleeps)
+	}
+	if tm.paneIdx < 2 {
+		t.Errorf("the stability wait runs for an unknown size; captures = %d", tm.paneIdx)
+	}
+	if got := enterCount(tm.sentSeq); got != 1 {
+		t.Errorf("Enter once, got %d", got)
+	}
+}
+
+func TestPasteTiming_NeverEqualsTheArtifactWaitInterval(t *testing.T) {
+	t.Parallel()
+	for size := 0; size <= 120_000; size += 100 {
+		if d := pasteSettleFor(size); d == artifactWaitInterval {
+			t.Fatalf("pasteSettleFor(%d) = %v == artifactWaitInterval", size, d)
+		}
+	}
+	for i, d := range submitVerifyBackoff {
+		if d == artifactWaitInterval {
+			t.Errorf("submitVerifyBackoff[%d] = %v == artifactWaitInterval", i, d)
+		}
+	}
+	if pasteStabilityPoll == artifactWaitInterval || pasteSettleMax == artifactWaitInterval {
+		t.Error("the stability poll and the settle cap must not equal the artifact-wait interval either")
+	}
+}
+
+func TestPastePrompt_SmallPromptTakesTheCaptureFreePath(t *testing.T) {
+	t.Parallel()
+	tm := &fakeTmux{paneSeq: []string{"› [Pasted Content 1 +2 lines]"}}
+	var stderr bytes.Buffer
+	var sleeps []time.Duration
+	deps := recordingSleepDeps(tm, &stderr, &sleeps)
+	pf, _ := writePromptSized(t, 500)
+	out, err := pastePrompt(context.Background(), deps, "[t]", "s", pf, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tm.paneIdx != 0 || len(sleeps) != 1 || sleeps[0] != time.Second || enterCount(tm.sentSeq) != 1 {
+		t.Errorf("captures=%d sleeps=%v enters=%d", tm.paneIdx, sleeps, enterCount(tm.sentSeq))
+	}
+	if out.Stability != pasteSkipped || out.Settle != time.Second {
+		t.Errorf("outcome = %+v", out)
+	}
+}
+
+func TestPastePrompt_CaptureFaultFailsOpen(t *testing.T) {
+	t.Parallel()
+	tm := &captureErrTmux{fakeTmux: &fakeTmux{paneSeq: []string{"› x"}}, errAfter: 1}
+	var stderr bytes.Buffer
+	var sleeps []time.Duration
+	deps := recordingSleepDeps(tm, &stderr, &sleeps)
+	pf, _ := writePromptSized(t, 20_000)
+	out, err := pastePrompt(context.Background(), deps, "[codex-tmux]", "s", pf, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Stability != pasteCaptureFault || enterCount(tm.fakeTmux.sentSeq) != 1 {
+		t.Errorf("outcome = %+v enters=%d", out, enterCount(tm.fakeTmux.sentSeq))
+	}
+	if !strings.Contains(stderr.String(), "[codex-tmux] paste settle: capture failed") {
+		t.Errorf("the fault carries the driver prefix: %q", stderr.String())
+	}
+}
+
+func TestPastePrompt_EnterFollowsTwoAgreeingCaptures(t *testing.T) {
+	t.Parallel()
+	tm := &fakeTmux{paneSeq: []string{"› [Pasted Content 1 +40 lines]", "› [Pasted Content 1 +900 lines]", "› [Pasted Content 1 +900 lines]"}}
+	var stderr bytes.Buffer
+	var sleeps []time.Duration
+	deps := recordingSleepDeps(tm, &stderr, &sleeps)
+	pf, size := writePromptSized(t, 17_700)
+	out, err := pastePrompt(context.Background(), deps, "[t]", "s", pf, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tm.paneIdx < 2 || tm.paneSeq[tm.paneIdx-1] != tm.paneSeq[tm.paneIdx-2] {
+		t.Errorf("Enter only after two agreeing captures; consumed %d, last two %q / %q", tm.paneIdx, tm.paneSeq[tm.paneIdx-1], tm.paneSeq[tm.paneIdx-2])
+	}
+	if out.Stability != pasteStable || out.Settle != pasteSettleFor(size) || sleeps[0] != pasteSettleFor(size) {
+		t.Errorf("outcome = %+v (size %d) sleeps=%v", out, size, sleeps)
+	}
+}
+
+func TestInjectText_SharesTheDeliveryTail(t *testing.T) {
+	t.Parallel()
+	cfg := fixtureConfig(t)
+	tm := &fakeTmux{paneSeq: []string{"› a", "› a"}}
+	var stderr bytes.Buffer
+	var sleeps []time.Duration
+	deps := recordingSleepDeps(tm, &stderr, &sleeps)
+	big := strings.Repeat("inject body line\n", 400)
+	if err := injectText(context.Background(), cfg, deps, "s", big); err != nil {
+		t.Fatal(err)
+	}
+	if tm.paneIdx < 2 || sleeps[0] != pasteSettleFor(len(big)) || enterCount(tm.sentSeq) != 1 {
+		t.Errorf("big inject: captures=%d sleeps=%v enters=%d", tm.paneIdx, sleeps, enterCount(tm.sentSeq))
+	}
+	tm2 := &fakeTmux{paneSeq: []string{"› a"}}
+	var sleeps2 []time.Duration
+	deps2 := recordingSleepDeps(tm2, &stderr, &sleeps2)
+	if err := injectText(context.Background(), cfg, deps2, "s", "small"); err != nil {
+		t.Fatal(err)
+	}
+	if tm2.paneIdx != 0 || len(sleeps2) != 1 || sleeps2[0] != time.Second || enterCount(tm2.sentSeq) != 1 {
+		t.Errorf("small inject keeps the old delivery: captures=%d sleeps=%v", tm2.paneIdx, sleeps2)
+	}
+}
+
+func TestRecordSubmitVerify_CarriesThePasteEvidence(t *testing.T) {
+	t.Parallel()
+	rec := interaction.NewRecorder(t.TempDir())
+	recordSubmitVerify(rec, "build", 7, "prompt", submitVerifyOutcome{Result: interaction.ResultSubmitVerified}, pasteOutcome{Settle: 4 * time.Second, Stability: pasteStable})
+	recordSubmitVerify(rec, "build", 7, "nudge", submitVerifyOutcome{Resends: 1, Result: interaction.ResultSubmittedAfterResend}, pasteOutcome{})
+	got := rec.Outcomes()
+	if len(got) != 2 || got[0].Event.Payload != "site=prompt resends=0 paste_settle=4s stability=stable" || got[1].Event.Payload != "site=nudge resends=1" {
+		t.Errorf("payloads = %+v", got)
+	}
+}
+
+func writePromptSized(t *testing.T, size int) (string, int) {
+	t.Helper()
+	pf := writePrompt(t, size)
+	fi, err := os.Stat(pf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pf, int(fi.Size())
+}

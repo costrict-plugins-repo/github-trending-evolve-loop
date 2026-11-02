@@ -1,0 +1,78 @@
+package core
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestRunCycleFromPhase_LegacyCheckpointIsStillReviewed(t *testing.T) {
+	t.Parallel()
+
+	projectRoot := t.TempDir()
+	ws := filepath.Join(projectRoot, ".evolve", "runs", "cycle-9")
+	if err := os.MkdirAll(ws, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	st := &fakeStorage{
+		state:      State{LastCycleNumber: 9},
+		cycleState: CycleState{CycleID: 9, WorkspacePath: ws, ActiveWorktree: t.TempDir()},
+	}
+	reviews := &phaseReviewCounter{}
+	o := NewOrchestrator(st, &fakeLedger{}, buildRunners(nil),
+		WithWorktreeProvisioner(&fakeWorktree{path: st.cycleState.ActiveWorktree}),
+		WithReviewer(reviews))
+
+	if _, err := o.RunCycleFromPhase(context.Background(),
+		CycleRequest{ProjectRoot: projectRoot, GoalHash: "g"},
+		&ResumePoint{Phase: string(PhaseAudit), CycleID: 9}); err != nil {
+		t.Fatalf("RunCycleFromPhase: %v", err)
+	}
+	if got := reviews.byPhase[string(PhaseAudit)]; got != 1 {
+		t.Fatalf("a resumed legacy (version-0) cycle's audit was reviewed %d time(s), want 1 — the fresh loop reviews every non-SKIPPED deliverable regardless of the explanation contract; the resume twin must too", got)
+	}
+}
+
+type gateMarker struct{ on bool }
+
+func (g gateMarker) Review(context.Context, ReviewInput) ReviewResult {
+	return ReviewResult{Approve: true}
+}
+func (g gateMarker) VerifiesDeclaredDeliverables() bool { return g.on }
+
+func TestDeclaredDeliverablesGateWired(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		opts []Option
+		want bool
+	}{
+		{"no reviewer", nil, false},
+		{"plain reviewer without the capability", []Option{WithReviewer(&phaseReviewCounter{})}, false},
+		{"gate alone", []Option{WithReviewer(gateMarker{on: true})}, true},
+		{"gate nested in a chain", []Option{WithReviewer(ChainReviewers(&phaseReviewCounter{}, gateMarker{on: true}))}, true},
+		{"gate switched off", []Option{WithReviewer(ChainReviewers(gateMarker{on: false}))}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o := NewOrchestrator(&fakeStorage{}, &fakeLedger{}, buildRunners(nil), tc.opts...)
+			if got := o.DeclaredDeliverablesGateWired(); got != tc.want {
+				t.Fatalf("DeclaredDeliverablesGateWired() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBuildFloorReviewer_LegacyCheckpointVersionZeroIsExempt(t *testing.T) {
+	t.Parallel()
+
+	r := MandatoryBuildHandoffFloor()
+	res := r.Review(context.Background(), ReviewInput{
+		Phase: string(PhaseBuild), Cycle: 9, Workspace: t.TempDir(), Worktree: t.TempDir(), ProjectRoot: t.TempDir(),
+		ExplanationDocumentationVersion: 0,
+	})
+	if !res.Approve {
+		t.Fatalf("a version-0 checkpoint must not be rejected on the explanation contract it never had: %+v", res)
+	}
+}

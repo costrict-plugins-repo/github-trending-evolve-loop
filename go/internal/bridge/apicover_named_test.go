@@ -1,0 +1,182 @@
+package bridge
+
+import (
+	"context"
+	"path/filepath"
+	"slices"
+	"testing"
+	"time"
+)
+
+func TestFakeTmuxController_PaneCommand_ReturnsScriptedAndRecords(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := &FakeTmuxController{PaneCmd: "node"}
+
+	got, err := f.PaneCommand(ctx, "sess")
+	if err != nil {
+		t.Fatalf("PaneCommand err = %v, want nil", err)
+	}
+	if got != "node" {
+		t.Fatalf("PaneCommand = %q, want %q (the scripted PaneCmd)", got, "node")
+	}
+	if len(f.Events) != 1 || f.Events[0] != "panecmd" {
+		t.Fatalf("Events = %v, want exactly [panecmd]", f.Events)
+	}
+}
+
+func TestPaneCommander_SatisfiedAndExercised(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	var pc PaneCommander = &FakeTmuxController{PaneCmd: "zsh"}
+
+	got, err := pc.PaneCommand(ctx, "sess")
+	if err != nil {
+		t.Fatalf("PaneCommander.PaneCommand err = %v, want nil", err)
+	}
+	if got != "zsh" {
+		t.Fatalf("PaneCommander.PaneCommand = %q, want %q", got, "zsh")
+	}
+}
+
+func TestFakeTmuxController_JiggleWindow_RecordsEffect(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := &FakeTmuxController{}
+
+	if err := f.JiggleWindow(ctx, "wedged-sess"); err != nil {
+		t.Fatalf("JiggleWindow err = %v, want nil", err)
+	}
+	if len(f.Events) != 1 || f.Events[0] != "jiggle:wedged-sess" {
+		t.Fatalf("Events = %v, want exactly [jiggle:wedged-sess]", f.Events)
+	}
+}
+
+func TestReport_BoundByBuildReport(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	now := time.Date(2026, 6, 16, 12, 0, 0, 0, time.UTC)
+
+	const token = "tok-abc123"
+	mkfile(t, filepath.Join(ws, "artifact.md"), "result\nchallenge: "+token+"\n")
+	mkfile(t, filepath.Join(ws, "challenge-token.txt"), token+"\n")
+	mkfile(t, filepath.Join(ws, "stdout.log"), "hello stdout\n")
+
+	var rep Report
+	rep, err := BuildReport(ws, "artifact.md", now)
+	if err != nil {
+		t.Fatalf("BuildReport err = %v, want nil", err)
+	}
+	if rep.Verdict != "complete" {
+		t.Fatalf("Report.Verdict = %q, want %q", rep.Verdict, "complete")
+	}
+	if rep.ScannedAt != "2026-06-16T12:00:00Z" {
+		t.Fatalf("Report.ScannedAt = %q, want the injected UTC time", rep.ScannedAt)
+	}
+
+	art := rep.Artifact
+	if !art.Exists || art.SizeBytes <= 0 {
+		t.Fatalf("ArtifactRef = %+v, want Exists with positive SizeBytes", art)
+	}
+	if !art.HasChallengeToken {
+		t.Fatal("ArtifactRef.HasChallengeToken = false, want true (token is inside the artifact)")
+	}
+
+	var stdoutLog FileRef = rep.Logs.StdoutLog
+	if !stdoutLog.Exists || stdoutLog.SizeBytes <= 0 {
+		t.Fatalf("FileRef(stdout.log) = %+v, want Exists with positive SizeBytes", stdoutLog)
+	}
+	if stdoutLog.Path != filepath.Join(ws, "stdout.log") {
+		t.Fatalf("FileRef.Path = %q, want the workspace stdout.log path", stdoutLog.Path)
+	}
+}
+
+func TestReport_TokenMismatchVerdict(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	now := time.Now()
+
+	mkfile(t, filepath.Join(ws, "artifact.md"), "result without the token\n")
+	mkfile(t, filepath.Join(ws, "challenge-token.txt"), "expected-token\n")
+
+	rep, err := BuildReport(ws, "artifact.md", now)
+	if err != nil {
+		t.Fatalf("BuildReport err = %v, want nil", err)
+	}
+	if rep.Verdict != "incomplete-token-mismatch" {
+		t.Fatalf("Report.Verdict = %q, want incomplete-token-mismatch", rep.Verdict)
+	}
+	var art ArtifactRef = rep.Artifact
+	if !art.Exists || art.HasChallengeToken {
+		t.Fatalf("ArtifactRef = %+v, want Exists=true HasChallengeToken=false", art)
+	}
+}
+
+func TestDoctorReport_BoundByDoctor(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	mkfile(t, filepath.Join(home, ".claude", ".credentials.json"), "{}")
+
+	eng := doctorEngine(map[string]string{"HOME": home}, map[string]bool{"claude": true}, 0, nil)
+
+	var rep DoctorReport
+	rep, code := eng.Doctor(context.Background(), "claude-p", true)
+	if code != ExitOK {
+		t.Fatalf("Doctor exit = %d, want ExitOK (ready)", code)
+	}
+	if rep.Host == "" || rep.ScannedAt == "" || !rep.Deep {
+		t.Fatalf("DoctorReport = {Host:%q ScannedAt:%q Deep:%v}, want all populated + Deep", rep.Host, rep.ScannedAt, rep.Deep)
+	}
+	if rep.Summary.Ready != 1 {
+		t.Fatalf("DoctorReport.Summary.Ready = %d, want 1", rep.Summary.Ready)
+	}
+	if len(rep.Results) != 1 {
+		t.Fatalf("DoctorReport.Results length = %d, want 1 (filtered to claude-p)", len(rep.Results))
+	}
+
+	var res DoctorResult = rep.Results[0]
+	if res.CLI != "claude-p" || res.Verdict != "ready" {
+		t.Fatalf("DoctorResult = {CLI:%q Verdict:%q}, want claude-p/ready", res.CLI, res.Verdict)
+	}
+
+	var bin BinaryInfo = res.Binary
+	if !bin.Present || bin.Path != "/usr/bin/claude" || bin.Version != "v1.2.3" {
+		t.Fatalf("BinaryInfo = %+v, want Present /usr/bin/claude v1.2.3", bin)
+	}
+
+	auth := res.Auth
+	if !auth.Configured || auth.Source != "file:credentials.json" {
+		t.Fatalf("AuthInfo = %+v, want Configured via file:credentials.json", auth)
+	}
+
+	deep := res.DeepProbe
+	if !deep.Ran || !deep.Passed || deep.Err != "" {
+		t.Fatalf("DeepProbe = %+v, want Ran && Passed without Err", deep)
+	}
+	failingDeep := DeepProbe{Ran: true, Passed: false, Err: "err"}
+	if failingDeep.Err != "err" {
+		t.Fatalf("DeepProbe.Err = %q, want err", failingDeep.Err)
+	}
+}
+
+func TestAuthInfo_OllamaOptional(t *testing.T) {
+	t.Parallel()
+	eng := doctorEngine(map[string]string{"HOME": t.TempDir()}, nil, 0, nil)
+
+	var auth AuthInfo = eng.doctorAuth("ollama-tmux")
+	if auth.Configured {
+		t.Fatalf("AuthInfo.Configured = true, want false for local-only ollama")
+	}
+	if !auth.AuthOptional {
+		t.Fatal("AuthInfo.AuthOptional = false, want true (local ollama needs no auth)")
+	}
+}
+
+func TestDeepProber_InterfaceNamedAndExercised(t *testing.T) {
+	t.Parallel()
+	var prober DeepProber = agyDriver{}
+	args := prober.DeepProbeArgs(Manifest{ModelTierMap: map[string]string{"fast": "gemini-3.5-flash"}})
+	if len(args) == 0 || !slices.Contains(args, "gemini-3.5-flash") {
+		t.Fatalf("DeepProber.DeepProbeArgs = %v, want to contain gemini-3.5-flash", args)
+	}
+}

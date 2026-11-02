@@ -1,0 +1,287 @@
+# evolve-loop Go binary — phased rewrite per docs/architecture/portable-core.md
+#
+# Targets:
+#   make build       — race-disabled binary into ./bin/evolve
+#   make test        — go test -race -cover ./... (excludes acs/ — that's per-cycle)
+#   make cover       — emits coverage.html and prints per-package %
+#   make lint        — go vet + go fmt -d (read-only diff)
+#   make vulncheck   — govulncheck at the pinned version
+#   make tidy        — go mod tidy + go mod verify
+#   make clean       — remove ./bin and coverage outputs
+
+GO       ?= go
+GOVULNCHECK_VERSION := v1.9.0
+PKG      := ./...
+BIN_DIR  := bin
+BIN      := $(BIN_DIR)/evolve
+VERSION  ?= dev
+COMMIT   := $(shell git -C .. rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+BUILT_AT := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+
+LDFLAGS  := -X github.com/mickeyyaya/evolve-loop/go/pkg/version.version=$(VERSION) \
+            -X github.com/mickeyyaya/evolve-loop/go/pkg/version.commit=$(COMMIT) \
+            -X github.com/mickeyyaya/evolve-loop/go/pkg/version.builtAt=$(BUILT_AT)
+
+DIST_DIR := $(BIN_DIR)/dist
+DIST_TARGETS := \
+    $(DIST_DIR)/evolve-darwin-amd64 \
+    $(DIST_DIR)/evolve-darwin-arm64 \
+    $(DIST_DIR)/evolve-linux-amd64 \
+    $(DIST_DIR)/evolve-linux-arm64
+
+# One-binary S2: single macOS fingerprint (lipo'd fat binary) + a checksums
+# manifest over every dist artifact (for approval-request fingerprinting and
+# install.sh --binary verification). The universal target is macOS-only (lipo);
+# `make dist` is operator-run locally on macOS — no CI/release job invokes it
+# (goreleaser's own universal_binaries block builds the release-time universal).
+DIST_UNIVERSAL := $(DIST_DIR)/evolve-darwin-universal
+DIST_CHECKSUMS := $(DIST_DIR)/checksums.txt
+
+export GIT_CONFIG_COUNT   := 2
+export GIT_CONFIG_KEY_0   := maintenance.auto
+export GIT_CONFIG_VALUE_0 := false
+export GIT_CONFIG_KEY_1   := gc.auto
+export GIT_CONFIG_VALUE_1 := 0
+
+export GORACE := $(strip $(GORACE) atexit_sleep_ms=0)
+
+.PHONY: build test test-component test-integration test-e2e test-acs-durable test-all \
+        test-latency test-budget cover apicover lint tidy clean help dist dist-clean \
+        cover-strict cover-changed apicover-enforce apicover-check \
+        test-integration-darwin cover-changed-darwin cover-strict-darwin darwin-set \
+        dist-darwin-amd64 dist-darwin-arm64 dist-linux-amd64 dist-linux-arm64 \
+        dist-darwin-universal dist-checksums
+
+# FAST_PKGS is every non-acs package. The default (no build tags) compiles
+# only the fast cost-axis layer: tests in files tagged `//go:build integration`
+# or `//go:build e2e` are excluded, so `make test` stays sub-10s. See
+# docs/testing.md for the two-axis (cost × granularity) model.
+FAST_PKGS = $$($(GO) list ./... | grep -v '/acs/')
+
+help:
+	@awk '/^[a-zA-Z_-]+:.*?##/ {sub(/:.*##/, "\t"); print}' $(MAKEFILE_LIST)
+
+build: ## Build evolve binary into ./bin/
+	@mkdir -p $(BIN_DIR)
+	$(GO) build -ldflags='$(LDFLAGS)' -o $(BIN) ./cmd/evolve
+
+# Cross-compile pattern: GOOS / GOARCH parsed from the suffix of each
+# dist-OS-ARCH target. CGO disabled for fully static binaries —
+# evolve-loop's Go tree has no cgo dependency (verified by go.mod) and
+# disabling it removes the glibc-version surface on linux.
+dist: $(DIST_TARGETS) $(DIST_UNIVERSAL) $(DIST_CHECKSUMS) ## Cross-compile all release binaries + universal macOS binary + checksums.txt into ./bin/dist/
+
+dist-darwin-amd64: $(DIST_DIR)/evolve-darwin-amd64
+dist-darwin-arm64: $(DIST_DIR)/evolve-darwin-arm64
+dist-linux-amd64:  $(DIST_DIR)/evolve-linux-amd64
+dist-linux-arm64:  $(DIST_DIR)/evolve-linux-arm64
+dist-darwin-universal: $(DIST_UNIVERSAL)
+dist-checksums: $(DIST_CHECKSUMS)
+
+$(DIST_DIR)/evolve-%:
+	@mkdir -p $(DIST_DIR)
+	@os=$$(echo $* | cut -d- -f1); arch=$$(echo $* | cut -d- -f2); \
+	echo "==> cross-compile $$os/$$arch -> $@"; \
+	CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch \
+	  $(GO) build -trimpath -ldflags='$(LDFLAGS)' -o $@ ./cmd/evolve
+
+# lipo-merge the two darwin arch binaries into ONE fat macOS binary — a single
+# fingerprint per version. An explicit rule so it overrides the evolve-% pattern
+# above (which would otherwise try GOARCH=universal). macOS-only.
+$(DIST_UNIVERSAL): $(DIST_DIR)/evolve-darwin-amd64 $(DIST_DIR)/evolve-darwin-arm64
+	@command -v lipo >/dev/null 2>&1 || { echo "dist-darwin-universal requires lipo (macOS)"; exit 1; }
+	@echo "==> lipo darwin universal -> $@"
+	@lipo -create -output $@ $(DIST_DIR)/evolve-darwin-amd64 $(DIST_DIR)/evolve-darwin-arm64
+
+# SHA256 of every dist artifact — the fingerprint manifest for approval requests
+# and install.sh --binary checksum verification. Rebuilt whenever any binary
+# changes. $(notdir $^) is the basename list of the prerequisites above (single
+# source of truth for "what gets checksummed"); sorted for a stable manifest.
+$(DIST_CHECKSUMS): $(DIST_TARGETS) $(DIST_UNIVERSAL)
+	@echo "==> checksums -> $@"
+	@cd $(DIST_DIR) && shasum -a 256 $(notdir $^) | sort -k2 > checksums.txt
+
+dist-clean: ## Remove cross-compiled artifacts
+	rm -rf $(DIST_DIR)
+
+test: ## FAST layer: co-located unit/functional/component tests, race on (excludes acs/, integration, e2e); a treewalk guard fails the run on any file or empty directory the tests leave in go/
+	@base=$$(mktemp) || exit 1; \
+	$(GO) run ./cmd/evolve treewalk snapshot --root . --out "$$base" || exit 1; \
+	$(GO) test -race -count=1 -cover $(FAST_PKGS); status=$$?; \
+	$(GO) run ./cmd/evolve treewalk check --root . --baseline "$$base" || status=1; \
+	rm -f "$$base"; exit $$status
+
+test-component: ## Component tier: several internal packages wired against temp FS (no subprocess)
+	$(GO) test -race -count=1 ./test/component/...
+
+TEST_TIMEOUT ?= 20m
+INTEGRATION_SET ?=
+DARWIN_SET := .darwin-set
+TEST_JSON ?=
+TEST_RUSAGE ?=
+RUSAGE_EXEC = $(if $(strip $(TEST_RUSAGE)),-exec $(abspath $(BIN_DIR))/testrusage,)
+BUILD_RUSAGE = if [ -n "$(TEST_RUSAGE)" ]; then $(GO) build -o $(BIN_DIR)/testrusage ./cmd/testrusage || exit $$?; fi
+INTEGRATION_TEST = $(GO) test $(RUSAGE_EXEC) -race -count=1 -timeout $(TEST_TIMEOUT) -tags integration
+
+test-integration: ## Full non-ACS runtime suite with integration, race, and coverage (shared by CI and release); coverage.txt exists only after a green run; TEST_TIMEOUT=20m bounds each package; TEST_JSON=<file> also writes the go test -json stream while the console keeps the plain text; TEST_RUSAGE=1 runs every test binary through bin/testrusage (appends to TESTRUSAGE_OUT); a test package split from the package it tests (go/.cover-split) runs beside the main run with -coverpkg, and its profile and -json stream join the main ones
+	@rm -f coverage.txt coverage.partial.txt coverage.run.*; \
+	$(BUILD_RUSAGE); \
+	roots=./...; \
+	if [ -n "$(INTEGRATION_SET)" ]; then \
+		roots=$$(sed '/^[[:space:]]*\#/d; /^[[:space:]]*$$/d' "$(INTEGRATION_SET)") || exit $$?; \
+		[ -n "$$roots" ] || { echo "test-integration: $(INTEGRATION_SET) names no package" >&2; exit 1; }; \
+	fi; \
+	pkgs=$$($(GO) list -tags integration $$roots) || exit $$?; \
+	pkgs=$$(printf '%s\n' "$$pkgs" | grep -v '/acs/') || exit $$?; \
+	$(GO) build -o $(BIN_DIR)/coversplit ./cmd/coversplit || exit $$?; \
+	$(BIN_DIR)/coversplit $$pkgs > coverage.run.plan || { status=$$?; rm -f coverage.run.*; exit $$status; }; \
+	if [ -n "$(TEST_JSON)" ]; then \
+		$(GO) build -o $(BIN_DIR)/testlatency ./cmd/testlatency || exit $$?; \
+		: > "$(TEST_JSON)"; \
+	fi; \
+	n=0; \
+	while IFS= read -r run; do \
+		n=$$((n+1)); \
+		if [ "$$n" -eq 1 ]; then pkgs=$$run; continue; fi; \
+		{ $(INTEGRATION_TEST) -coverprofile=coverage.run.$$n.txt $(if $(TEST_JSON),-json) $$run > coverage.run.$$n.out 2> coverage.run.$$n.err; echo $$? > coverage.run.$$n.status; } & \
+	done < coverage.run.plan; \
+	if [ -n "$(TEST_JSON)" ]; then \
+		status=$$( { { $(INTEGRATION_TEST) -coverprofile=coverage.run.1.txt -json $$pkgs; echo $$? >&3; } | tee -a "$(TEST_JSON)" | $(BIN_DIR)/testlatency -render >&2; } 3>&1 ); \
+	else \
+		$(INTEGRATION_TEST) -coverprofile=coverage.run.1.txt $$pkgs; status=$$?; \
+	fi; \
+	status=$${status:-1}; \
+	wait; \
+	i=2; \
+	while [ "$$i" -le "$$n" ]; do \
+		if [ -n "$(TEST_JSON)" ]; then \
+			tee -a "$(TEST_JSON)" < coverage.run.$$i.out | $(BIN_DIR)/testlatency -render >&2; \
+		else \
+			cat coverage.run.$$i.out; \
+		fi; \
+		cat coverage.run.$$i.err >&2; \
+		runstatus=$$(cat coverage.run.$$i.status 2>/dev/null) || runstatus=1; \
+		[ "$$runstatus" = 0 ] || status=$${runstatus:-1}; \
+		i=$$((i+1)); \
+	done; \
+	if [ "$$status" -ne 0 ]; then rm -f coverage.run.*; exit "$$status"; fi; \
+	profiles=; i=1; while [ "$$i" -le "$$n" ]; do profiles="$$profiles coverage.run.$$i.txt"; i=$$((i+1)); done; \
+	$(BIN_DIR)/coversplit -merge coverage.partial.txt $$profiles || { rm -f coverage.run.* coverage.partial.txt; exit 1; }; \
+	rm -f coverage.run.*; \
+	mv coverage.partial.txt coverage.txt
+
+test-integration-darwin: ## test-integration over the packages of go/.darwin-set only (the macOS CI job); fails when the set file is missing or names no package
+test-integration-darwin: INTEGRATION_SET = $(DARWIN_SET)
+test-integration-darwin: test-integration
+
+darwin-set: ## Write go/.darwin-set: the packages whose code or tests differ on macOS (build constraints, runtime.GOOS checks, sandbox-exec callers)
+	@$(GO) run ./cmd/darwinset > $(DARWIN_SET).tmp && mv $(DARWIN_SET).tmp $(DARWIN_SET) || { rm -f $(DARWIN_SET).tmp; exit 1; }
+
+E2E_JSON ?=
+E2E_TAGS = e2e evolve_test_phases
+E2E_TEST = $(GO) test $(RUSAGE_EXEC) -count=1 -timeout 45m -tags "$(E2E_TAGS)"
+E2E_ROOTS = cmd test/e2e
+E2E_PKGS = ./cmd/... ./test/e2e/...
+
+test-e2e: ## E2E tier: only the tests of e2e-tagged files, full-cycle subprocess paths (//go:build e2e + evolve_test_phases); live sub-tier self-skips without its opt-in; E2E_JSON=<file> also writes the go test -json stream while the console keeps the plain text; TEST_RUSAGE=1 runs every test binary through bin/testrusage (appends to TESTRUSAGE_OUT)
+	@$(BUILD_RUSAGE); \
+	$(GO) build -o $(BIN_DIR)/e2elist ./cmd/e2elist || exit $$?; \
+	run=$$($(BIN_DIR)/e2elist -tags "$(E2E_TAGS)" $(E2E_ROOTS)) || exit $$?; \
+	if [ -n "$(E2E_JSON)" ]; then \
+		$(GO) build -o $(BIN_DIR)/testlatency ./cmd/testlatency || exit $$?; \
+		status=$$( { { $(E2E_TEST) -run "$$run" -json $(E2E_PKGS); echo $$? >&3; } | tee "$(E2E_JSON)" | $(BIN_DIR)/testlatency -render >&2; } 3>&1 ); \
+	else \
+		$(E2E_TEST) -run "$$run" $(E2E_PKGS); status=$$?; \
+	fi; \
+	exit $${status:-1}
+
+test-acs-durable: ## Durable ACS regression tier (//go:build acs); artifact-free predicates, mirrors the ci.yml acs-durable gate
+	$(GO) test -count=1 -tags acs ./acs/regression/...
+
+test-all: test-integration ## All runtime tiers, preserving no-race E2E and its test-only phase tag
+	$(MAKE) -f "$(firstword $(MAKEFILE_LIST))" test-e2e
+	$(MAKE) -f "$(firstword $(MAKEFILE_LIST))" test-acs-durable
+
+test-latency: ## Render the fast-suite latency report to test/latency-report.md
+	@$(GO) test -json $(FAST_PKGS) | $(GO) run ./cmd/testlatency -title "Fast suite latency" > test/latency-report.md
+	@echo "Latency report: test/latency-report.md"
+
+test-budget: ## Check fast-suite package wall times against addedtests.PackageWallBudget
+	@$(GO) test -json $(FAST_PKGS) | $(GO) run ./cmd/testlatency -package-budget
+
+cover: test-integration ## Coverage report; hard package floors are enforced separately by cover-strict
+	@$(GO) tool cover -func=coverage.txt | tee coverage.func.txt
+	@$(GO) tool cover -html=coverage.txt -o coverage.html
+	@echo "Coverage HTML: coverage.html"
+
+# APICOVER_PKGS scopes the public-API-coverage measurement. Default is all
+# internal packages; override (e.g. APICOVER_PKGS=./internal/paths/...) to focus.
+APICOVER_PKGS ?= ./internal/...
+
+apicover: ## Public-API coverage report (warning-only; APICOVER_PKGS=... to scope, -enforce in Phase 5)
+	@mkdir -p $(BIN_DIR)
+	@$(GO) build -o $(BIN_DIR)/apicover ./cmd/apicover
+	@$(GO) test -count=1 -coverprofile=coverage.apicover.txt $(APICOVER_PKGS) >/dev/null
+	@$(GO) tool cover -func=coverage.apicover.txt > coverage.apicover.func.txt
+	@$(BIN_DIR)/apicover -cover coverage.apicover.func.txt $$($(GO) list -f '{{.Dir}}' $(APICOVER_PKGS))
+
+cover-strict: ## Per-package line-coverage hard-fail over go/.cover-strict (ADR-0101 §11: `<pkg> <min%>` per line), read from the coverage.txt of test-integration; runs no test
+	$(GO) run ./cmd/evolve cover strict --root .
+
+COVER_CHANGED_BASE ?= origin/main
+COVER_PROFILE ?= coverage.txt
+
+cover-changed: ## Every function the change touches since COVER_CHANGED_BASE is at 100% in the coverage.txt of test-integration (no allowance: a touched gap must be tested)
+	$(GO) run ./cmd/evolve cover changed --base $(COVER_CHANGED_BASE) --root .
+
+cover-changed-darwin: ## cover-changed over the packages of go/.darwin-set only, read from the coverage.txt of test-integration-darwin
+	$(GO) run ./cmd/evolve cover changed --base $(COVER_CHANGED_BASE) --root . --packages $(DARWIN_SET)
+
+cover-strict-darwin: ## cover-strict over the floors of the go/.darwin-set packages only, read from the coverage.txt of test-integration-darwin
+	$(GO) run ./cmd/evolve cover strict --root . --packages $(DARWIN_SET)
+
+# Test-only ACS enrollments have no production API, and their artifact-dependent
+# predicates belong to the cycle runner. Inspect those dirs without running them.
+apicover-enforce: ## Per-package hard-fail over go/.apicover-enforce (mirrors go.yml Phase-5; the composed-gate recipe — a red here means an uncovered/false-green EXPORT, and it must fail the tree)
+	@pkgs="$${APICOVER_PKGS}"; \
+	if [ -z "$$pkgs" ]; then pkgs=$$(sed '/^[[:space:]]*\#/d; /^[[:space:]]*$$/d' .apicover-enforce) || exit $$?; fi; \
+	if [ -z "$$pkgs" ]; then echo "apicover-enforce: no enforced packages — skipping"; exit 0; fi; \
+	set --; for pkg in $$pkgs; do \
+		case "$$pkg" in */acs/*|acs/*) continue;; esac; \
+		set -- "$$@" "$$pkg"; \
+	done; \
+	if [ "$$#" -eq 0 ]; then printf 'mode: set\n' > coverage.apicover.txt; \
+	else $(GO) test -count=1 -tags integration -coverprofile=coverage.apicover.txt "$$@" || exit $$?; fi
+	$(MAKE) -f "$(firstword $(MAKEFILE_LIST))" apicover-check COVER_PROFILE=coverage.apicover.txt
+
+apicover-check: ## Enforce public API coverage from the successful integration run's coverage.txt
+	@mkdir -p $(BIN_DIR)
+	@$(GO) build -o $(BIN_DIR)/apicover ./cmd/apicover
+	@pkgs="$${APICOVER_PKGS}"; \
+	if [ -z "$$pkgs" ]; then pkgs=$$(sed '/^[[:space:]]*\#/d; /^[[:space:]]*$$/d' .apicover-enforce) || exit $$?; fi; \
+	if [ -z "$$pkgs" ]; then echo "apicover-enforce: no enforced packages — skipping"; exit 0; fi; \
+	$(GO) tool cover -func=$(COVER_PROFILE) > coverage.apicover.func.txt || exit $$?; \
+	$(GO) list -e -f '{{if .Dir}}{{.Dir}}{{else}}MISSING_PACKAGE{{end}}' $$pkgs > $(BIN_DIR)/apicover-dirs.txt || exit $$?; \
+	set --; while IFS= read -r dir; do \
+		test -d "$$dir" || { echo "apicover-check: missing package directory: $$dir" >&2; exit 1; }; \
+		set -- "$$@" "$$dir"; \
+	done < $(BIN_DIR)/apicover-dirs.txt; \
+	test "$$#" -gt 0 || { echo "apicover-check: no package directories" >&2; exit 1; }; \
+	$(BIN_DIR)/apicover -enforce -cover coverage.apicover.func.txt "$$@"
+
+lint: ## go vet + format diff (read-only)
+	$(GO) vet $(PKG)
+	@diff_out=$$(gofmt -d -s .) ; \
+	if [ -n "$$diff_out" ]; then echo "$$diff_out"; echo "FAIL: gofmt diff above" >&2; exit 1; fi
+
+vulncheck: ## govulncheck over the whole module at the pinned version (no go.mod require); fails on any reachable vulnerability
+	@mkdir -p $(BIN_DIR); \
+	$(GO) run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) -json $(PKG) > $(BIN_DIR)/vulncheck.json || { status=$$?; echo "vulncheck: govulncheck failed (exit $$status)" >&2; exit $$status; }; \
+	$(GO) run ./cmd/vulnfilter -allowlist vulncheck-allowlist.json < $(BIN_DIR)/vulncheck.json
+
+tidy: ## Normalize go.mod / go.sum
+	$(GO) mod tidy
+	$(GO) mod verify
+
+clean: dist-clean ## Remove build outputs (incl. cross-compile artifacts)
+	rm -rf $(BIN_DIR) coverage.txt coverage.partial.txt coverage.apicover.txt coverage.apicover.func.txt coverage.html coverage.func.txt

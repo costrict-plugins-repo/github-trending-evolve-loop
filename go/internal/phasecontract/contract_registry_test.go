@@ -1,0 +1,240 @@
+package phasecontract
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestFor_CoversAllEightAgents(t *testing.T) {
+	want := []string{
+		"build", "scout", "tdd", "audit", "intent", "triage",
+		"router",
+		"orchestrator",
+	}
+	for _, phase := range want {
+		c, ok := For(phase)
+		if !ok {
+			t.Errorf("For(%q): want a contract, got none", phase)
+			continue
+		}
+		if c.Phase != phase {
+			t.Errorf("For(%q): Phase=%q, want %q", phase, c.Phase, phase)
+		}
+		if c.ArtifactName == "" {
+			t.Errorf("For(%q): empty ArtifactName", phase)
+		}
+	}
+}
+
+func TestFor_Ship_NoArtifactContract(t *testing.T) {
+	c, ok := For("ship")
+	if !ok {
+		t.Fatal(`For("ship"): want a contract (ship had none → contract-gate fail-open WARN every cycle)`)
+	}
+	if !c.NoArtifact {
+		t.Error("ship contract must declare NoArtifact (its deliverable is the pushed commit)")
+	}
+	if c.ArtifactName != "" {
+		t.Errorf("ship NoArtifact contract should have empty ArtifactName, got %q", c.ArtifactName)
+	}
+}
+
+func TestMandatoryPhasesHaveContracts(t *testing.T) {
+	for _, p := range []string{"scout", "build", "audit", "ship", "tdd"} {
+		if _, ok := For(p); !ok {
+			t.Errorf("mandatory phase %q has no registered contract", p)
+		}
+	}
+}
+
+func TestFor_UnknownPhase(t *testing.T) {
+	if c, ok := For("nope"); ok {
+		t.Errorf("For(unknown): want (_, false), got %+v", c)
+	}
+}
+
+func TestContract_KindDispatch(t *testing.T) {
+	cases := map[string]Kind{
+		"build":        KindMarkdown,
+		"audit":        KindMarkdown,
+		"router":       KindJSON,
+		"orchestrator": KindJSON,
+	}
+	for phase, wantKind := range cases {
+		c, _ := For(phase)
+		if c.Kind != wantKind {
+			t.Errorf("For(%q).Kind=%d, want %d", phase, c.Kind, wantKind)
+		}
+	}
+}
+
+func TestContract_ArtifactNames(t *testing.T) {
+	cases := map[string]string{
+		"build":        "build-report.md",
+		"scout":        "scout-report.md",
+		"tdd":          "test-report.md",
+		"audit":        "audit-report.md",
+		"intent":       "intent.md",
+		"triage":       "triage-report.md",
+		"router":       "routing-plan.json",
+		"orchestrator": "cycle-state.json",
+	}
+	for phase, want := range cases {
+		c, _ := For(phase)
+		if c.ArtifactName != want {
+			t.Errorf("For(%q).ArtifactName=%q, want %q", phase, c.ArtifactName, want)
+		}
+	}
+}
+
+func TestContract_ArtifactPath_WorkspaceTarget(t *testing.T) {
+	c, _ := For("build")
+	r := Roots{Workspace: "/ws", Worktree: "/wt", EvolveDir: "/ev"}
+	if got, want := c.ArtifactPath(r), filepath.Join("/ws", "build-report.md"); got != want {
+		t.Errorf("build ArtifactPath=%q, want %q", got, want)
+	}
+}
+
+func TestContract_ArtifactPath_EvolveDirTarget(t *testing.T) {
+	c, _ := For("orchestrator")
+	r := Roots{Workspace: "/ws", Worktree: "/wt", EvolveDir: "/ev"}
+	if got, want := c.ArtifactPath(r), filepath.Join("/ev", "cycle-state.json"); got != want {
+		t.Errorf("orchestrator ArtifactPath=%q, want %q", got, want)
+	}
+}
+
+func TestContract_WriteTarget(t *testing.T) {
+	workspaceAgents := []string{"build", "scout", "tdd", "audit", "intent", "triage", "router"}
+	for _, phase := range workspaceAgents {
+		c, _ := For(phase)
+		if c.WriteTarget != "workspace" {
+			t.Errorf("For(%q).WriteTarget=%q, want workspace", phase, c.WriteTarget)
+		}
+	}
+	if c, _ := For("orchestrator"); c.WriteTarget != "evolve_dir" {
+		t.Errorf("orchestrator WriteTarget=%q, want evolve_dir", c.WriteTarget)
+	}
+}
+
+func TestContracts_ReturnsWholeRegistry(t *testing.T) {
+	all := Contracts()
+	if len(all) != 13 {
+		t.Fatalf("Contracts() len=%d, want 13", len(all))
+	}
+	seen := map[string]bool{}
+	for _, c := range all {
+		seen[c.Phase] = true
+	}
+	for _, phase := range []string{"build", "scout", "tdd", "audit", "intent", "triage", "router", "router-replan", "router-proposal", "orchestrator", "ship", "retro", "build-planner"} {
+		if !seen[phase] {
+			t.Errorf("Contracts() missing %q", phase)
+		}
+	}
+}
+
+func TestContract_JSONContractsDeclareRequiredKeys(t *testing.T) {
+	advisor, _ := For("advisor")
+	if len(advisor.RequiredKeys) != 0 {
+		t.Errorf("advisor/router RequiredKeys=%v, want none (bare array)", advisor.RequiredKeys)
+	}
+	if advisor.Phase != "router" {
+		t.Errorf("advisor alias should resolve to canonical router; got Phase=%q", advisor.Phase)
+	}
+	orch, _ := For("orchestrator")
+	if !contains(orch.RequiredKeys, "cycle_id") {
+		t.Errorf("orchestrator RequiredKeys=%v, want to contain 'cycle_id'", orch.RequiredKeys)
+	}
+}
+
+func TestContract_TopLevelJSONShapePreservesLegacyDefaults(t *testing.T) {
+	if got := (Contract{Kind: KindJSON}).TopLevelJSONShape(); got != JSONShapeAny {
+		t.Errorf("unkeyed zero-value JSON shape=%v, want any value", got)
+	}
+	if got := (Contract{Kind: KindJSON, RequiredKeys: []string{"id"}}).TopLevelJSONShape(); got != JSONShapeObject {
+		t.Errorf("legacy keyed JSON shape=%v, want object", got)
+	}
+}
+
+func TestJSONShape_String(t *testing.T) {
+	tests := []struct {
+		shape JSONShape
+		want  string
+	}{
+		{shape: JSONShapeAny, want: "value"},
+		{shape: JSONShapeObject, want: "object"},
+		{shape: JSONShapeArray, want: "array"},
+	}
+	for _, tt := range tests {
+		if got := tt.shape.String(); got != tt.want {
+			t.Errorf("JSONShape(%d).String()=%q, want %q", tt.shape, got, tt.want)
+		}
+	}
+}
+
+func TestRouterArtifactContractsAreDistinct(t *testing.T) {
+	tests := []struct {
+		contract string
+		artifact string
+	}{
+		{contract: "router", artifact: "routing-plan.json"},
+		{contract: "router-replan", artifact: "routing-replan.json"},
+		{contract: "router-proposal", artifact: "routing-proposal.json"},
+	}
+	for _, test := range tests {
+		t.Run(test.contract, func(t *testing.T) {
+			c, ok := For(test.contract)
+			if !ok {
+				t.Fatalf("For(%q): contract not registered", test.contract)
+			}
+			if c.ArtifactName != test.artifact {
+				t.Errorf("For(%q).ArtifactName = %q, want %q", test.contract, c.ArtifactName, test.artifact)
+			}
+			if c.AgentName != "router" {
+				t.Errorf("For(%q).AgentName = %q, want router", test.contract, c.AgentName)
+			}
+		})
+	}
+}
+
+func TestArtifactNameMatchesProfileOutput(t *testing.T) {
+	profileDir := filepath.Join("..", "..", "..", ".evolve", "profiles")
+	profileOf := map[string]string{
+		"build":  "builder",
+		"scout":  "scout",
+		"tdd":    "tdd-engineer",
+		"audit":  "auditor",
+		"intent": "intent",
+		"triage": "triage",
+	}
+	for phase, profName := range profileOf {
+		c, _ := For(phase)
+		path := filepath.Join(profileDir, profName+".json")
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Errorf("%s: read profile %s: %v", phase, path, err)
+			continue
+		}
+		var prof struct {
+			OutputArtifact string `json:"output_artifact"`
+		}
+		if err := json.Unmarshal(data, &prof); err != nil {
+			t.Errorf("%s: parse profile: %v", phase, err)
+			continue
+		}
+		if got := filepath.Base(prof.OutputArtifact); got != c.ArtifactName {
+			t.Errorf("DRIFT %s: profile output_artifact basename=%q, contract ArtifactName=%q",
+				phase, got, c.ArtifactName)
+		}
+	}
+}
+
+func contains(ss []string, s string) bool {
+	for _, v := range ss {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}

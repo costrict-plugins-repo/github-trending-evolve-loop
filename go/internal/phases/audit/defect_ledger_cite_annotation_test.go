@@ -1,0 +1,61 @@
+package audit
+
+import (
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+)
+
+func TestClassify_AnnotatedRangeCiteCloses(t *testing.T) {
+	t.Parallel()
+	ws, wt, req := worktreeContinuationFixture(t, 1350, 1356, []string{"carryforward candidates timestamp is stale"})
+	evidenceFile(t, wt, "go/internal/phases/triage/triage.go")
+	writeJSON(t, filepath.Join(ws, dispositionFile), map[string]any{
+		"dispositions": []any{
+			map[string]any{"id": "d1", "status": "FIXED",
+				"evidence": "go/internal/phases/triage/triage.go:114-129 (carryforwardCandidatesTimestamp now cycle-scoped)",
+				"reason":   "fix landed in this lane's worktree"},
+		},
+	})
+
+	verdict, diags, _ := hooks{}.Classify(narrativeReport("PASS"), req, core.BridgeResponse{})
+
+	if verdict != core.VerdictPASS {
+		t.Errorf("a valid path:N-M cite with a trailing parenthetical annotation must be accepted (annotation dropped, path resolved); verdict = %q\ndiagnostics:\n%s", verdict, diagsText(diags))
+	}
+}
+
+func TestClassify_AnnotationCannotLaunderARejection(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name, evidence string
+	}{
+		{"annotation-only cite", "(see the fix above)"},
+		{"empty path before annotation", " (all better now)"},
+		{"nonexistent path with annotation", "go/internal/nowhere/imaginary.go:12-40 (definitely fixed)"},
+		{"root escape with annotation", "../outside.go:3-9 (fixed elsewhere)"},
+		{"self-vouch with annotation", "defect-ledger.json:1-5 (the ledger says so)"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ws, wt, req := worktreeContinuationFixture(t, 1350, 1356, []string{"carryforward candidates timestamp is stale"})
+			evidenceFile(t, wt, "go/internal/phases/triage/triage.go")
+			writeJSON(t, filepath.Join(ws, dispositionFile), map[string]any{
+				"dispositions": []any{
+					map[string]any{"id": "d1", "status": "FIXED", "evidence": c.evidence, "reason": "claims closure"},
+				},
+			})
+
+			verdict, diags, _ := hooks{}.Classify(narrativeReport("PASS"), req, core.BridgeResponse{})
+
+			if verdict == core.VerdictPASS {
+				t.Errorf("cite %q must still block PASS — annotation tolerance strips decoration from a VALID cite, it never launders an invalid one\ndiagnostics:\n%s", c.evidence, diagsText(diags))
+			}
+			if text := diagsText(diags); !strings.Contains(text, "d1") {
+				t.Errorf("the rejected closure must be named by id; diagnostics:\n%s", text)
+			}
+		})
+	}
+}

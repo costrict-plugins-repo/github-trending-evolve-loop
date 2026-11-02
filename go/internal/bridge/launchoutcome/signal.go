@@ -1,0 +1,36 @@
+package launchoutcome
+
+import "github.com/mickeyyaya/evolve-loop/go/internal/signalcenter"
+
+const (
+	CodeExitSafetyGate              signalcenter.Code = "BRIDGE_EXIT_SAFETY_GATE"
+	CodeExitCostLeak                signalcenter.Code = "BRIDGE_EXIT_COST_LEAK"
+	CodeExitBadFlags                signalcenter.Code = "BRIDGE_EXIT_BAD_FLAGS"
+	CodeExitREPLBootTimeout         signalcenter.Code = "BRIDGE_EXIT_REPL_BOOT_TIMEOUT"
+	CodeExitArtifactTimeout         signalcenter.Code = "BRIDGE_EXIT_ARTIFACT_TIMEOUT"
+	CodeExitUnknownPrompt           signalcenter.Code = "BRIDGE_EXIT_UNKNOWN_PROMPT"
+	CodeExitRespondLoopGuard        signalcenter.Code = "BRIDGE_EXIT_RESPOND_LOOP_GUARD"
+	CodeExitRequiredTierUnavailable signalcenter.Code = "BRIDGE_EXIT_REQUIRED_TIER_UNAVAILABLE"
+	CodeExitCommandTimeout          signalcenter.Code = "BRIDGE_EXIT_COMMAND_TIMEOUT"
+	CodeExitMissingBinary           signalcenter.Code = "BRIDGE_EXIT_MISSING_BINARY"
+	CodeExitSignalDeath             signalcenter.Code = "BRIDGE_EXIT_SIGNAL_DEATH"
+	CodeExitDriverError             signalcenter.Code = "BRIDGE_EXIT_DRIVER_ERROR"
+	CodeExitModelMismatch           signalcenter.Code = "BRIDGE_EXIT_MODEL_MISMATCH"
+)
+
+func init() {
+	const common = "; the reason is the classified launch error (the exact string the outcome record and the retry backoff parse), fields exit_code, cause_code, transient, ctx_cancelled, launch_error (the persisted <agent>-launch-error.txt when written), call_id, cli, agent, step=classify"
+	signalcenter.RegisterCode(signalcenter.ModuleBridge, CodeExitSafetyGate, "a launch died in a safety gate (exit 2: e.g. a launch without --allow-bypass, or a --human-input with no audit); plain failure"+common)
+	signalcenter.RegisterCode(signalcenter.ModuleBridge, CodeExitCostLeak, "a launch refused to leak a forbidden credential into the inner CLI's environment (exit 3); plain failure"+common)
+	signalcenter.RegisterCode(signalcenter.ModuleBridge, CodeExitBadFlags, "a launch died in the validate gauntlet — bad flags, a missing profile, an unreadable or empty prompt, no driver for the CLI (exit 10); plain failure"+common)
+	signalcenter.RegisterCode(signalcenter.ModuleBridge, CodeExitREPLBootTimeout, "a tmux REPL never showed its prompt marker within the boot budget (exit 80); transient — the boot strike is recorded before this event"+common)
+	signalcenter.RegisterCode(signalcenter.ModuleBridge, CodeExitArtifactTimeout, "the artifact never appeared within the wait window (exit 81); wraps core.ErrArtifactTimeout — one code whatever the sub-cause, which rides cause_code (context_cancelled, pane_lost (the tmux session or its server is gone: an infrastructure loss, never a stall), completion_detector_error, submit_wedged, transient_upstream, review_stop, review_pause, incomplete)"+common)
+	signalcenter.RegisterCode(signalcenter.ModuleBridge, CodeExitUnknownPrompt, "the auto-responder escalated on an interactive prompt and wrote the escalation report, or a checkpoint corroborated a quota wall (exit 85); transient — one code whatever the pattern, which rides cause_code (rate_limit, model_unsupported, …; unknown_prompt for a prompt nobody recognised)"+common)
+	signalcenter.RegisterCode(signalcenter.ModuleBridge, CodeExitRespondLoopGuard, "the auto-respond loop guard tripped (exit 86); transient"+common)
+	signalcenter.RegisterCode(signalcenter.ModuleBridge, CodeExitModelMismatch, "a tmux REPL booted a model outside the dispatched target's model_family, or showed no readable model label, before the prompt was delivered (exit 87); plain failure that walks the chain to the next CLI; the exit benches nothing by itself, while the usage-evidence decorator's query can bench an exhausted family — BRIDGE_DISPATCH_MODEL_MISMATCH carries the expected and observed families"+common)
+	signalcenter.RegisterCode(signalcenter.ModuleBridge, CodeExitRequiredTierUnavailable, "--require-full was set and the full model tier is unavailable (exit 99); plain failure"+common)
+	signalcenter.RegisterCode(signalcenter.ModuleBridge, CodeExitCommandTimeout, "the driver was killed by a command-level timeout (exit 124, the gnu timeout convention); transient — infra weather, the sibling of 81"+common)
+	signalcenter.RegisterCode(signalcenter.ModuleBridge, CodeExitMissingBinary, "a required external binary is missing (exit 127); deliberately plain — an absent CLI is an environment defect, and the family fallback sees the raw 127"+common)
+	signalcenter.RegisterCode(signalcenter.ModuleBridge, CodeExitSignalDeath, "the driver died of a signal or failed to start (exit -1): transient under a cancelled context (our own teardown — the deliverable-authority door), plain with a live one (a start failure); the ledger cause stays driver_error"+common)
+	signalcenter.RegisterCode(signalcenter.ModuleBridge, CodeExitDriverError, "a launch exited with a code the table does not name; plain failure, ledger cause driver_error"+common)
+}

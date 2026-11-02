@@ -1,0 +1,497 @@
+//go:build integration
+
+package core
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"github.com/mickeyyaya/evolve-loop/go/internal/continuation"
+	"github.com/mickeyyaya/evolve-loop/go/internal/dossier"
+	"github.com/mickeyyaya/evolve-loop/go/internal/phasespec"
+	"github.com/mickeyyaya/evolve-loop/go/internal/signalcenter"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func resumedLifecycleFixture(t *testing.T) (*Orchestrator, *fakeStorage, CycleRequest, *ResumePoint) {
+	t.Helper()
+	root := initDossierRepo(t)
+	ws := RunWorkspacePath(root, 7)
+	if err := os.MkdirAll(ws, 0755); err != nil {
+		t.Fatal(err)
+	}
+	st := &fakeStorage{state: State{LastCycleNumber: 7}, cycleState: CycleState{CycleID: 7, RunID: "original-run", WorkspacePath: ws, CompletedPhases: []string{"scout", "triage", "build"}}}
+	o := NewOrchestrator(st, &fakeLedger{}, buildRunners(nil))
+	return o, st, CycleRequest{ProjectRoot: root, GoalHash: "recover-original-task"}, &ResumePoint{Phase: string(PhaseAudit), CycleID: 7}
+}
+
+func TestResumeLifecycle_CloseoutRecordsLearningAndRejectsReplay(t *testing.T) {
+	t.Parallel()
+
+	o, st, req, rp := resumedLifecycleFixture(t)
+	if err := os.WriteFile(filepath.Join(st.cycleState.WorkspacePath, "carryover-todos.json"), []byte(`[{"id":"follow-up","action":"verify recovered behavior"}]`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := o.RunCycleFromPhase(context.Background(), req, rp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dossier.CyclesDir(req.ProjectRoot), "cycle-7.json"))
+	if err != nil {
+		t.Fatalf("resumed terminal cycle has no durable dossier: %v", err)
+	}
+	d, err := dossier.ParseJSON(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Cycle != 7 || d.RunID != "original-run" || d.FinalVerdict != result.FinalVerdict {
+		t.Fatalf("closeout lost original identity/outcome: %+v", d)
+	}
+	if len(st.state.CarryoverTodos) != 1 || st.state.CarryoverTodos[0].ID != "follow-up" {
+		t.Fatalf("resumed learning not merged: %+v", st.state.CarryoverTodos)
+	}
+	calls := len(o.runners[PhaseAudit].(*fakeRunner).requests)
+	if _, err := o.RunCycleFromPhase(context.Background(), req, rp); err == nil {
+		t.Error("completed checkpoint must not dispatch again")
+	}
+	if got := len(o.runners[PhaseAudit].(*fakeRunner).requests); got != calls {
+		t.Errorf("replay re-dispatched audit: %d -> %d", calls, got)
+	}
+	if len(st.state.CarryoverTodos) != 1 {
+		t.Fatal("replay duplicated carryover")
+	}
+}
+
+func TestResumeLifecycle_EmptyTriageStopsBeforeImplementation(t *testing.T) {
+	t.Parallel()
+
+	root := initDossierRepo(t)
+	ws := RunWorkspacePath(root, 7)
+	if err := os.MkdirAll(ws, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	st := &fakeStorage{
+		state: State{LastCycleNumber: 7},
+		cycleState: CycleState{
+			CycleID:         7,
+			RunID:           "original-run",
+			WorkspacePath:   ws,
+			CompletedPhases: []string{"scout"},
+			FinalVerdict:    VerdictPASS,
+		},
+	}
+	runners := buildRunners(nil)
+	runners[PhaseTriage] = triageDecisionRunner{verdict: VerdictPASS, decision: `{"top_n":[]}`}
+	o := NewOrchestrator(st, &fakeLedger{}, runners)
+
+	result, err := o.RunCycleFromPhase(context.Background(), CycleRequest{ProjectRoot: root, GoalHash: "protected-task"}, &ResumePoint{Phase: string(PhaseTriage), CycleID: 7})
+	if err != nil {
+		t.Fatalf("RunCycleFromPhase: %v", err)
+	}
+	if result.FinalVerdict != CycleOutcomeSkippedUnknown {
+		t.Errorf("FinalVerdict = %q, want %q", result.FinalVerdict, CycleOutcomeSkippedUnknown)
+	}
+	if result.TerminationReason != CycleTerminationTriageNoWork {
+		t.Errorf("TerminationReason = %q, want %q", result.TerminationReason, CycleTerminationTriageNoWork)
+	}
+	if got, want := result.PhasesRun, []Phase{PhaseTriage}; len(got) != len(want) || got[0] != want[0] {
+		t.Errorf("PhasesRun = %v, want %v", got, want)
+	}
+	for _, phase := range []Phase{PhaseTDD, PhaseBuild, PhaseAudit, PhaseShip} {
+		if got := len(runners[phase].(*fakeRunner).requests); got != 0 {
+			t.Errorf("%s dispatched %d time(s) after terminal Triage", phase, got)
+		}
+	}
+}
+
+func TestResumeLifecycle_AShipThatPassedAfterAStaleShipErrorIsNotALostLanding(t *testing.T) {
+	t.Parallel()
+
+	o, st, req, rp := resumedLifecycleFixture(t)
+	if err := os.WriteFile(filepath.Join(st.cycleState.WorkspacePath, "ship-error.json"), []byte(`{"code":"GIT_FLEET_REBASE_NEEDED","class":"transient","message":"peer conflict"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := o.RunCycleFromPhase(context.Background(), req, rp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.FinalVerdict != VerdictPASS || got.SystemFailure != nil {
+		t.Fatalf("the resumed ship PASSed, so the host latched the landing; the earlier ship-error is stale: %+v", got)
+	}
+}
+
+func TestResumeLifecycle_IterationExhaustionIsExplicitFailure(t *testing.T) {
+	t.Parallel()
+
+	o, _, req, rp := resumedLifecycleFixture(t)
+	WithMaxPhaseIterations(1)(o)
+	got, err := o.RunCycleFromPhase(context.Background(), req, rp)
+	if err == nil || !strings.Contains(err.Error(), "iteration") || got.FinalVerdict != VerdictFAIL {
+		t.Fatalf("safety bound reported success: result=%+v err=%v", got, err)
+	}
+}
+
+func TestResumeLifecycle_TerminalFailurePreservesContinuation(t *testing.T) {
+	t.Parallel()
+
+	root, wt := initContinuationRepo(t, 7)
+	ws := RunWorkspacePath(root, 7)
+	if err := os.MkdirAll(ws, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "feature.go"), []byte("package feature\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	st := &fakeStorage{state: State{LastCycleNumber: 7}, cycleState: CycleState{CycleID: 7, RunID: "original-run", WorkspacePath: ws, ActiveWorktree: wt, WorktreeBaseSHA: gitOut(t, wt, "rev-parse", "HEAD")}}
+	runners := buildRunners(nil)
+	runners[PhaseBuild] = &fakeRunner{name: "build", failErr: errors.New("deterministic build failure"), failUntil: 99}
+	o := NewOrchestrator(st, &fakeLedger{}, runners)
+	_, err := o.RunCycleFromPhase(context.Background(), CycleRequest{ProjectRoot: root, GoalHash: "recover"}, &ResumePoint{CycleID: 7, Phase: "build", WorktreePath: wt})
+	if err == nil {
+		t.Fatal("fixture should fail")
+	}
+	manifest, ok, err := continuation.ReadManifest(ws)
+	if err != nil || !ok || manifest.Cycle != 7 {
+		t.Fatalf("resumed failure lost continuation: %+v present=%v err=%v", manifest, ok, err)
+	}
+	if _, err := os.Stat(filepath.Join(dossier.CyclesDir(root), "cycle-7.json")); err != nil {
+		t.Fatalf("resumed failure lost dossier: %v", err)
+	}
+}
+
+func TestResumeLifecycle_RequestRetainsDifficultyAndRecurrence(t *testing.T) {
+	t.Parallel()
+
+	o, st, req, rp := resumedLifecycleFixture(t)
+	rp.Phase = "build"
+	req.Context = map[string]string{"fleet_scope": "task-a"}
+	if err := os.WriteFile(filepath.Join(st.cycleState.WorkspacePath, "triage-report.md"), []byte("cycle_size_estimate: large\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	WithFailureCountReader(func(string) int { return 1 })(o)
+	o.failurePolicy.Thresholds.BuildDeepEscalateAtFailures = 1
+	if _, err := o.RunCycleFromPhase(context.Background(), req, rp); err != nil {
+		t.Fatal(err)
+	}
+	got := o.runners[PhaseBuild].(*fakeRunner).requests[0]
+	if got.BudgetScale != 1.5 || got.Assignment.Tier != "deep" {
+		t.Fatalf("resume dropped dispatch policy: scale=%v tier=%q", got.BudgetScale, got.Assignment.Tier)
+	}
+}
+
+func TestResumeLifecycle_QuotaExhaustionDefersWithoutTerminalDossier(t *testing.T) {
+	t.Parallel()
+
+	o, st, req, rp := resumedLifecycleFixture(t)
+	o.retryConfig.RetryBackoffBaseS = 0
+	o.runners[PhaseAudit] = &fakeRunner{name: "audit", failErr: wrapTransient(85), failUntil: 99}
+	signals, got := recordingCenter()
+	WithSignalCenter(signals)(o)
+	result, err := o.RunCycleFromPhase(context.Background(), req, rp)
+	if !errors.Is(err, ErrAllFamiliesExhausted) {
+		t.Fatalf("quota pause not typed as resumable: %+v %v", result, err)
+	}
+	if paused := eventsOfKind(*got, signalcenter.KindQuotaPaused); len(paused) != 1 || paused[0].Phase != "audit" || paused[0].Origin != "cycleRun.pauseForQuota" {
+		t.Fatalf("the resume root emits exactly one quota.paused for the paused phase: %+v", paused)
+	}
+	if sealed := eventsOfKind(*got, signalcenter.KindCycleSealed); len(sealed) != 0 {
+		t.Fatalf("a pause is not a seal: %+v", sealed)
+	}
+	if st.cycleState.Phase == "aborted" || len(st.state.FailedAt) != 0 {
+		t.Fatalf("quota pause recorded terminal failure: %+v", st.cycleState)
+	}
+	if _, err := os.Stat(filepath.Join(dossier.CyclesDir(req.ProjectRoot), "cycle-7.json")); !os.IsNotExist(err) {
+		t.Fatalf("quota pause wrote a terminal dossier: %v", err)
+	}
+}
+
+func TestResumeLifecycle_CloseoutNeverRewindsConcurrentCycleCursor(t *testing.T) {
+	t.Parallel()
+
+	st := &fakeUpdaterStorage{}
+	st.mem.st = State{LastCycleNumber: 12, LastAllocatedCycleNumber: 13}
+	o := &Orchestrator{storage: st}
+	if err := o.persistCycleEndState(context.Background(), State{LastCycleNumber: 7}); err != nil {
+		t.Fatal(err)
+	}
+	if st.mem.st.LastCycleNumber != 12 || st.mem.st.LastAllocatedCycleNumber != 13 {
+		t.Fatalf("old resumed lane rewound newer completion: %+v", st.mem.st)
+	}
+}
+
+func TestResumeLifecycle_FinalizeAccountingIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	o, st, req, _ := resumedLifecycleFixture(t)
+	st.state.TriageThroughput = []TriageThroughputEntry{{Cycle: 7, Floors: 3}}
+	o.gitHEAD = func() (string, error) { return "new-head", nil }
+	o.throughputRecorder = func(s *State, cycle int, _ string) {
+		s.TriageThroughput = append(s.TriageThroughput, TriageThroughputEntry{Cycle: cycle, Floors: 3})
+	}
+	result := CycleResult{Cycle: 7, FinalVerdict: VerdictPASS}
+	if _, err := o.finalizeCycle(context.Background(), st.cycleState, 7, "old-head", req.ProjectRoot, &result, &st.state, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.state.TriageThroughput) != 1 {
+		t.Fatalf("replayed closeout counted cycle twice: %+v", st.state.TriageThroughput)
+	}
+}
+
+func TestResumeLifecycle_PostShipPauseRetainsThroughputBaseline(t *testing.T) {
+	t.Parallel()
+
+	o, st, req, rp := resumedLifecycleFixture(t)
+	rp.Phase = string(PhaseRetro)
+	st.cycleState.CompletedPhases = append(st.cycleState.CompletedPhases, "audit", "ship")
+	st.cycleState.FinalVerdict = VerdictPASS
+	raw, err := json.Marshal(st.cycleState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved map[string]any
+	if err := json.Unmarshal(raw, &saved); err != nil {
+		t.Fatal(err)
+	}
+	saved["pre_cycle_head"] = "original-head"
+	raw, err = json.Marshal(saved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &st.cycleState); err != nil {
+		t.Fatal(err)
+	}
+	hostWitness(t, req.ProjectRoot, st.cycleState)
+	o.gitHEAD = func() (string, error) { return "already-shipped-head", nil }
+	o.throughputRecorder = func(s *State, cycle int, _ string) {
+		s.TriageThroughput = append(s.TriageThroughput, TriageThroughputEntry{Cycle: cycle, Floors: 3})
+	}
+	if _, err := o.RunCycleFromPhase(context.Background(), req, rp); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.state.TriageThroughput) != 1 || st.state.TriageThroughput[0].Cycle != 7 {
+		t.Fatalf("post-ship resume lost observed throughput: %+v", st.state.TriageThroughput)
+	}
+}
+
+func TestResumeLifecycle_AuditRoundPropagatesToAuditAndShip(t *testing.T) {
+	t.Parallel()
+
+	o, st, req, rp := resumedLifecycleFixture(t)
+	st.cycleState.AuditDispatches = 2
+	if _, err := o.RunCycleFromPhase(context.Background(), req, rp); err != nil {
+		t.Fatal(err)
+	}
+	for _, phase := range []Phase{PhaseAudit, PhaseShip} {
+		raw, _ := json.Marshal(o.runners[phase].(*fakeRunner).requests[0])
+		var got map[string]any
+		_ = json.Unmarshal(raw, &got)
+		if got["audit_round"] != float64(3) {
+			t.Errorf("%s request dropped audit round: %v", phase, got["audit_round"])
+		}
+	}
+}
+
+func TestResumeLifecycle_RestoresOriginalGoalAndRejectsReplacement(t *testing.T) {
+	t.Parallel()
+
+	for _, replacement := range []bool{false, true} {
+		t.Run(map[bool]string{false: "restore", true: "reject-replacement"}[replacement], func(t *testing.T) {
+			o, st, req, rp := resumedLifecycleFixture(t)
+			rp.Phase = "build"
+			req.GoalHash = ""
+			raw, _ := json.Marshal(st.cycleState)
+			var state map[string]any
+			_ = json.Unmarshal(raw, &state)
+			state["goal_hash"], state["goal_text"] = "original-hash", "repair the original task"
+			raw, _ = json.Marshal(state)
+			if err := json.Unmarshal(raw, &st.cycleState); err != nil {
+				t.Fatal(err)
+			}
+			if replacement {
+				req.GoalHash = "replacement-hash"
+			}
+			_, err := o.RunCycleFromPhase(context.Background(), req, rp)
+			if replacement {
+				if err == nil {
+					t.Fatal("resumed checkpoint accepted a different goal")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := o.runners[PhaseBuild].(*fakeRunner).requests[0]
+			if got.GoalHash != "original-hash" || got.Context["goal"] != "repair the original task" {
+				t.Fatalf("original task lost on resume: hash=%q goal=%q", got.GoalHash, got.Context["goal"])
+			}
+		})
+	}
+}
+
+func TestResumeLifecycle_FreshCyclePersistsOriginalGoal(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	st := &fakeStorage{}
+	o := NewOrchestrator(st, &fakeLedger{}, buildRunners(nil))
+	o.gitHEAD = func() (string, error) { return "original-head", nil }
+	_, err := o.RunCycle(context.Background(), CycleRequest{ProjectRoot: root, GoalHash: "original-hash", Context: map[string]string{"goal": "original task"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(st.cycleState)
+	var state map[string]any
+	_ = json.Unmarshal(raw, &state)
+	if state["goal_hash"] != "original-hash" || state["goal_text"] != "original task" || state["pre_cycle_head"] != "original-head" {
+		t.Fatalf("fresh cycle has no durable goal: %v", state)
+	}
+}
+
+func TestResumeLifecycle_RecurrenceUsesPersistedLaneScope(t *testing.T) {
+	t.Parallel()
+
+	o, st, req, rp := resumedLifecycleFixture(t)
+	rp.Phase = "build"
+	materializeLaneScope(st.cycleState.WorkspacePath, "task-a", req.GoalHash)
+	WithFailureCountReader(func(id string) int {
+		if id == "task-a" {
+			return 1
+		}
+		return 0
+	})(o)
+	o.failurePolicy.Thresholds.BuildDeepEscalateAtFailures = 1
+	if _, err := o.RunCycleFromPhase(context.Background(), req, rp); err != nil {
+		t.Fatal(err)
+	}
+	got := o.runners[PhaseBuild].(*fakeRunner).requests[0]
+	if got.Assignment.Tier != "deep" || got.Context["fleet_scope"] != "task-a" {
+		t.Fatalf("persisted task scope lost: tier=%q scope=%q", got.Assignment.Tier, got.Context["fleet_scope"])
+	}
+}
+
+func TestResumeLifecycle_FreshQuotaPauseIsNotTerminalFailure(t *testing.T) {
+	t.Parallel()
+
+	root := initDossierRepo(t)
+	runners := buildRunners(nil)
+	runners[PhaseScout] = &fakeRunner{name: "scout", failErr: wrapTransient(85), failUntil: 99}
+	st := &fakeStorage{}
+	o := NewOrchestrator(st, &fakeLedger{}, runners)
+	o.retryConfig.RetryBackoffBaseS = 0
+	got, err := o.RunCycle(context.Background(), CycleRequest{ProjectRoot: root, GoalHash: "original"})
+	if !errors.Is(err, ErrAllFamiliesExhausted) {
+		t.Fatalf("fixture must pause on quota: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dossier.CyclesDir(root), "cycle-1.json")); !os.IsNotExist(err) {
+		t.Fatalf("resource pause incorrectly became a terminal dossier: %v", err)
+	}
+	if st.cycleState.Phase == "aborted" || len(got.SkippedPhases) != 0 {
+		t.Fatalf("resource pause sealed as failed: %+v %+v", st.cycleState, got)
+	}
+}
+
+func TestResumeLifecycle_PausedAllocatedCycleUsesHostLeaseIdentity(t *testing.T) {
+	t.Parallel()
+
+	o, st, req, rp := resumedLifecycleFixture(t)
+	st.state.LastCycleNumber = 6
+	st.state.LastAllocatedCycleNumber = 7
+	got, err := o.RunCycleFromPhase(context.Background(), req, rp)
+	if err != nil {
+		t.Fatalf("host allocated cycle could not resume after quota pause: %v", err)
+	}
+	if got.Cycle != 7 || st.state.LastCycleNumber != 7 || st.state.LastAllocatedCycleNumber != 7 {
+		t.Fatalf("resume changed allocated identity: %+v %+v", got, st.state)
+	}
+}
+
+func TestResumeLifecycle_PostShipObserverFailureDegradesLikeFreshPath(t *testing.T) {
+	t.Parallel()
+
+	o, st, req, rp := resumedLifecycleFixture(t)
+	cat, warnings := phasespec.Catalog{}.Merge([]phasespec.PhaseSpec{{Name: "memo", Optional: true, After: "ship"}})
+	if len(warnings) > 0 {
+		t.Fatalf("catalog merge: %v", warnings)
+	}
+	WithCatalog(cat)(o)
+	o.retryConfig.PhaseMaxAttempts = 1
+	o.runners[Phase("memo")] = &fakeRunner{name: "memo", failErr: errors.New("memo tier/envelope policy error"), failUntil: 99}
+	st.cycleState.CompletedPhases = []string{"scout", "triage", "build", "audit", "ship"}
+	st.cycleState.Shipped = true
+	hostWitness(t, req.ProjectRoot, st.cycleState)
+	rp.Phase = "memo"
+
+	got, err := o.RunCycleFromPhase(context.Background(), req, rp)
+	if err != nil {
+		t.Fatalf("a shipped resume must degrade a failed best-effort observer, got abort: %v (result %+v)", err, got)
+	}
+	if got.FinalVerdict == VerdictFAIL {
+		t.Fatalf("shipped resume FinalVerdict = FAIL after observer skip: %+v", got)
+	}
+}
+
+func TestResumeLifecycle_NonCanonicalVerdictFromDispatchAbortsAndRecords(t *testing.T) {
+	t.Parallel()
+
+	o, _, req, rp := resumedLifecycleFixture(t)
+	o.resumeDispatch = func(_ *cycleRun, next Phase, _ PhaseRequest, _ retryOpts) (map[string]bool, PhaseResponse, int, error) {
+		return nil, PhaseResponse{Phase: string(next), Verdict: "BOGUS"}, 1, nil
+	}
+
+	got, err := o.RunCycleFromPhase(context.Background(), req, rp)
+	if err == nil || !strings.Contains(err.Error(), `phase audit returned non-canonical verdict "BOGUS"`) {
+		t.Fatalf("a resumed phase returning a non-canonical verdict with a nil error must abort with the guard message: result=%+v err=%v", got, err)
+	}
+	if got.FinalVerdict != VerdictFAIL {
+		t.Errorf("FinalVerdict = %q, want %q", got.FinalVerdict, VerdictFAIL)
+	}
+	if len(got.PhasesRun) == 0 || got.PhasesRun[len(got.PhasesRun)-1] != PhaseAudit {
+		t.Errorf("the guard must record the audit phase outcome before returning, PhasesRun = %v", got.PhasesRun)
+	}
+}
+
+func TestResumeLifecycle_NonCanonicalVerdictAborts(t *testing.T) {
+	t.Parallel()
+
+	o, _, req, rp := resumedLifecycleFixture(t)
+	o.runners[PhaseAudit] = &fakeRunner{name: "audit", verdict: "BOGUS"}
+
+	got, err := o.RunCycleFromPhase(context.Background(), req, rp)
+	if err == nil || !strings.Contains(err.Error(), "non-canonical verdict") {
+		t.Fatalf("a resumed phase returning a non-canonical verdict must abort: result=%+v err=%v", got, err)
+	}
+	if got.FinalVerdict != VerdictFAIL {
+		t.Errorf("FinalVerdict = %q, want %q", got.FinalVerdict, VerdictFAIL)
+	}
+}
+
+func TestResumeLifecycle_ThePersistedPreCycleHeadReachesTheCloseout(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		pre     string
+		records bool
+	}{
+		{"the host witness's pre-cycle HEAD bounds the closeout", "pre-cycle-sha", true},
+		{"the same HEAD before and after records nothing", "post-cycle-sha", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o, st, req, rp := resumedLifecycleFixture(t)
+			st.cycleState.PreCycleHEAD = tc.pre
+			hostWitness(t, req.ProjectRoot, st.cycleState)
+			o.gitHEAD = func() (string, error) { return "post-cycle-sha", nil }
+			recorded := 0
+			WithThroughputRecorder(func(*State, int, string) { recorded++ })(o)
+			if _, err := o.RunCycleFromPhase(context.Background(), req, rp); err != nil {
+				t.Fatal(err)
+			}
+			if (recorded == 1) != tc.records {
+				t.Fatalf("recorded %d time(s), want records=%v: the resumed closeout must compare against the host witness's pre-cycle HEAD", recorded, tc.records)
+			}
+		})
+	}
+}

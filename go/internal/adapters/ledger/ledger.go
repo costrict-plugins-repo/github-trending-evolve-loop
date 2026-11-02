@@ -1,0 +1,501 @@
+// Package ledger implements core.Ledger as an append-only JSONL file hash-chained over each line's raw bytes.
+// See docs/architecture/packages/internal-adapters-ledger.md.
+package ledger
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/adapters/flock"
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+	"github.com/mickeyyaya/evolve-loop/go/internal/ledgerartifacts"
+	"github.com/mickeyyaya/evolve-loop/go/internal/ledgertip"
+)
+
+const ZeroSeed = "0000000000000000000000000000000000000000000000000000000000000000"
+
+type FileLedger struct {
+	ledgerPath string
+	tipPath    string
+	lockPath   string
+	anchorPath string
+	mu         sync.RWMutex
+	onAppend   func(e core.LedgerEntry, err error)
+}
+
+type Option func(*FileLedger)
+
+type ledgerHooks struct {
+	marshal func(any) ([]byte, error)
+	openF   func(path string, flag int, perm os.FileMode) (*os.File, error)
+	write   func(f *os.File, b []byte) (int, error)
+	closeF  func(f *os.File) error
+	writeF  func(path string, data []byte, perm os.FileMode) error
+	readF   func(path string) ([]byte, error)
+}
+
+var hooks = ledgerHooks{
+	marshal: json.Marshal,
+	openF:   os.OpenFile,
+	write:   func(f *os.File, b []byte) (int, error) { return f.Write(b) },
+	closeF:  func(f *os.File) error { return f.Close() },
+	writeF:  os.WriteFile,
+	readF:   os.ReadFile,
+}
+
+func withHooks(replacement ledgerHooks, fn func()) {
+	prev := hooks
+	if replacement.marshal != nil {
+		hooks.marshal = replacement.marshal
+	}
+	if replacement.openF != nil {
+		hooks.openF = replacement.openF
+	}
+	if replacement.write != nil {
+		hooks.write = replacement.write
+	}
+	if replacement.closeF != nil {
+		hooks.closeF = replacement.closeF
+	}
+	if replacement.writeF != nil {
+		hooks.writeF = replacement.writeF
+	}
+	if replacement.readF != nil {
+		hooks.readF = replacement.readF
+	}
+	defer func() { hooks = prev }()
+	fn()
+}
+
+func New(evolveDir string, opts ...Option) *FileLedger {
+	l := &FileLedger{
+		ledgerPath: filepath.Join(evolveDir, "ledger.jsonl"),
+		tipPath:    filepath.Join(evolveDir, "ledger.tip"),
+		lockPath:   filepath.Join(evolveDir, "ledger.lock"),
+		anchorPath: filepath.Join(evolveDir, "ledger-anchor.json"),
+	}
+	for _, opt := range opts {
+		opt(l)
+	}
+	return l
+}
+
+func (l *FileLedger) Append(_ context.Context, e core.LedgerEntry) error {
+	err := l.appendChained(chainInto(&e))
+	l.observe(e, err)
+	return err
+}
+
+func chainInto(e *core.LedgerEntry) func(seq int, prevHash string) any {
+	return func(seq int, prevHash string) any {
+		e.EntrySeq = seq
+		e.PrevHash = prevHash
+		return *e
+	}
+}
+
+func (l *FileLedger) observe(e core.LedgerEntry, err error) {
+	if l.onAppend != nil {
+		l.onAppend(e, err)
+	}
+}
+
+func (l *FileLedger) appendChained(fill func(seq int, prevHash string) any) error {
+	return l.underChainLock(func() error { return l.appendChainedLocked(fill) })
+}
+
+func (l *FileLedger) appendChainedLocked(fill func(seq int, prevHash string) any) error {
+	prevSeq, prevHash, err := l.readTip()
+	if err != nil {
+		return err
+	}
+	seq := 0
+	if prevHash == "" {
+		prevHash = ZeroSeed
+	} else {
+		seq = prevSeq + 1
+	}
+	return l.appendLineAndReplaceTip(fill(seq, prevHash), seq)
+}
+
+func (l *FileLedger) underChainLock(fn func() error) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	release, err := flock.Lock(l.lockPath)
+	if err != nil {
+		return fmt.Errorf("ledger: %w", err)
+	}
+	defer release()
+	return fn()
+}
+
+func (l *FileLedger) readSnapshot(read func() error) error {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	release, err := flock.LockShared(l.lockPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return read()
+	}
+	if err != nil {
+		return fmt.Errorf("ledger: %w", err)
+	}
+	defer release()
+	return read()
+}
+
+func (l *FileLedger) appendLineAndReplaceTip(entry any, seq int) error {
+	line, err := hooks.marshal(entry)
+	if err != nil {
+		return fmt.Errorf("ledger marshal: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(l.ledgerPath), 0o755); err != nil {
+		return fmt.Errorf("ledger mkdir: %w", err)
+	}
+	f, err := hooks.openF(l.ledgerPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("ledger open: %w", err)
+	}
+	if _, err := hooks.write(f, append(line, '\n')); err != nil {
+		_ = hooks.closeF(f)
+		return fmt.Errorf("ledger append: %w", err)
+	}
+	if err := hooks.closeF(f); err != nil {
+		return fmt.Errorf("ledger close: %w", err)
+	}
+
+	newHash := sha256Hex(line)
+	tip := ledgertip.Format(seq, newHash)
+	tmp := fmt.Sprintf("%s.tmp.%d", l.tipPath, os.Getpid())
+	if err := hooks.writeF(tmp, []byte(tip), 0o644); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("tip write: %w", err)
+	}
+	if err := os.Rename(tmp, l.tipPath); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("tip rename: %w", err)
+	}
+	return nil
+}
+
+type LifecycleRecord struct {
+	TS      string
+	Action  string
+	TaskID  string
+	Message string
+	GitHead string
+	Cycle   int
+}
+
+func (l *FileLedger) AppendLifecycle(ctx context.Context, r LifecycleRecord) error {
+	return l.Append(ctx, core.LedgerEntry{
+		TS:      r.TS,
+		Role:    "orchestrator",
+		Kind:    "inbox-lifecycle",
+		Action:  r.Action,
+		TaskID:  r.TaskID,
+		Message: r.Message,
+		GitHEAD: r.GitHead,
+		Cycle:   r.Cycle,
+	})
+}
+
+func (l *FileLedger) appendChainedFromTail(fill func(seq int, prevHash string) any) error {
+	return l.underChainLock(func() error {
+		raw, err := os.ReadFile(l.ledgerPath)
+		if err != nil {
+			return fmt.Errorf("ledger read: %w", err)
+		}
+		lines := splitLines(raw)
+		if len(lines) == 0 {
+			return fmt.Errorf("ledger: appendChainedFromTail on an empty chain")
+		}
+		prevHash := sha256Hex(lines[len(lines)-1])
+		prevSeq, _, err := l.readTip()
+		if err != nil {
+			return err
+		}
+		return l.appendLineAndReplaceTip(fill(prevSeq+1, prevHash), prevSeq+1)
+	})
+}
+
+func (l *FileLedger) Verify(ctx context.Context) error {
+	_, err := l.VerifyScope(ctx)
+	return err
+}
+
+func (l *FileLedger) VerifyScope(_ context.Context) (VerifiedScope, error) {
+	if _, err := os.Stat(l.ledgerPath); errors.Is(err, os.ErrNotExist) {
+		return VerifiedScope{}, nil
+	}
+	var live [][]byte
+	var seed []byte
+	var tip tipRead
+	var segErr error
+	err := l.readSnapshot(func() error {
+		raw, err := hooks.readF(l.ledgerPath)
+		tip = l.readTipFile()
+		if err != nil {
+			return err
+		}
+		live = splitLines(raw)
+		seed, segErr = l.sealedPredecessor(live)
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return VerifiedScope{}, nil
+		}
+		return VerifiedScope{}, fmt.Errorf("ledger read: %w", err)
+	}
+	if segErr != nil {
+		return VerifiedScope{}, segErr
+	}
+	if len(live) == 0 {
+		return VerifiedScope{}, nil
+	}
+	return l.verifyLive(seed, live, tip)
+}
+
+func (l *FileLedger) verifyLive(seed []byte, live [][]byte, tip tipRead) (VerifiedScope, error) {
+	lines := live
+	if seed != nil {
+		lines = append([][]byte{seed}, live...)
+	}
+	scope := liveScope(seed, lines, l.loadAnchorSHA())
+	lastSeq, lastSha, sawV837, err := walkChain(lines, scope.AnchorLineSHA, indexCompositionEvidence(l.evidence(), lines))
+	if err != nil {
+		return VerifiedScope{}, err
+	}
+	if !sawV837 {
+		return scope, nil
+	}
+	if err := tip.check(lastSeq, lastSha); err != nil {
+		return VerifiedScope{}, err
+	}
+	return scope, nil
+}
+
+func liveScope(seed []byte, lines [][]byte, fileAnchorSHA string) VerifiedScope {
+	anchorSHA, anchorSeq := effectiveAnchorSHA(lines, fileAnchorSHA)
+	if seed == nil || carriesLine(lines, anchorSHA) {
+		return VerifiedScope{AnchorLineSHA: anchorSHA, AnchorSeq: anchorSeq}
+	}
+	if anchorSHA, anchorSeq = effectiveAnchorSHA(lines, ""); anchorSHA != "" {
+		return VerifiedScope{AnchorLineSHA: anchorSHA, AnchorSeq: anchorSeq}
+	}
+	_, e, _ := decodeLedgerLine(seed)
+	return VerifiedScope{AnchorLineSHA: sha256Hex(seed), AnchorSeq: e.EntrySeq, FromSealedSegment: true}
+}
+
+func carriesLine(lines [][]byte, lineSHA string) bool {
+	if lineSHA == "" {
+		return false
+	}
+	_, found := epochStart(lines, lineSHA)
+	return found
+}
+
+func walkChain(lines [][]byte, anchorLineSHA string, evidence compositionEvidenceIndex) (lastSeq int, lastSha string, sawV837 bool, err error) {
+	start, found := epochStart(lines, anchorLineSHA)
+	if !found {
+		return 0, "", false, fmt.Errorf("%w: epoch anchor line not found (sha %s) — anchored content absent or altered", core.ErrLedgerChainBroken, anchorLineSHA)
+	}
+	c := chainCursor{seenPrev: map[string]struct{}{}}
+	if start > 0 {
+		c.lastSha = sha256Hex(lines[start-1])
+		c.sawV837 = true
+		if _, e, derr := decodeLedgerLine(lines[start-1]); derr == nil {
+			c.lastSeq = e.EntrySeq
+		}
+	}
+	for i := start; i < len(lines); i++ {
+		hasPrev, e, err := decodeLedgerLine(lines[i])
+		if err != nil {
+			return 0, "", false, fmt.Errorf("%w: line %d unmarshal: %v", core.ErrLedgerChainBroken, i, err)
+		}
+		if e.Kind == CompositionVerdictKind {
+			if cerr := verifyCompositionLine(i, lines[i], evidence); cerr != nil {
+				return 0, "", false, cerr
+			}
+		}
+		if hasPrev {
+			if err := c.acceptChained(i, e); err != nil {
+				return 0, "", false, err
+			}
+		} else {
+			c.prevLinePrev = ""
+		}
+		c.lastSha = sha256Hex(lines[i])
+	}
+	return c.lastSeq, c.lastSha, c.sawV837, nil
+}
+
+func epochStart(lines [][]byte, anchorLineSHA string) (start int, found bool) {
+	if anchorLineSHA == "" {
+		return 0, true
+	}
+	for i, line := range lines {
+		if sha256Hex(line) == anchorLineSHA {
+			return i + 1, true
+		}
+	}
+	return 0, false
+}
+
+type chainCursor struct {
+	lastSeq      int
+	lastSha      string
+	sawV837      bool
+	prevLinePrev string
+	seenPrev     map[string]struct{}
+}
+
+func (c *chainCursor) acceptChained(i int, e core.LedgerEntry) error {
+	isReGenesis := e.PrevHash == ZeroSeed && e.EntrySeq == 0
+	isForkSibling := c.prevLinePrev != "" && c.prevLinePrev != ZeroSeed && e.PrevHash == c.prevLinePrev
+	if c.sawV837 {
+		if e.PrevHash != c.lastSha && !isReGenesis && !isForkSibling {
+			return fmt.Errorf("%w: line %d prev_hash mismatch (have %s want %s)", core.ErrLedgerChainBroken, i, e.PrevHash, c.lastSha)
+		}
+	} else if !isReGenesis && e.PrevHash != c.lastSha {
+		return fmt.Errorf("%w: line %d chained-genesis prev_hash mismatch (have %s want zero seed or %s)", core.ErrLedgerChainBroken, i, e.PrevHash, c.lastSha)
+	}
+	if _, dup := c.seenPrev[e.PrevHash]; dup && c.sawV837 && !isReGenesis && !isForkSibling {
+		return fmt.Errorf("%w: line %d duplicate prev_hash (concurrent fan-out anomaly)", core.ErrLedgerChainBroken, i)
+	}
+	c.seenPrev[e.PrevHash] = struct{}{}
+	c.lastSeq = e.EntrySeq
+	c.sawV837 = true
+	c.prevLinePrev = e.PrevHash
+	return nil
+}
+
+func (l *FileLedger) evidence() ledgerartifacts.Store {
+	return ledgerartifacts.Open(filepath.Dir(l.ledgerPath))
+}
+
+type tipRead struct {
+	body []byte
+	err  error
+}
+
+func (l *FileLedger) readTipFile() tipRead {
+	body, err := hooks.readF(l.tipPath)
+	return tipRead{body: body, err: err}
+}
+
+func (t tipRead) check(lastSeq int, lastSha string) error {
+	if t.err != nil {
+		return fmt.Errorf("%w: tip read: %v", core.ErrLedgerChainBroken, t.err)
+	}
+	return compareTip(string(t.body), lastSeq, lastSha)
+}
+
+func compareTip(tip string, lastSeq int, lastSha string) error {
+	wantTip := ledgertip.Format(lastSeq, lastSha)
+	if tip != wantTip {
+		return fmt.Errorf("%w: tip mismatch (have %q want %q)", core.ErrLedgerChainBroken, tip, wantTip)
+	}
+	return nil
+}
+
+func decodeLedgerLine(line []byte) (hasPrevHash bool, e core.LedgerEntry, err error) {
+	if err = json.Unmarshal(line, &e); err != nil {
+		return false, e, err
+	}
+	var raw map[string]json.RawMessage
+	if err = json.Unmarshal(line, &raw); err != nil {
+		return false, e, err
+	}
+	_, hasPrevHash = raw["prev_hash"]
+	return hasPrevHash, e, nil
+}
+
+func (l *FileLedger) Iter(_ context.Context) (core.LedgerIterator, error) {
+	raw, err := os.ReadFile(l.ledgerPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return &lineIter{}, nil
+		}
+		return nil, fmt.Errorf("ledger read: %w", err)
+	}
+	return &lineIter{lines: splitLines(raw)}, nil
+}
+
+type lineIter struct {
+	lines [][]byte
+	i     int
+}
+
+func (it *lineIter) Next() (core.LedgerEntry, bool, error) {
+	if it.i >= len(it.lines) {
+		return core.LedgerEntry{}, false, nil
+	}
+	var e core.LedgerEntry
+	if err := json.Unmarshal(it.lines[it.i], &e); err != nil {
+		return core.LedgerEntry{}, false, fmt.Errorf("ledger iter line %d: %w", it.i, err)
+	}
+	it.i++
+	return e, true, nil
+}
+
+func (it *lineIter) Close() error { return nil }
+
+func (l *FileLedger) readTip() (seq int, sha string, err error) {
+	raw, err := os.ReadFile(l.tipPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, "", nil
+		}
+		return 0, "", fmt.Errorf("tip read: %w", err)
+	}
+	parts := splitTip(string(raw))
+	if len(parts) != 2 {
+		return 0, "", fmt.Errorf("tip malformed: %q", raw)
+	}
+	if _, scanErr := fmt.Sscanf(parts[0], "%d", &seq); scanErr != nil {
+		return 0, "", fmt.Errorf("tip seq parse: %w", scanErr)
+	}
+	return seq, parts[1], nil
+}
+
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+func splitLines(raw []byte) [][]byte {
+	var out [][]byte
+	start := 0
+	for i, b := range raw {
+		if b == '\n' {
+			if i > start {
+				out = append(out, raw[start:i])
+			}
+			start = i + 1
+		}
+	}
+	if start < len(raw) {
+		out = append(out, raw[start:])
+	}
+	return out
+}
+
+func splitTip(s string) []string {
+	if n := len(s); n > 0 && s[n-1] == '\n' {
+		s = s[:n-1]
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] == ':' {
+			return []string{s[:i], s[i+1:]}
+		}
+	}
+	return []string{s}
+}

@@ -1,0 +1,106 @@
+package cyclestate
+
+import (
+	"encoding/json"
+	"reflect"
+	"strings"
+	"testing"
+)
+
+func TestState_RoundTrip(t *testing.T) {
+	in := State{
+		LastUpdated:              "2026-06-21T00:00:00Z",
+		LastCycleNumber:          7,
+		Version:                  3,
+		CurrentBatch:             BatchAccrual{CycleAccruedCostUSD: 1.5, GoalHash: "abc"},
+		FailedAt:                 []FailedRecord{{Cycle: 6, Verdict: "FAIL", Defects: []string{"x"}}},
+		CarryoverTodos:           []CarryoverTodo{{ID: "t1", Action: "do", Priority: "high", FirstSeenCycle: 5}},
+		TriageThroughput:         []TriageThroughputEntry{{Cycle: 6, Floors: 2}},
+		StateRevision:            4,
+		LastAllocatedCycleNumber: 8,
+	}
+	b, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var out State
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !reflect.DeepEqual(in, out) {
+		t.Errorf("round-trip mismatch:\n in=%+v\nout=%+v", in, out)
+	}
+	for _, want := range []string{
+		`"lastCycleNumber"`, `"failedApproaches"`, `"carryoverTodos"`, `"currentBatch"`,
+		`"cycleAccruedCostUSD"`, `"retrospected"`, `"first_seen_cycle"`, `"floors"`,
+	} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("State JSON missing wire field %s; got %s", want, b)
+		}
+	}
+}
+
+func TestCycleState_RoundTrip(t *testing.T) {
+	in := CycleState{
+		CycleID:         9,
+		Phase:           "build",
+		StartedAt:       "t0",
+		PhaseStartedAt:  "t1",
+		ActiveAgent:     "builder",
+		ActiveWorktree:  "/wt",
+		CompletedPhases: []string{"scout", "tdd"},
+		WorkspacePath:   "/ws",
+		IntentRequired:  true,
+		RunID:           "01H",
+		WorktreeBaseSHA: "deadbeef",
+	}
+	b, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var out CycleState
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !reflect.DeepEqual(in, out) {
+		t.Errorf("round-trip mismatch:\n in=%+v\nout=%+v", in, out)
+	}
+	for _, want := range []string{`"cycle_id"`, `"worktree_base_sha"`, `"completed_phases"`, `"intent_required"`} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("CycleState JSON missing wire field %s; got %s", want, b)
+		}
+	}
+}
+
+func TestStateOmitempty(t *testing.T) {
+	b, err := json.Marshal(State{})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, absent := range []string{"failedApproaches", "carryoverTodos", "triageThroughput", "setupCompletedAt", "setupVersion", "stateRevision", "lastAllocatedCycleNumber"} {
+		if strings.Contains(string(b), absent) {
+			t.Errorf("zero State should omit %q; got %s", absent, b)
+		}
+	}
+}
+
+func TestState_HighestCycleNumberTakesTheLeaseOrTheCompletionCounter(t *testing.T) {
+	cases := []struct {
+		name            string
+		completed, mint int
+		want            int
+	}{
+		{"a lane stopped before it finalized", 1837, 1838, 1838},
+		{"a legacy state with no lease", 1836, 0, 1836},
+		{"a lease behind the completion counter", 1836, 1830, 1836},
+		{"a fresh state", 0, 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := State{LastCycleNumber: tc.completed, LastAllocatedCycleNumber: tc.mint}
+			if got := s.HighestCycleNumber(); got != tc.want {
+				t.Errorf("State{last %d, lease %d}.HighestCycleNumber() = %d, want %d", tc.completed, tc.mint, got, tc.want)
+			}
+		})
+	}
+}

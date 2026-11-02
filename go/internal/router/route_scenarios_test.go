@@ -1,0 +1,116 @@
+package router_test
+
+import (
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/config"
+	. "github.com/mickeyyaya/evolve-loop/go/internal/routingtest"
+)
+
+func TestKernelScenarios(t *testing.T) {
+	RunAll(t, kernelCatalog())
+}
+
+func kernelCatalog() []ScenarioSpec {
+	return []ScenarioSpec{
+		Scenario("start->scout default",
+			Pure(), At("start"), ExpectNext("scout"), ExpectReason("spine:scout")),
+		Scenario("start->intent when forced",
+			Pure(), At("start"), PhaseEnabled("intent", config.EnableOn),
+			ExpectNext("intent"), ExpectInserts("intent"), ExpectReason("forced-on:intent")),
+
+		Scenario("scout->tdd small",
+			Pure(), At("scout"), Done("scout"), SmallCycle(),
+			ExpectNext("tdd"), ExpectReason("conditional-pin:tdd")),
+		Scenario("scout->tdd medium skips triage",
+			Pure(), At("scout"), Done("scout"), MediumCycle(),
+			ExpectNext("tdd"), ExpectSkips("triage"), ExpectReason("conditional-pin:tdd")),
+		Scenario("scout->tdd large",
+			Pure(), At("scout"), Done("scout"), LargeCycle(),
+			ExpectNext("tdd"), ExpectReason("conditional-pin:tdd")),
+		Scenario("scout->build trivial skips tdd",
+			Pure(), At("scout"), Done("scout"), TrivialCycle(),
+			ExpectNext("build"), ExpectSkips("tdd"), ExpectReason("spine:build")),
+
+		Scenario("triage refines scout to tdd",
+			Pure(), At("triage"), Done("scout", "triage"), TrivialCycle(), TriageSize("medium"),
+			ExpectNext("tdd"), ExpectReason("conditional-pin:tdd")),
+
+		Scenario("build->tester on acs_red",
+			Pure(), At("build"), Done("scout", "tdd", "build"), RedBuild(2),
+			ExpectNext("tester"), ExpectInserts("tester"), ExpectReason("content-insert:tester")),
+		Scenario("build->audit on green skips tester",
+			Pure(), At("build"), Done("scout", "tdd", "build"), GreenBuild(),
+			ExpectNext("audit"), ExpectSkips("tester"), ExpectReason("spine:audit")),
+		Scenario("build->tester on severity HIGH",
+			Pure(), At("build"), Done("scout", "tdd", "build"), Severity("HIGH"), SeverityTrigger(),
+			ExpectNext("tester"), ExpectInserts("tester")),
+		Scenario("build severity MEDIUM below HIGH threshold",
+			Pure(), At("build"), Done("scout", "tdd", "build"), Severity("MEDIUM"), SeverityTrigger(),
+			ExpectNext("audit"), ExpectSkips("tester")),
+
+		Scenario("audit PASS->ship",
+			Pure(), At("audit"), Done("scout", "build", "audit"), CompletedVerdict("PASS"),
+			ExpectNext("ship"), ExpectReason("spine:ship")),
+		Scenario("audit WARN->ship",
+			Pure(), At("audit"), Done("scout", "build", "audit"), CompletedVerdict("WARN"),
+			ExpectNext("ship")),
+		Scenario("audit FAIL->retrospective",
+			Pure(), At("audit"), Done("scout", "build", "audit"), CompletedVerdict("FAIL"),
+			ExpectNext("retrospective"), ExpectReason("audit-fail-to-retrospective")),
+		Scenario("audit FAIL retro-off->end",
+			Pure(), At("audit"), Done("scout", "build", "audit"), CompletedVerdict("FAIL"),
+			PhaseEnabled("retrospective", config.EnableOff), ExpectNext("end")),
+
+		Scenario("mandatory clamp ship=off forced on",
+			Pure(), At("audit"), Done("scout", "build", "audit"), CompletedVerdict("PASS"),
+			PhaseEnabled("ship", config.EnableOff),
+			ExpectNext("ship"), ExpectClamp("mandatory-never-skipped")),
+		Scenario("max-insertions cap drops tester",
+			Pure(), At("build"), Done("scout", "tdd", "build", "plan-review"), RedBuild(5), MaxInserts(1),
+			ExpectNext("audit"), ExpectSkips("tester"), ExpectClamp("max-insertions-cap")),
+
+		Scenario("LLM agrees no clamp",
+			Pure(), At("build"), Done("scout", "tdd", "build"), GreenBuild(), Agent("build", "audit"),
+			ExpectNext("audit"), ExpectInvariants("proposal-never-weakens", "determinism")),
+		Scenario("LLM legal-divergent insert adopted",
+			Pure(), At("build"), Done("scout", "tdd", "build"), RedBuild(2), Agent("build", "tester"),
+			ExpectNext("tester"), ExpectInserts("tester")),
+		Scenario("LLM illegal ship-from-build clamped",
+			Pure(), At("build"), Done("scout", "tdd", "build"), GreenBuild(), Agent("build", "ship"),
+			ExpectNext("audit"), ExpectClamp("llm-proposal-clamped")),
+
+		Scenario("LLM justification captured when proposal agrees",
+			Pure(), At("build"), Done("scout", "tdd", "build"), GreenBuild(),
+			AgentJustified("build", "audit", "green build, proceed to audit"),
+			ExpectNext("audit"), ExpectJustification("green build")),
+		Scenario("LLM justification captured even when clamped (forbidden ship-skip-audit)",
+			Pure(), At("build"), Done("scout", "tdd", "build"), GreenBuild(),
+			AgentJustified("build", "ship", "looks fine, skip audit"),
+			ExpectNext("audit"), ExpectClamp("llm-proposal-clamped"),
+			ExpectJustification("skip audit")),
+	}
+}
+
+func TestKernelInvariants(t *testing.T) {
+	specs := Matrix(
+		[]Brick{Pure(), ExpectInvariants(
+			"proposal-never-weakens", "mandatory-never-skipped", "no-ship-before-audit",
+			"tdd-pin-nontrivial", "insert-le-cap", "determinism",
+		)},
+		Dim("at",
+			V("scout", At("scout"), Done("scout")),
+			V("build", At("build"), Done("scout", "tdd", "build")),
+			V("audit", At("audit"), Done("scout", "build", "audit"), CompletedVerdict("PASS")),
+		),
+		Dim("size", V("trivial", TrivialCycle()), V("medium", MediumCycle())),
+		Dim("build", V("green", GreenBuild()), V("red", RedBuild(3))),
+		Dim("agent",
+			V("none"),
+			V("ship", Agent("build", "ship")),
+			V("end", Agent("scout", "end")),
+			V("memo", Agent("build", "memo")),
+		),
+	)
+	RunAll(t, specs)
+}

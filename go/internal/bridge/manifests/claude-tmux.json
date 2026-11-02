@@ -1,0 +1,264 @@
+{
+  "schema_version": 1,
+  "cli": "claude-tmux",
+  "binary": "claude",
+  "probe_unsandboxed_reason": "A version, update, usage or doctor probe of claude reads and writes the CLI state under $HOME (~/.claude, ~/.claude.json and the install of the binary itself). The phase sandbox grants no write outside the cell, so the probe runs outside it.",
+  "install_roots": ["~/.local/share/claude/versions"],
+  "env_passthrough": ["CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "AWS_PROFILE", "AWS_REGION", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_BEARER_TOKEN_BEDROCK", "ANTHROPIC_VERTEX_PROJECT_ID", "CLOUD_ML_REGION", "GOOGLE_APPLICATION_CREDENTIALS", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "no_proxy", "all_proxy", "NODE_EXTRA_CA_CERTS"],
+  "model_family": "claude",
+  "parsers": {"pane": "claude-repl-v1"},
+  "collectors": {"tokens": "claude-jsonl-v1"},
+  "transcript": {"format": "claude-jsonl-v1"},
+  "capabilities": ["tools", "edit", "inprocess_subagents"],
+  "home_reads": ["~/.claude", "~/.claude.json"],
+  "context_window": 200000,
+  "binary_min_version": "2.1.0",
+  "update_argv": ["claude", "update"],
+  "transport": "tmux",
+  "default_tier": "hybrid",
+  "tier_dependencies": {
+    "full": [
+      "claude",
+      "tmux"
+    ],
+    "hybrid": [
+      "claude",
+      "tmux"
+    ],
+    "degraded": [
+      "claude"
+    ]
+  },
+  "prompt_marker": "❯",
+  "transient_regex": "(?i)(api error:\\s*5\\d{2}\\b|server-side issue,? usually temporary)",
+  "default_model": "haiku",
+  "default_args": ["--strict-mcp-config"],
+  "mcp_config_files": [".mcp.json"],
+  "default_env": {
+    "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION": "false"
+  },
+  "model_tier_map": {
+    "fast": "haiku",
+    "balanced": "sonnet",
+    "deep": "opus",
+    "top": "opus"
+  },
+  "model_freshness": {
+    "prefer": "alias",
+    "alias_ids": [
+      "opus",
+      "sonnet",
+      "haiku"
+    ],
+    "note": "claude resolves the bare family alias to that family's newest release at LAUNCH (verified 2026-07-27: --model opus -> canonicalModel claude-opus-5). The alias is strictly fresher than any concrete id the catalog could cache; caching opus-4.6 would FREEZE the version."
+  },
+  "params": {
+    "permission": {
+      "channel": "flag",
+      "values": {
+        "bypass": [
+          "--dangerously-skip-permissions"
+        ],
+        "plan": [
+          "--permission-mode",
+          "plan"
+        ],
+        "acceptEdits": [
+          "--permission-mode",
+          "acceptEdits"
+        ],
+        "default": [
+          "--permission-mode",
+          "default"
+        ],
+        "dontAsk": [
+          "--permission-mode",
+          "dontAsk"
+        ],
+        "auto": [
+          "--permission-mode",
+          "auto"
+        ]
+      }
+    },
+    "model_tier": {
+      "channel": "flag",
+      "flag": "--model",
+      "from": "model_tier_map"
+    },
+    "effort": {
+      "channel": "flag",
+      "flag": "--effort"
+    },
+    "settings_scope": {
+      "channel": "flag",
+      "values": {
+        "project": [
+          "--setting-sources",
+          "project",
+          "--settings",
+          "{\"skipDangerousModePermissionPrompt\":true}"
+        ]
+      },
+      "note": "project scope drops the user settings; --settings re-declares only the bypass acceptance (docs/architecture/packages/internal-bridge.md)"
+    },
+    "session_mode": {
+      "channel": "controller"
+    },
+    "system_prompt_file": {
+      "channel": "flag",
+      "flag": "--append-system-prompt-file"
+    },
+    "allowed_tools": {
+      "channel": "flag",
+      "flag": "--allowedTools"
+    },
+    "disallowed_tools": {
+      "channel": "flag",
+      "flag": "--disallowedTools"
+    }
+  },
+  "controls": {
+    "usage": {
+      "send": "/usage",
+      "await": "windows",
+      "exhausted_regex": "(?i)((?:reached|hit) your (usage|weekly) limit|you(?:.?ve| have) reached your .{1,40}? limit\\b.{0,40}?/usage-credits|usage limit reached|\\b0%\\s*(left|remaining)|out of (usage|credits)|upgrade to (a paid plan|continue))|(?im:^[\\t\\p{Zs}]*(?:⎿[\\t\\p{Zs}]*)?you(?:[’']ve| have) (?:hit|reached) your session limit[\\t\\p{Zs}]*[·—][\\t\\p{Zs}]*resets\\b)",
+      "drift_probe_regex": "(?i)(/usage-credits|(?:reached|hit) your|usage limit|weekly limit|rate.?limit|out of (usage|credits)|upgrade to|switch models with /model)",
+      "windows": {
+        "labels": [
+          {
+            "regex": "^\\s*Current session\\s*$",
+            "kind": "session",
+            "scope": "session"
+          },
+          {
+            "regex": "^\\s*Current week \\((?P<scope>[^)]+)\\)\\s*$",
+            "kind": "week"
+          }
+        ],
+        "value_regex": "(?P<pct>\\d{1,3}(?:\\.\\d+)?)%\\s*used",
+        "value_direction": "used",
+        "reset_regex": "^\\s*Resets\\s+(?P<reset>.+?)\\s*$",
+        "scopes": {
+          "session": {
+            "family": "claude"
+          },
+          "all models": {
+            "family": "claude"
+          },
+          "*": {
+            "family": "claude",
+            "per_model": true
+          }
+        }
+      }
+    },
+    "status": {
+      "send": "/status",
+      "await": "prompt_marker"
+    },
+    "clean_ctx": {
+      "send": "/clear"
+    },
+    "compact": {
+      "send": "/compact"
+    },
+    "model": {
+      "send": "/model"
+    },
+    "help": {
+      "send": "/help"
+    },
+    "exit": {
+      "send": "/exit"
+    }
+  },
+  "interactive_prompts": [
+    {
+      "name": "cli_feedback_rating",
+      "regex": "How's the CLI experience so far\\?|Help us improve:",
+      "response_keys": "0,Enter",
+      "policy": "auto_respond",
+      "once": true,
+      "note": "Quick feedback rating prompt from the CLI wrapper; '0' skips/cancels"
+    },
+    {
+      "name": "trust_prompt_cursor_on_no",
+      "regex": "(?s)❯ No, exit.{0,80}Yes, I trust this folder.{0,120}Enter to confirm · Esc to cancel\\s*\\z",
+      "response_keys": "Down",
+      "tail_lines": 12,
+      "policy": "auto_respond",
+      "note": "claude 2.1.252+ folder-trust dialog, unnumbered, cursor on its default '❯ No, exit'. NAVIGATION ONLY: one Down per tick, never Enter, so a lost keystroke costs a repeat instead of the REPL. Repeats while the cursor is still seen on No (a swallowed Down, or the live dialog's Down wrapping Yes back to No, verified on 2.1.285 on 2026-10-05); the loop guard bounds it, and a boot wait that trips the guard ends at once as a boot timeout (ExitREPLBootTimeout, a bench strike) rather than sending Enter. Confirmation is trust_prompt_cursor_on_yes's job alone. BOTTOM-ANCHORED (footer + \\z + tail_lines 12 + distance bounds) so tracked files quoting the dialog cannot self-match. PERMISSIVE ON PURPOSE: any frame with a cursor on No, a torn redraw that shows a cursor on both lines included, gets a Down and never an Enter. MUST PRECEDE trust_prompt_cursor_on_yes and trust_prompt: the three are disjoint on every frame the dialog renders, but text no build renders can match two of them, and first-match order then resolves it to navigation, never confirmation. Replaces the blind Down,Enter burst (trust_prompt_no_default) that lost its Down and confirmed No at wave 59's preflight. Source: docs/incidents/2026-09-01-claude-2252-trust-default-flip.md"
+    },
+    {
+      "name": "trust_prompt_cursor_on_yes",
+      "regex": "(?sm)^[ \\t]*No, exit[ \\t]*\\n[ \\t]*❯ Yes, I trust this folder.{0,120}Enter to confirm · Esc to cancel\\s*\\z",
+      "response_keys": "Enter",
+      "tail_lines": 12,
+      "policy": "auto_respond",
+      "note": "claude 2.1.252+ folder-trust dialog, unnumbered, cursor verifiably on '❯ Yes, I trust this folder' (after trust_prompt_cursor_on_no's Down landed). The only rule that confirms this dialog, so Enter is sent only on a capture that shows the cursor on Yes; an Enter can therefore only ever confirm Yes, and repeating it on a lost Enter is safe (the loop guard bounds it). Live on 2.1.285 the dialog is gone 250 ms after the Enter and the REPL marker shows within 1 s, inside one boot tick. BOTTOM-ANCHORED like its sibling. STRICT ON PURPOSE: it requires the 'No, exit' line with no cursor directly above an unnumbered '❯ Yes' line, so a torn redraw with a cursor on both lines is left to trust_prompt_cursor_on_no's Down. It never matches a frame the numbered trust_prompt matches (that one needs '❯ 1. Yes'). Source: docs/incidents/2026-09-01-claude-2252-trust-default-flip.md"
+    },
+    {
+      "name": "trust_prompt",
+      "regex": "(?sm)^[ \\t]*❯ 1\\.\\s+Yes, I trust this folder.{0,120}^[ \\t]*Enter to confirm[^\\n]{0,40}\\s*\\z",
+      "response_keys": "Enter",
+      "tail_lines": 12,
+      "policy": "auto_respond",
+      "once": true,
+      "note": "claude v2.1.193 folder-trust dialog (numbered options, Yes pre-highlighted): one Enter confirms Yes, verified live 2026-06-26. Kept for older builds; v2.1.252+'s unnumbered No-default dialog is trust_prompt_cursor_on_no / trust_prompt_cursor_on_yes above — on every frame the dialogs render, the three regexes are disjoint (this one requires the numbered ❯ 1. Yes line; those require the unnumbered ❯ No, exit, or an uncursored No, exit line directly above an unnumbered ❯ Yes). Order still matters as the tiebreak for text no build renders: the navigation rule comes first, so ambiguity sends Down, never Enter. BOTTOM-ANCHORED on the Enter-to-confirm footer + tail_lines per the plan_approval discipline (2026-09-02: the unanchored form self-matched this repo's own tracked files when rendered by an agent — see the self-match guard test). LINE-ANCHORED (2026-10-05): the cursor line and the footer must each begin a line, because the self-match guard now slides the pane bottom over every line of the tracked files and found two test source lines that quote this dialog flattened with \\n escapes; a source line is not the dialog. The ❯ cursor collides with the REPL marker, so tickDuringBoot dismisses it before prompt delivery. once:true — lingering-scrollback discipline. Source: docs/incidents/2026-09-01-claude-2252-trust-default-flip.md"
+    },
+    {
+      "name": "askuserquestion_multiselect",
+      "regex": "(?s)\\[ \\].*Enter to select",
+      "response_keys": "Enter,Right,Enter",
+      "policy": "auto_respond",
+      "note": "claude AskUserQuestion multiSelect: '[ ]' checkboxes + the 'Enter to select' menu footer. Verified 2026-05-26: Enter toggles the highlighted checkbox, Right moves to the Submit tab, Enter submits → recommended_or_first (keystrokes are PACED — see autoRespondInterKeyPause). Requires BOTH a '[ ]' checkbox AND the menu footer so a bare markdown checklist in agent output ('1. [ ] do thing') does NOT false-match, and so the rule keeps matching after the first checkbox toggles (other rows stay '[ ]') — enabling a retry if the first submit misses. MUST precede askuserquestion_select: a multi-select pane also contains that footer, so the checkbox rule must win (first-match). --dangerously-skip-permissions does NOT suppress this (a question is not a permission)."
+    },
+    {
+      "name": "askuserquestion_select",
+      "regex": "Enter to select.*navigate",
+      "response_keys": "Enter",
+      "policy": "auto_respond",
+      "note": "claude AskUserQuestion single-select: first option pre-highlighted ('❯ 1.'); footer 'Enter to select · ↑/↓ to navigate · Esc to cancel'. Verified 2026-05-26: a single Enter selects the highlighted first option = recommended_or_first. Layer-2 net behind the prompt-prefix interactive policy (Layer 1)."
+    },
+    {
+      "name": "auth_recheck",
+      "regex": "Please log in|Authentication required|Login expired",
+      "response_keys": null,
+      "policy": "escalate",
+      "note": "Bridge cannot complete OAuth; escalate to operator"
+    },
+    {
+      "name": "rate_limit",
+      "regex": "(usage|rate)[ -]limit (reached|exceeded|hit)|too many requests",
+      "response_keys": null,
+      "policy": "escalate",
+      "note": "Operator decides retry vs abandon"
+    },
+    {
+      "name": "model_deprecation_continue",
+      "regex": "model is deprecated.*[Cc]ontinue",
+      "response_keys": "y,Enter",
+      "policy": "auto_respond",
+      "note": "Common edge case on model rollover; comma-separated key names"
+    },
+    {
+      "name": "terminal_resize_redraw",
+      "regex": "Terminal too small.*resize",
+      "response_keys": "Enter",
+      "policy": "auto_respond",
+      "note": "Cosmetic redraw prompt; just press Enter"
+    },
+    {
+      "name": "plan_approval",
+      "regex": "(?s)ready to execute\\. Would you like to proceed\\?.{0,400}2\\.\\s+Yes, manually approve edits.{0,300}ctrl\\+g to edit in Vim.{0,200}\\.md\\s*\\z",
+      "response_keys": "Enter",
+      "tail_lines": 9,
+      "policy": "auto_respond",
+      "note": "ExitPlanMode approval. Enter accepts the pre-highlighted option 1, an approval in both observed launch-mode variants. BOTTOM-ANCHORED (\\z): a live dialog is always at the END of the capture, so scrollback that has scrolled up - including this repo's OWN docs and test fixtures, which quote the dialog verbatim on tracked files an agent may cat - cannot match. That single anchor closes the self-match, the answered-dialog re-fire, and the diff-line-deletion attacks together; distance bounds alone did not (a matcher that DELETES lines can shrink any gap). Tail bound 400 (live: 155, and the footer carries a variable-length plan path). Response is a bare Enter, NOT the explicit '1,Enter' the per_edit_approval note argues for: Enter is what was verified live against this dialog and '1' as a hotkey was not, and shipping an unverified keystroke is the exact class of error this rule exists to prevent. Source: docs/incidents/2026-08-27-plan-mode-dialog-blind-spot.md."
+    }
+  ],
+  "_notes_on_removed_patterns": {
+    "fact_forcing_gate": "REMOVED v12.1.5 after live-smoke forensics (workspace bridge-t7-G3mPzn). The ECC gateguard PreToolUse hook fires once per Write attempt and Claude recovers natively — it presents the 4 requested facts and retries the Write. Neither extend_timeout nor auto_respond is appropriate: extend_timeout doesn't help (Claude isn't slow, it's just sequencing tool calls), and auto_respond stacks identical messages at the prompt every poll-tick because the gate error remains visible in pane scrollback, interfering with Claude's own recovery. The correct bridge behavior is no rule — let Claude handle the hook natively. Re-introduce only with dedupe logic that suppresses re-fires within a single agent turn (v12.1.6+ design)."
+  }
+}

@@ -1,0 +1,323 @@
+package llmroute
+
+import (
+	"errors"
+	"os"
+	"reflect"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/policy"
+	"github.com/mickeyyaya/evolve-loop/go/internal/profiles"
+)
+
+func TestMain(m *testing.M) {
+	os.Unsetenv("EVOLVE_CLI")
+	os.Exit(m.Run())
+}
+
+func TestResolve_TheCLIOverrideBeatsTheProfileAndThePerAgentEnvIsNotRead(t *testing.T) {
+	prof := &profiles.Profile{CLI: "codex-tmux"}
+	env := map[string]string{"EVOLVE_AUDITOR_CLI": "agy-tmux"}
+	if got := Resolve("auditor", "audit", "auto", env, AgentOverride{}, prof, nil, nil); got.Candidates[0] != "codex-tmux" {
+		t.Errorf("primary=%q, want the profile codex-tmux: EVOLVE_AUDITOR_CLI is not read", got.Candidates[0])
+	}
+	got := Resolve("auditor", "audit", "auto", env, AgentOverride{CLI: "claude-tmux"}, prof, nil, nil)
+	if got.Candidates[0] != "claude-tmux" || got.PrimarySource != "--cli auditor" {
+		t.Errorf("got %q/%q, want claude-tmux/--cli auditor", got.Candidates[0], got.PrimarySource)
+	}
+	if !IsOperatorChoice(got.PrimarySource) || !IsOperatorChoice("env(EVOLVE_CLI)") || IsOperatorChoice("profile.auditor.cli") {
+		t.Error("IsOperatorChoice must hold for the --cli and the env sources only")
+	}
+}
+
+func TestResolve_GlobalEnvBeatsProfile(t *testing.T) {
+	prof := &profiles.Profile{CLI: "codex-tmux"}
+	env := map[string]string{"EVOLVE_CLI": "agy-tmux"}
+	got := Resolve("auditor", "audit", "auto", env, AgentOverride{}, prof, nil, nil)
+	if got.Candidates[0] != "agy-tmux" || got.PrimarySource != "env(EVOLVE_CLI)" {
+		t.Errorf("got %q/%q, want agy-tmux/env(EVOLVE_CLI)", got.Candidates[0], got.PrimarySource)
+	}
+}
+
+func TestResolve_PerAgentBeatsGlobalEnv(t *testing.T) {
+	prof := &profiles.Profile{CLI: "codex-tmux"}
+	env := map[string]string{"EVOLVE_CLI": "agy-tmux"}
+	got := Resolve("auditor", "audit", "auto", env, AgentOverride{CLI: "claude-tmux"}, prof, nil, nil)
+	if got.Candidates[0] != "claude-tmux" {
+		t.Errorf("primary=%q, want claude-tmux (per-agent beats global)", got.Candidates[0])
+	}
+}
+
+func TestResolve_ProfileUsedWhenNoEnv(t *testing.T) {
+	prof := &profiles.Profile{CLI: "codex-tmux"}
+	got := Resolve("auditor", "audit", "auto", nil, AgentOverride{}, prof, nil, nil)
+	if got.Candidates[0] != "codex-tmux" || got.PrimarySource != "profile.auditor.cli" {
+		t.Errorf("got %q/%q, want codex-tmux/profile.auditor.cli", got.Candidates[0], got.PrimarySource)
+	}
+}
+
+func TestResolve_DefaultWhenAllEmpty(t *testing.T) {
+	got := Resolve("auditor", "audit", "auto", nil, AgentOverride{}, nil, nil, nil)
+	if got.Candidates[0] != "claude-tmux" || got.PrimarySource != "default" {
+		t.Errorf("got %q/%q, want claude-tmux/default", got.Candidates[0], got.PrimarySource)
+	}
+}
+
+func TestResolve_FallbackDedup(t *testing.T) {
+	prof := &profiles.Profile{CLI: "codex-tmux", CLIFallback: []string{"codex-tmux", "claude-tmux", "agy-tmux"}}
+	got := Resolve("auditor", "audit", "auto", nil, AgentOverride{}, prof, nil, nil)
+	want := []string{"codex-tmux", "claude-tmux", "agy-tmux"}
+	if !reflect.DeepEqual(got.Candidates, want) {
+		t.Errorf("candidates=%v, want %v (primary dedup'd)", got.Candidates, want)
+	}
+}
+
+func TestResolve_FallbackDedupPreservesOrder(t *testing.T) {
+	prof := &profiles.Profile{CLI: "codex-tmux", CLIFallback: []string{"claude-tmux", "agy-tmux", "claude-tmux"}}
+	got := Resolve("auditor", "audit", "auto", nil, AgentOverride{}, prof, nil, nil)
+	want := []string{"codex-tmux", "claude-tmux", "agy-tmux"}
+	if !reflect.DeepEqual(got.Candidates, want) {
+		t.Errorf("candidates=%v, want %v", got.Candidates, want)
+	}
+}
+
+func TestResolve_DefaultTriggers(t *testing.T) {
+	prof := &profiles.Profile{CLI: "codex-tmux"}
+	got := Resolve("auditor", "audit", "auto", nil, AgentOverride{}, prof, nil, nil)
+	want := []int{80, 81, 85, 87, 124, 127}
+	if !reflect.DeepEqual(got.Triggers, want) {
+		t.Errorf("triggers=%v, want %v", got.Triggers, want)
+	}
+}
+
+func TestResolve_CustomTriggers(t *testing.T) {
+	prof := &profiles.Profile{CLI: "codex-tmux", CLIFallbackOnExit: []int{80, 127, 81, 2}}
+	got := Resolve("auditor", "audit", "auto", nil, AgentOverride{}, prof, nil, nil)
+	if !reflect.DeepEqual(got.Triggers, []int{80, 127, 81, 2}) {
+		t.Errorf("triggers=%v, want operator-extended list", got.Triggers)
+	}
+}
+
+func TestResolve_TrimsWhitespace(t *testing.T) {
+	prof := &profiles.Profile{CLI: "codex-tmux", CLIFallback: []string{"  claude-tmux\n", "\tagy-tmux ", "  "}}
+	got := Resolve("auditor", "audit", "auto", nil, AgentOverride{}, prof, nil, nil)
+	want := []string{"codex-tmux", "claude-tmux", "agy-tmux"}
+	if !reflect.DeepEqual(got.Candidates, want) {
+		t.Errorf("candidates=%v, want %v (whitespace stripped, empty rejected)", got.Candidates, want)
+	}
+}
+
+func TestPlan_TriggersFallback(t *testing.T) {
+	p := Plan{Triggers: []int{80, 127}}
+	cases := []struct {
+		exit int
+		want bool
+	}{
+		{0, false}, {80, true}, {81, false}, {127, true}, {2, false}, {1, false},
+	}
+	for _, tc := range cases {
+		if got := p.TriggersFallback(tc.exit); got != tc.want {
+			t.Errorf("TriggersFallback(%d)=%v, want %v", tc.exit, got, tc.want)
+		}
+	}
+}
+
+func TestProbe_DemotesMissingBinary(t *testing.T) {
+	p := Plan{Candidates: []string{"codex-tmux", "claude-tmux"}, Triggers: []int{80}, Model: "sonnet"}
+	lookPath := func(bin string) (string, error) {
+		if bin == "claude" {
+			return "/usr/bin/claude", nil
+		}
+		return "", errors.New("not found")
+	}
+	got := Probe(p, lookPath)
+	want := []string{"claude-tmux", "codex-tmux"}
+	if !reflect.DeepEqual(got.Candidates, want) {
+		t.Errorf("candidates=%v, want %v (missing demoted)", got.Candidates, want)
+	}
+	if got.Model != "sonnet" || got.PrimarySource != p.PrimarySource {
+		t.Errorf("Probe dropped non-candidate fields: %+v", got)
+	}
+}
+
+func TestProbe_AllMissingKeepsOrder(t *testing.T) {
+	p := Plan{Candidates: []string{"codex-tmux", "claude-tmux"}}
+	got := Probe(p, func(string) (string, error) { return "", errors.New("nope") })
+	if !reflect.DeepEqual(got.Candidates, []string{"codex-tmux", "claude-tmux"}) {
+		t.Errorf("all-missing should keep order, got %v", got.Candidates)
+	}
+}
+
+func TestProbe_SingleCandidateUnchanged(t *testing.T) {
+	p := Plan{Candidates: []string{"codex-tmux"}}
+	got := Probe(p, func(string) (string, error) { return "", errors.New("nope") })
+	if !reflect.DeepEqual(got.Candidates, []string{"codex-tmux"}) {
+		t.Errorf("single candidate must be unchanged, got %v", got.Candidates)
+	}
+}
+
+func TestProbe_AllAvailableNoReorder(t *testing.T) {
+	p := Plan{Candidates: []string{"codex-tmux", "claude-tmux", "agy-tmux"}}
+	got := Probe(p, func(string) (string, error) { return "/usr/bin/x", nil })
+	if !reflect.DeepEqual(got.Candidates, p.Candidates) {
+		t.Errorf("all-present must not reorder, got %v", got.Candidates)
+	}
+}
+
+func TestProbe_MultipleMissingPreservesRelativeOrder(t *testing.T) {
+	p := Plan{Candidates: []string{"codex-tmux", "claude-tmux", "agy-tmux", "ollama-tmux"}}
+	present := map[string]bool{"claude": true, "ollama": true}
+	got := Probe(p, func(bin string) (string, error) {
+		if present[bin] {
+			return "/usr/bin/" + bin, nil
+		}
+		return "", errors.New("missing")
+	})
+	want := []string{"claude-tmux", "ollama-tmux", "codex-tmux", "agy-tmux"}
+	if !reflect.DeepEqual(got.Candidates, want) {
+		t.Errorf("candidates=%v, want %v (relative order preserved within available/missing)", got.Candidates, want)
+	}
+}
+
+func TestProbe_UnknownCLIKeepsPosition(t *testing.T) {
+	p := Plan{Candidates: []string{"mystery-cli", "claude-tmux"}}
+	got := Probe(p, func(bin string) (string, error) {
+		if bin == "claude" {
+			return "/usr/bin/claude", nil
+		}
+		return "", errors.New("missing")
+	})
+	if !reflect.DeepEqual(got.Candidates, []string{"mystery-cli", "claude-tmux"}) {
+		t.Errorf("unknown CLI should keep position, got %v", got.Candidates)
+	}
+}
+
+func TestProbe_NilLookPathDefaultsToExecLookPath(t *testing.T) {
+	p := Plan{Candidates: []string{"codex-tmux", "claude-tmux"}}
+	got := Probe(p, nil)
+	if len(got.Candidates) != 2 {
+		t.Errorf("nil lookPath: got %d candidates, want 2", len(got.Candidates))
+	}
+}
+
+func TestResolve_ModelEnvBeatsProfileAndDefault(t *testing.T) {
+	prof := &profiles.Profile{CLI: "claude-tmux", ModelTierDefault: "sonnet"}
+	env := map[string]string{"EVOLVE_AUDITOR_MODEL": "haiku"}
+	got := Resolve("auditor", "audit", "auto", env, AgentOverride{Model: "opus"}, prof, nil, nil)
+	if got.Model != "opus" {
+		t.Errorf("Model=%q, want opus (the --model override beats profile + default; the env is not read)", got.Model)
+	}
+}
+
+func TestResolve_ModelProfileTierBeatsDefault(t *testing.T) {
+	prof := &profiles.Profile{CLI: "claude-tmux", ModelTierDefault: "sonnet"}
+	got := Resolve("auditor", "audit", "auto", nil, AgentOverride{}, prof, nil, nil)
+	if got.Model != "sonnet" {
+		t.Errorf("Model=%q, want sonnet (profile tier beats default 'auto')", got.Model)
+	}
+}
+
+func TestResolve_ModelDefaultWhenNoEnvNoProfile(t *testing.T) {
+	got := Resolve("auditor", "audit", "opus", nil, AgentOverride{}, nil, nil, nil)
+	if got.Model != "opus" {
+		t.Errorf("Model=%q, want opus (the supplied default)", got.Model)
+	}
+}
+
+func TestResolve_AutoExpandedViaSeam(t *testing.T) {
+	gotRole := ""
+	autoExpand := func(role string) (string, bool) {
+		gotRole = role
+		return "claude-opus-4-7", true
+	}
+	got := Resolve("auditor", "audit", "auto", nil, AgentOverride{}, nil, autoExpand, nil)
+	if got.Model != "claude-opus-4-7" {
+		t.Errorf("Model=%q, want claude-opus-4-7 (auto expanded)", got.Model)
+	}
+	if gotRole != "audit" {
+		t.Errorf("autoExpand role=%q, want audit (phase, not agent)", gotRole)
+	}
+}
+
+func TestResolve_AutoSeamFailureKeepsAuto(t *testing.T) {
+	autoExpand := func(role string) (string, bool) { return "", false }
+	got := Resolve("auditor", "audit", "auto", nil, AgentOverride{}, nil, autoExpand, nil)
+	if got.Model != "auto" {
+		t.Errorf("Model=%q, want auto unchanged when expander returns ok=false", got.Model)
+	}
+}
+
+func TestResolve_NonAutoModelNotExpanded(t *testing.T) {
+	called := false
+	autoExpand := func(role string) (string, bool) { called = true; return "x", true }
+	prof := &profiles.Profile{CLI: "claude-tmux", ModelTierDefault: "sonnet"}
+	got := Resolve("auditor", "audit", "auto", nil, AgentOverride{}, prof, autoExpand, nil)
+	if got.Model != "sonnet" {
+		t.Errorf("Model=%q, want sonnet", got.Model)
+	}
+	if called {
+		t.Error("autoExpand must not be called when model is already concrete (sonnet)")
+	}
+}
+
+func TestResolve_PinCLIOverridesEnv(t *testing.T) {
+	prof := &profiles.Profile{CLI: "agy-tmux"}
+	pin := &policy.Pin{CLI: "claude-tmux"}
+	got := Resolve("auditor", "audit", "auto", nil, AgentOverride{CLI: "agy-tmux"}, prof, nil, pin)
+	if got.Candidates[0] != "claude-tmux" || got.PrimarySource != "policy.pin" {
+		t.Errorf("got %q/%q, want claude-tmux/policy.pin (pin beats env)", got.Candidates[0], got.PrimarySource)
+	}
+}
+
+func TestResolve_PinModelBypassesAutoExpand(t *testing.T) {
+	called := false
+	autoExpand := func(role string) (string, bool) { called = true; return "x", true }
+	pin := &policy.Pin{Model: "claude-opus-4-8"}
+	got := Resolve("auditor", "audit", "auto", nil, AgentOverride{}, nil, autoExpand, pin)
+	if got.Model != "claude-opus-4-8" {
+		t.Errorf("Model=%q, want claude-opus-4-8 (pin absolute)", got.Model)
+	}
+	if called {
+		t.Error("autoExpand must NOT be called when model is pinned (no wasted resolvellm/catalog lookup)")
+	}
+}
+
+func TestResolve_PinPreservesProfileFallbackChain(t *testing.T) {
+	prof := &profiles.Profile{CLI: "agy-tmux", CLIFallback: []string{"codex-tmux", "agy-tmux"}}
+	pin := &policy.Pin{CLI: "claude-tmux"}
+	got := Resolve("auditor", "audit", "auto", nil, AgentOverride{}, prof, nil, pin)
+	want := []string{"claude-tmux", "codex-tmux", "agy-tmux"}
+	if !reflect.DeepEqual(got.Candidates, want) {
+		t.Errorf("candidates=%v, want %v (pin primary + profile fallback)", got.Candidates, want)
+	}
+}
+
+func TestResolve_PinCLIOnlyLeavesModelNormal(t *testing.T) {
+	prof := &profiles.Profile{CLI: "agy-tmux", ModelTierDefault: "sonnet"}
+	pin := &policy.Pin{CLI: "claude-tmux"}
+	got := Resolve("auditor", "audit", "auto", nil, AgentOverride{}, prof, nil, pin)
+	if got.Model != "sonnet" {
+		t.Errorf("Model=%q, want sonnet (CLI-only pin leaves model to normal chain)", got.Model)
+	}
+}
+
+func TestResolve_PinBaseFamilyNormalizesToDefaultDriver(t *testing.T) {
+	for _, tc := range []struct{ pinCLI, want string }{
+		{"codex", "codex-tmux"},
+		{"claude", "claude-tmux"},
+		{"agy", "agy-tmux"},
+		{"ollama", "ollama-tmux"},
+		{"codex-tmux", "codex-tmux"},
+		{"claude-tmux", "claude-tmux"},
+		{"claude-p", "claude-p"},
+	} {
+		pin := &policy.Pin{CLI: tc.pinCLI}
+		got := Resolve("scout", "scout", "auto", nil, AgentOverride{}, nil, nil, pin)
+		if got.Candidates[0] != tc.want {
+			t.Errorf("pin cli=%q: primary=%q, want %q", tc.pinCLI, got.Candidates[0], tc.want)
+		}
+		if got.PrimarySource != "policy.pin" {
+			t.Errorf("pin cli=%q: source=%q, want policy.pin", tc.pinCLI, got.PrimarySource)
+		}
+	}
+}

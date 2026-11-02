@@ -1,0 +1,808 @@
+package core
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/derived"
+	"github.com/mickeyyaya/evolve-loop/go/internal/gittest"
+)
+
+type scriptedGit struct {
+	calls   [][]string
+	respond func(args []string) (string, int, error)
+}
+
+func (s *scriptedGit) capture(_ context.Context, _ string, args ...string) (string, int, error) {
+	s.calls = append(s.calls, append([]string(nil), args...))
+	return s.respond(args)
+}
+
+func (s *scriptedGit) ran(want ...string) bool {
+	needle := strings.Join(want, " ")
+	for _, c := range s.calls {
+		if strings.Contains(strings.Join(c, " "), needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func joined(args []string) string { return strings.Join(args, " ") }
+
+const cflags = "docs/architecture/control-flags.md"
+
+func recordingRegen(failOn string) (func(context.Context, string, string) error, *[]string) {
+	var got []string
+	fn := func(_ context.Context, _ string, p string) error {
+		got = append(got, p)
+		if p == failOn {
+			return errors.New("regen boom")
+		}
+		return nil
+	}
+	return fn, &got
+}
+
+func TestRebaseWithDerivedRegen_CleanRebase(t *testing.T) {
+	t.Parallel()
+
+	g := &scriptedGit{respond: func(args []string) (string, int, error) {
+		if joined(args) != "rebase main" {
+			t.Fatalf("clean rebase should issue only 'rebase main', got %q", joined(args))
+		}
+		return "", 0, nil
+	}}
+	regen, got := recordingRegen("")
+	ok, conflicts := rebaseWithDerivedRegen(context.Background(), "/wt", g.capture, regen, derivedEntryOf)
+	if !ok || len(conflicts) > 0 {
+		t.Fatalf("want (true,false), got (%v,%v)", ok, conflicts)
+	}
+	if len(*got) != 0 {
+		t.Fatalf("regen must not run on a clean rebase, ran for %v", *got)
+	}
+}
+
+func TestRebaseWithDerivedRegen_AllDerivedConflict_Resolves(t *testing.T) {
+	t.Parallel()
+
+	g := &scriptedGit{}
+	g.respond = func(args []string) (string, int, error) {
+		j := joined(args)
+		switch {
+		case j == "rebase main":
+			return "", 1, nil
+		case strings.HasPrefix(j, "diff --name-only --diff-filter=U"):
+			return cflags + "\x00", 0, nil
+		case strings.HasPrefix(j, "ls-files "):
+			return cflags + "\x00", 0, nil
+		case strings.HasPrefix(j, "add -A -- "):
+			return "", 0, nil
+		case strings.Contains(j, "rebase --continue"):
+			return "", 0, nil
+		}
+		t.Fatalf("unexpected git call %q", j)
+		return "", 0, nil
+	}
+	regen, got := recordingRegen("")
+	ok, conflicts := rebaseWithDerivedRegen(context.Background(), "/wt", g.capture, regen, derivedEntryOf)
+	if !ok || len(conflicts) > 0 {
+		t.Fatalf("want (true,false), got (%v,%v)", ok, conflicts)
+	}
+	if len(*got) != 1 || (*got)[0] != "flag-index" {
+		t.Fatalf("regen entries = %v, want [flag-index]", *got)
+	}
+	if !g.ran("add", "-A", "--", cflags) {
+		t.Fatal("must `git add` the regenerated derived artifact")
+	}
+	if !g.ran("rebase", "--continue") {
+		t.Fatal("must continue the rebase after resolving")
+	}
+	if g.ran("rebase", "--abort") {
+		t.Fatal("must NOT abort when all conflicts are derived + resolved")
+	}
+}
+
+func TestRebaseWithDerivedRegen_NonDerivedConflict_AbortsToDebugger(t *testing.T) {
+	t.Parallel()
+
+	g := &scriptedGit{}
+	g.respond = func(args []string) (string, int, error) {
+		j := joined(args)
+		switch {
+		case j == "rebase main":
+			return "", 1, nil
+		case strings.HasPrefix(j, "diff --name-only --diff-filter=U"):
+			return "go/internal/flagregistry/registry_table.go\x00", 0, nil
+		case strings.Contains(j, "rebase --abort"):
+			return "", 0, nil
+		}
+		t.Fatalf("unexpected git call %q (must not regen/continue a real conflict)", j)
+		return "", 0, nil
+	}
+	regen, got := recordingRegen("")
+	ok, conflicts := rebaseWithDerivedRegen(context.Background(), "/wt", g.capture, regen, derivedEntryOf)
+	if ok || len(conflicts) == 0 {
+		t.Fatalf("want (false,true) for a real SSOT conflict, got (%v,%v)", ok, conflicts)
+	}
+	if len(*got) != 0 {
+		t.Fatalf("regen must NOT run on a non-derived conflict, ran for %v", *got)
+	}
+	if !g.ran("rebase", "--abort") {
+		t.Fatal("must abort a non-derived conflict so it routes to the debugger")
+	}
+}
+
+func TestRebaseWithDerivedRegen_MixedConflict_Aborts(t *testing.T) {
+	t.Parallel()
+
+	g := &scriptedGit{}
+	g.respond = func(args []string) (string, int, error) {
+		j := joined(args)
+		switch {
+		case j == "rebase main":
+			return "", 1, nil
+		case strings.HasPrefix(j, "diff --name-only --diff-filter=U"):
+			return cflags + "\x00go/internal/core/orchestrator.go\x00", 0, nil
+		case strings.Contains(j, "rebase --abort"):
+			return "", 0, nil
+		}
+		t.Fatalf("unexpected git call %q", j)
+		return "", 0, nil
+	}
+	regen, got := recordingRegen("")
+	ok, conflicts := rebaseWithDerivedRegen(context.Background(), "/wt", g.capture, regen, derivedEntryOf)
+	if ok || len(conflicts) == 0 {
+		t.Fatalf("want (false,true) when ANY conflict is non-derived, got (%v,%v)", ok, conflicts)
+	}
+	if len(*got) != 0 {
+		t.Fatalf("regen must not run when the set is not all-derived, ran for %v", *got)
+	}
+}
+
+func TestRebaseWithDerivedRegen_MultiCommitDerivedConflicts_Resolves(t *testing.T) {
+	t.Parallel()
+
+	continues := 0
+	g := &scriptedGit{}
+	g.respond = func(args []string) (string, int, error) {
+		j := joined(args)
+		switch {
+		case j == "rebase main":
+			return "", 1, nil
+		case strings.HasPrefix(j, "diff --name-only --diff-filter=U"):
+			return cflags + "\x00", 0, nil
+		case strings.HasPrefix(j, "ls-files "):
+			return cflags + "\x00", 0, nil
+		case strings.HasPrefix(j, "add -A -- "):
+			return "", 0, nil
+		case strings.Contains(j, "rebase --continue"):
+			continues++
+			if continues == 1 {
+				return "", 1, nil
+			}
+			return "", 0, nil
+		}
+		t.Fatalf("unexpected git call %q", j)
+		return "", 0, nil
+	}
+	regen, got := recordingRegen("")
+	ok, conflicts := rebaseWithDerivedRegen(context.Background(), "/wt", g.capture, regen, derivedEntryOf)
+	if !ok || len(conflicts) > 0 {
+		t.Fatalf("want (true,false) across multiple derived-conflict commits, got (%v,%v)", ok, conflicts)
+	}
+	if len(*got) != 2 {
+		t.Fatalf("regen should run once per conflicting commit, ran %d time(s)", len(*got))
+	}
+}
+
+func TestRebaseWithDerivedRegen_RegenFails_Aborts(t *testing.T) {
+	t.Parallel()
+
+	g := &scriptedGit{}
+	g.respond = func(args []string) (string, int, error) {
+		j := joined(args)
+		switch {
+		case j == "rebase main":
+			return "", 1, nil
+		case strings.HasPrefix(j, "diff --name-only --diff-filter=U"):
+			return cflags + "\x00", 0, nil
+		case strings.Contains(j, "rebase --abort"):
+			return "", 0, nil
+		}
+		t.Fatalf("unexpected git call %q", j)
+		return "", 0, nil
+	}
+	regen, _ := recordingRegen("flag-index")
+	ok, conflicts := rebaseWithDerivedRegen(context.Background(), "/wt", g.capture, regen, derivedEntryOf)
+	if ok || len(conflicts) > 0 {
+		t.Fatalf("want (false,false) on regen failure (infra, not overlap), got (%v,%v)", ok, conflicts)
+	}
+	if !g.ran("rebase", "--abort") {
+		t.Fatal("must abort when regeneration fails")
+	}
+}
+
+func TestRebaseWithDerivedRegen_InfraFailureNoUnmerged_Aborts(t *testing.T) {
+	t.Parallel()
+
+	g := &scriptedGit{}
+	g.respond = func(args []string) (string, int, error) {
+		j := joined(args)
+		switch {
+		case j == "rebase main":
+			return "fatal: something broke", 128, nil
+		case strings.HasPrefix(j, "diff --name-only --diff-filter=U"):
+			return "", 0, nil
+		case strings.Contains(j, "rebase --abort"):
+			return "", 0, nil
+		}
+		t.Fatalf("unexpected git call %q", j)
+		return "", 0, nil
+	}
+	regen, got := recordingRegen("")
+	ok, conflicts := rebaseWithDerivedRegen(context.Background(), "/wt", g.capture, regen, derivedEntryOf)
+	if ok || len(conflicts) > 0 {
+		t.Fatalf("want (false,false) for an infra failure with no conflicts, got (%v,%v)", ok, conflicts)
+	}
+	if len(*got) != 0 {
+		t.Fatal("regen must not run on an infra failure")
+	}
+}
+
+func TestRebaseWithDerivedRegen_EmptyCommitAfterResolve_Skips(t *testing.T) {
+	t.Parallel()
+
+	diffCalls := 0
+	g := &scriptedGit{}
+	g.respond = func(args []string) (string, int, error) {
+		j := joined(args)
+		switch {
+		case j == "rebase main":
+			return "", 1, nil
+		case strings.HasPrefix(j, "diff --name-only --diff-filter=U"):
+			diffCalls++
+			if diffCalls <= 2 {
+				return cflags + "\x00", 0, nil
+			}
+			return "", 0, nil
+		case strings.HasPrefix(j, "ls-files "):
+			return cflags + "\x00", 0, nil
+		case strings.HasPrefix(j, "add -A -- "):
+			return "", 0, nil
+		case strings.Contains(j, "rebase --continue"):
+			return "nothing to commit", 1, nil
+		case strings.Contains(j, "rebase --skip"):
+			return "", 0, nil
+		}
+		t.Fatalf("unexpected git call %q", j)
+		return "", 0, nil
+	}
+	regen, _ := recordingRegen("")
+	ok, conflicts := rebaseWithDerivedRegen(context.Background(), "/wt", g.capture, regen, derivedEntryOf)
+	if !ok || len(conflicts) > 0 {
+		t.Fatalf("want (true,false) when an emptied commit is skipped, got (%v,%v)", ok, conflicts)
+	}
+	if !g.ran("rebase", "--skip") {
+		t.Fatal("must `rebase --skip` a commit emptied by resolution")
+	}
+}
+
+func TestRebaseWithDerivedRegen_ContinueNeverConverges_AbortsAtBound(t *testing.T) {
+	t.Parallel()
+
+	g := &scriptedGit{}
+	g.respond = func(args []string) (string, int, error) {
+		j := joined(args)
+		switch {
+		case j == "rebase main":
+			return "", 1, nil
+		case strings.HasPrefix(j, "diff --name-only --diff-filter=U"):
+			return cflags + "\x00", 0, nil
+		case strings.HasPrefix(j, "ls-files "):
+			return cflags + "\x00", 0, nil
+		case strings.HasPrefix(j, "add -A -- "):
+			return "", 0, nil
+		case strings.Contains(j, "rebase --continue"):
+			return "", 1, nil
+		case strings.Contains(j, "rebase --abort"):
+			return "", 0, nil
+		}
+		t.Fatalf("unexpected git call %q", j)
+		return "", 0, nil
+	}
+	regen, got := recordingRegen("")
+	ok, conflicts := rebaseWithDerivedRegen(context.Background(), "/wt", g.capture, regen, derivedEntryOf)
+	if ok || len(conflicts) > 0 {
+		t.Fatalf("want (false,false) at the replay-step bound, got (%v,%v)", ok, conflicts)
+	}
+	if len(*got) != maxRebaseContinueSteps {
+		t.Fatalf("expected regen once per bounded step (%d), got %d", maxRebaseContinueSteps, len(*got))
+	}
+	if !g.ran("rebase", "--abort") {
+		t.Fatal("must abort after exceeding the replay-step bound")
+	}
+}
+
+func TestRegenerateDerivedArtifact_UnregisteredPath_Errors(t *testing.T) {
+	t.Parallel()
+
+	err := regenerateDerivedArtifact(context.Background(), "/wt", "no/such/file.md")
+	if err == nil {
+		t.Fatal("want an error for an unregistered derived-artifact path")
+	}
+	if !strings.Contains(err.Error(), "no regenerator registered") {
+		t.Fatalf("error should name the missing registration, got %v", err)
+	}
+}
+
+func TestRegenerateDerivedArtifact_Integration(t *testing.T) {
+	t.Parallel()
+
+	if testing.Short() {
+		t.Skip("compiles cmd/evolve via `go run`; skipped under -short")
+	}
+	root := repoRootForTest(t)
+	committed, err := os.ReadFile(filepath.Join(root, cflags))
+	if err != nil {
+		t.Fatalf("read %s: %v", cflags, err)
+	}
+	repo := gittest.Fixture(t)
+	worktree := repo.Dir
+	if err := os.Symlink(filepath.Join(root, "go"), filepath.Join(worktree, "go")); err != nil {
+		t.Fatal(err)
+	}
+	docPath := filepath.Join(worktree, cflags)
+	if err := os.MkdirAll(filepath.Dir(docPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(docPath, committed, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	repo.Git("add", "--", cflags)
+	repo.Git("commit", "-qm", "base")
+	if err := regenerateDerivedArtifact(context.Background(), worktree, "flag-index"); err != nil {
+		t.Fatalf("regenerate failed: %v", err)
+	}
+	after, err := os.ReadFile(docPath)
+	if err != nil {
+		t.Fatalf("re-read %s: %v", cflags, err)
+	}
+	if string(committed) != string(after) {
+		t.Fatalf("%s changed after regeneration — the committed projection is out of sync with the registry", cflags)
+	}
+}
+
+func TestRebaseWithDerivedRegen_GitAddFails_Aborts(t *testing.T) {
+	t.Parallel()
+
+	g := &scriptedGit{}
+	g.respond = func(args []string) (string, int, error) {
+		j := joined(args)
+		switch {
+		case j == "rebase main":
+			return "", 1, nil
+		case strings.HasPrefix(j, "diff --name-only --diff-filter=U"):
+			return cflags + "\x00", 0, nil
+		case strings.HasPrefix(j, "ls-files "):
+			return cflags + "\x00", 0, nil
+		case strings.HasPrefix(j, "add -A -- "):
+			return "", 1, nil
+		case strings.Contains(j, "rebase --abort"):
+			return "", 0, nil
+		}
+		t.Fatalf("unexpected git call %q", j)
+		return "", 0, nil
+	}
+	regen, got := recordingRegen("")
+	ok, conflicts := rebaseWithDerivedRegen(context.Background(), "/wt", g.capture, regen, derivedEntryOf)
+	if ok || len(conflicts) > 0 {
+		t.Fatalf("want (false,false) when `git add` fails, got (%v,%v)", ok, conflicts)
+	}
+	if len(*got) != 1 {
+		t.Fatalf("regen should run once before the failed add, got %d", len(*got))
+	}
+	if !g.ran("rebase", "--abort") {
+		t.Fatal("must abort when `git add` fails")
+	}
+}
+
+func TestRebaseCycleBranchOntoMain_EmptyWorktree(t *testing.T) {
+	t.Parallel()
+
+	ok, conflicts := rebaseCycleBranchOntoMain(context.Background(), "", "")
+	if ok || len(conflicts) > 0 {
+		t.Fatalf("empty worktree must return (false,false), got (%v,%v)", ok, conflicts)
+	}
+}
+
+func TestRebaseCycleBranchOntoMain_RealGit_NonDerivedConflict(t *testing.T) {
+	t.Parallel()
+
+	dir := initConflictRepo(t, "foo.go")
+	ok, conflicts := rebaseCycleBranchOntoMain(context.Background(), "", dir)
+	if ok || len(conflicts) == 0 {
+		t.Fatalf("a non-derived conflict must route to the debugger: got (%v,%v)", ok, conflicts)
+	}
+	out, _, _ := gitCapture(context.Background(), dir, "status", "--porcelain")
+	if strings.TrimSpace(out) != "" {
+		t.Fatalf("worktree must be clean after a real rebase --abort, got:\n%s", out)
+	}
+}
+
+func TestRebaseWithDerivedRegen_RealGit_DerivedConflict(t *testing.T) {
+	t.Parallel()
+
+	dir := initConflictRepo(t, cflags)
+	regen := func(_ context.Context, wt, _ string) error {
+		return os.WriteFile(filepath.Join(wt, cflags), []byte("regenerated\nshared\n"), 0o644)
+	}
+	ok, conflicts := rebaseWithDerivedRegen(context.Background(), dir, gitCapture, regen, derivedEntryOf)
+	if !ok || len(conflicts) > 0 {
+		t.Fatalf("real-git derived conflict should auto-resolve: got (%v,%v)", ok, conflicts)
+	}
+	out, _, _ := gitCapture(context.Background(), dir, "status", "--porcelain")
+	if strings.TrimSpace(out) != "" {
+		t.Fatalf("worktree must be clean after a resolved rebase, got:\n%s", out)
+	}
+	got, _ := os.ReadFile(filepath.Join(dir, cflags))
+	if string(got) != "regenerated\nshared\n" {
+		t.Fatalf("resolved file content = %q, want the regenerated projection", string(got))
+	}
+}
+
+func initConflictRepo(t *testing.T, relFile string) string {
+	t.Helper()
+	dir := t.TempDir()
+	git := func(args ...string) {
+		t.Helper()
+		if _, code, err := gitCapture(context.Background(), dir, args...); err != nil || code != 0 {
+			t.Fatalf("git %v: code=%d err=%v", args, code, err)
+		}
+	}
+	write := func(content string) {
+		t.Helper()
+		p := filepath.Join(dir, relFile)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	git("init")
+	git("checkout", "-b", "main")
+	git("config", "user.email", "t@example.com")
+	git("config", "user.name", "test")
+	git("config", "commit.gpgsign", "false")
+	write("base\nshared\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("checkout", "-b", "cycle")
+	write("cycle-change\nshared\n")
+	git("add", "-A")
+	git("commit", "-m", "cycle change")
+	git("checkout", "main")
+	write("main-change\nshared\n")
+	git("add", "-A")
+	git("commit", "-m", "main change")
+	git("checkout", "cycle")
+	return dir
+}
+
+func TestRebaseWithDerivedRegen_SkipRetriesThenCompletes(t *testing.T) {
+	t.Parallel()
+
+	diffCalls, skips := 0, 0
+	g := &scriptedGit{}
+	g.respond = func(args []string) (string, int, error) {
+		j := joined(args)
+		switch {
+		case j == "rebase main":
+			return "", 1, nil
+		case strings.HasPrefix(j, "diff --name-only --diff-filter=U"):
+			diffCalls++
+			if diffCalls <= 2 {
+				return cflags + "\x00", 0, nil
+			}
+			return "", 0, nil
+		case strings.HasPrefix(j, "ls-files "):
+			return cflags + "\x00", 0, nil
+		case strings.HasPrefix(j, "add -A -- "):
+			return "", 0, nil
+		case strings.Contains(j, "rebase --continue"):
+			return "nothing to commit", 1, nil
+		case strings.Contains(j, "rebase --skip"):
+			skips++
+			if skips == 1 {
+				return "transient", 1, nil
+			}
+			return "", 0, nil
+		}
+		t.Fatalf("unexpected git call %q", j)
+		return "", 0, nil
+	}
+	regen, _ := recordingRegen("")
+	ok, conflicts := rebaseWithDerivedRegen(context.Background(), "/wt", g.capture, regen, derivedEntryOf)
+	if !ok || len(conflicts) > 0 {
+		t.Fatalf("want (true,false) after a retried skip, got (%v,%v)", ok, conflicts)
+	}
+	if skips < 2 {
+		t.Fatalf("expected the skip to be retried, skips=%d", skips)
+	}
+}
+
+func TestRebaseWithDerivedRegen_SkipThenNewDerivedConflict_Resolves(t *testing.T) {
+	t.Parallel()
+
+	var diffN, skipN, contN int
+	g := &scriptedGit{}
+	g.respond = func(args []string) (string, int, error) {
+		j := joined(args)
+		switch {
+		case j == "rebase main":
+			return "", 1, nil
+		case strings.HasPrefix(j, "diff --name-only --diff-filter=U"):
+			diffN++
+			switch diffN {
+			case 1, 2:
+				return cflags + "\x00", 0, nil
+			case 3:
+				return "", 0, nil
+			default:
+				return cflags + "\x00", 0, nil
+			}
+		case strings.HasPrefix(j, "ls-files "):
+			return cflags + "\x00", 0, nil
+		case strings.HasPrefix(j, "add -A -- "):
+			return "", 0, nil
+		case strings.Contains(j, "rebase --continue"):
+			contN++
+			if contN == 1 {
+				return "nothing to commit", 1, nil
+			}
+			return "", 0, nil
+		case strings.Contains(j, "rebase --skip"):
+			skipN++
+			return "transient", 1, nil
+		}
+		t.Fatalf("unexpected git call %q", j)
+		return "", 0, nil
+	}
+	regen, got := recordingRegen("")
+	ok, conflicts := rebaseWithDerivedRegen(context.Background(), "/wt", g.capture, regen, derivedEntryOf)
+	if !ok || len(conflicts) > 0 {
+		t.Fatalf("want (true,false) for skip-fail then a new derived resolve, got (%v,%v)", ok, conflicts)
+	}
+	if skipN < 1 {
+		t.Fatal("expected at least one failed --skip")
+	}
+	if len(*got) != 2 {
+		t.Fatalf("expected two regenerations (first commit + post-skip commit), got %d", len(*got))
+	}
+}
+
+func TestRegenerateDerivedArtifact_RunFails_Errors(t *testing.T) {
+	t.Parallel()
+
+	if testing.Short() {
+		t.Skip("invokes the go toolchain")
+	}
+	wt := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(wt, "go"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := regenerateDerivedArtifact(context.Background(), wt, "flag-index"); err == nil {
+		t.Fatal("want an error when `go run` fails in a worktree with no module")
+	}
+}
+
+func TestDerivedEntryOf(t *testing.T) {
+	t.Parallel()
+
+	for path, want := range map[string]string{cflags: "flag-index", "commands/build.md": "skill-projections"} {
+		if got, ok := derivedEntryOf(path); !ok || got != want {
+			t.Errorf("derivedEntryOf(%q) = (%q, %v), want (%q, true)", path, got, ok, want)
+		}
+	}
+	for _, p := range []string{"go/internal/flagregistry/registry_table.go", "README.md", ""} {
+		if got, ok := derivedEntryOf(p); ok {
+			t.Errorf("derivedEntryOf(%q) = %q, want no entry", p, got)
+		}
+	}
+}
+
+func TestRegenStaleProjections_RegeneratesAndStages(t *testing.T) {
+	t.Parallel()
+
+	var regened, staged []string
+	regen := func(_ context.Context, _, entry string) error { regened = append(regened, entry); return nil }
+	stage := func(_ context.Context, _, entry string) error { staged = append(staged, entry); return nil }
+	stale := derived.Stale([]string{"go/internal/flagregistry/registry_table.go", "go/internal/core/foo.go"}, nil)
+
+	done := regenStaleProjections(context.Background(), "/wt", stale, regen, stage)
+
+	for name, got := range map[string][]string{"done": done, "regenerated": regened, "staged": staged} {
+		if !reflect.DeepEqual(got, []string{"flag-index"}) {
+			t.Errorf("%s = %v, want [flag-index]", name, got)
+		}
+	}
+}
+
+func TestRegenStaleProjections_NoStaleEntry_NoOp(t *testing.T) {
+	t.Parallel()
+
+	called := false
+	regen := func(_ context.Context, _, _ string) error { called = true; return nil }
+	done := regenStaleProjections(context.Background(), "/wt", nil, regen, func(context.Context, string, string) error { return nil })
+	if len(done) != 0 || called {
+		t.Fatalf("no stale entry must be a no-op (done=%v called=%v)", done, called)
+	}
+}
+
+func flagIndexOnly(t *testing.T) []derived.Entry {
+	t.Helper()
+	e, ok := derived.Lookup("flag-index")
+	if !ok {
+		t.Fatal("the catalog has no flag-index entry")
+	}
+	return []derived.Entry{e}
+}
+
+func TestRegenStaleProjections_RegenFails_SkipsWithoutStaging(t *testing.T) {
+	t.Parallel()
+
+	staged := false
+	regen := func(_ context.Context, _, _ string) error { return errors.New("regen boom") }
+	done := regenStaleProjections(context.Background(), "/wt", flagIndexOnly(t), regen, func(context.Context, string, string) error { staged = true; return nil })
+	if len(done) != 0 {
+		t.Fatalf("regen failure → not done, got %v", done)
+	}
+	if staged {
+		t.Fatal("must NOT stage when regen failed")
+	}
+}
+
+func TestRegenStaleProjections_StageFails_Skips(t *testing.T) {
+	t.Parallel()
+
+	regen := func(_ context.Context, _, _ string) error { return nil }
+	done := regenStaleProjections(context.Background(), "/wt", flagIndexOnly(t), regen, func(context.Context, string, string) error { return errors.New("add boom") })
+	if len(done) != 0 {
+		t.Fatalf("stage failure → not done, got %v", done)
+	}
+}
+
+func initTempRepo(t *testing.T) (string, func(...string)) {
+	t.Helper()
+	dir := t.TempDir()
+	git := func(args ...string) {
+		t.Helper()
+		if _, code, err := gitCapture(context.Background(), dir, args...); err != nil || code != 0 {
+			t.Fatalf("git %v: code=%d err=%v", args, code, err)
+		}
+	}
+	git("init")
+	git("checkout", "-b", "main")
+	git("config", "user.email", "t@example.com")
+	git("config", "user.name", "test")
+	return dir, git
+}
+
+func TestStageDerivedEntry_StagesOnlyTheOutputsOfTheEntry(t *testing.T) {
+	t.Parallel()
+
+	dir, git := initTempRepo(t)
+	writeFile(t, filepath.Join(dir, "base.txt"), "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	writeFile(t, filepath.Join(dir, cflags), "regenerated\n")
+	writeFile(t, filepath.Join(dir, "commands", "build.md"), "stub\n")
+
+	if err := stageDerivedEntry(context.Background(), dir, "flag-index"); err != nil {
+		t.Fatalf("stageDerivedEntry: %v", err)
+	}
+
+	out, _, _ := gitCapture(context.Background(), dir, "diff", "--cached", "--name-only")
+	if strings.TrimSpace(out) != cflags {
+		t.Fatalf("staged = %q, want only %s", out, cflags)
+	}
+}
+
+func TestStageDerivedEntry_Refusals(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]struct{ dir, entry string }{
+		"a directory outside git":     {t.TempDir(), "flag-index"},
+		"an entry not in the catalog": {t.TempDir(), "no-such-entry"},
+	}
+	for name, c := range cases {
+		if err := stageDerivedEntry(context.Background(), c.dir, c.entry); err == nil {
+			t.Errorf("%s: stageDerivedEntry = nil, want an error", name)
+		}
+	}
+}
+
+func TestStageEntryWith_ASpawnFailureIsAnError(t *testing.T) {
+	t.Parallel()
+
+	spawnFails := func(context.Context, string, ...string) (string, int, error) { return "", -1, errors.New("no git") }
+
+	if err := stageEntryWith(context.Background(), spawnFails, "/wt", "flag-index"); err == nil || !strings.Contains(err.Error(), "no git") {
+		t.Fatalf("stageEntryWith = %v, want the spawn error", err)
+	}
+}
+
+func TestNormalizeDerivedProjections_EmptyWorktree_NoOp(t *testing.T) {
+	t.Parallel()
+
+	o := &Orchestrator{}
+	o.normalizeDerivedProjections(context.Background(), "")
+}
+
+func TestNormalizeDerivedProjections_CleanWorktree_NoRegen(t *testing.T) {
+	t.Parallel()
+
+	dir, git := initTempRepo(t)
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "-A")
+	git("commit", "-m", "base")
+	o := &Orchestrator{}
+	o.normalizeDerivedProjections(context.Background(), dir)
+}
+
+func TestChangedWorktreePaths_RealGit(t *testing.T) {
+	t.Parallel()
+
+	dir, git := initTempRepo(t)
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "-A")
+	git("commit", "-m", "base")
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "new.txt"), []byte("new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := changedWorktreePaths(context.Background(), dir)
+	want := map[string]bool{"f.txt": false, "new.txt": false}
+	for _, p := range got {
+		if _, ok := want[p]; ok {
+			want[p] = true
+		}
+	}
+	if !want["f.txt"] || !want["new.txt"] {
+		t.Fatalf("changedWorktreePaths must report tracked AND untracked changes, got %v", got)
+	}
+	git("checkout", "--", "f.txt")
+	_ = os.Remove(filepath.Join(dir, "new.txt"))
+	if g := changedWorktreePaths(context.Background(), dir); len(g) != 0 {
+		t.Fatalf("clean tree must yield no changed paths, got %v", g)
+	}
+}
+
+func repoRootForTest(t *testing.T) string {
+	t.Helper()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	dir := wd
+	for i := 0; i < 6; i++ {
+		if _, err := os.Stat(filepath.Join(dir, "go", "go.mod")); err == nil {
+			return dir
+		}
+		dir = filepath.Dir(dir)
+	}
+	t.Fatalf("could not locate repo root from %s", wd)
+	return ""
+}

@@ -1,0 +1,174 @@
+package runner
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/bridgechain"
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+	"github.com/mickeyyaya/evolve-loop/go/internal/llmroute"
+	"github.com/mickeyyaya/evolve-loop/go/internal/log"
+	"github.com/mickeyyaya/evolve-loop/go/internal/policy"
+)
+
+type phaseDispatchResult struct {
+	bridgeResponse   core.BridgeResponse
+	bridgeErr        error
+	resolvedModel    string
+	durationMS       int64
+	worktreeVerified bool
+	fenceDiagnostics []core.Diagnostic
+	skills           []string
+}
+
+func (b *BaseRunner) dispatchPhaseAttempts(
+	ctx context.Context,
+	req core.PhaseRequest,
+	prep phasePreparation,
+	resolved phaseDispatchPlan,
+) phaseDispatchResult {
+	start := prep.start
+	phase := prep.phase
+	prompt := prep.prompt
+	plan := resolved.plan
+	overlayPolicy := resolved.overlayPolicy
+	model := plan.Model
+
+	fence := takeWorktreeFence(ctx, phase, req)
+
+	var bres core.BridgeResponse
+	var bridgeErr error
+	var attemptLog, skills, walked []string
+	var wall bridgechain.WallKeeper
+	base := b.baseRequest(req, prep, resolved)
+	postmortems := postmortemScope{req: req, phase: phase, artifactPath: prep.artifactPath, cfg: overlayPolicy.AttemptPostmortemConfig()}
+	tieredRes := llmroute.DispatchTiered(plan, func(candidateCLI, tier string) (int, error) {
+		logFallbackStep(phase, attemptLog, candidateCLI, tier, bres.ExitCode)
+		skills = overlayPolicy.ResolveOverlays(overlayDispatchFor(req, phase, candidateCLI, tier))
+		log.Diag().Infof("%s\n", FormatSkillOverlayLog(phase, skills, tier))
+		attempt := base
+		attempt.CLI, attempt.Model, attempt.Skills = candidateCLI, tier, skills
+		attempt, bres, bridgeErr = b.launchWithFreshSession(ctx, postmortems, attempt, prompt)
+		wall.Observe(candidateCLI+"@"+tier, bres, bridgeErr)
+		if err := b.eventsProducer(req.Workspace, phase, candidateCLI, req.Cycle, attempt.Prompt); err != nil {
+			log.Diag().Warnf("[runner] WARN events producer phase=%s cli=%s: %v (cost/classification degraded)\n", phase, candidateCLI, err)
+		}
+		attemptLog = append(attemptLog, fmt.Sprintf("%s@%s=%d", candidateCLI, tier, bres.ExitCode))
+		walked = append(walked, candidateCLI)
+		if bridgeErr != nil && bres.ExitCode == 85 {
+			b.maybeBenchOnEscalation(bridgechain.EscalationFor(attempt, start))
+		}
+		return llmroute.TieringExit(bres.ExitCode, bres.CauseCode), bridgeErr
+	}, func(from, to string) {
+		log.Diag().Infof("[runner] phase=%s tier step-down: %s → %s (CLI chain exhausted at quota)\n", phase, from, to)
+	})
+	if wall.Surfaces(tieredRes, bres) {
+		bres, bridgeErr = wall.Surface(tieredRes, bres, bridgeErr)
+		log.Diag().Infof("[runner] phase=%s dispatch chain exhausted after a quota wall: surfacing exit %d: %v\n", phase, bres.ExitCode, bridgeErr)
+	}
+	if unlaunched := bridgechain.Unlaunched(tieredRes, plan); unlaunched != nil {
+		bridgeErr = unlaunched
+	}
+	bridgeErr = withWalk(withCause(bridgeErr, bres.CauseCode), walked)
+	resolvedModel := terminalTier(tieredRes, model)
+	if len(attemptLog) > 1 {
+		log.Diag().Infof("[runner] phase=%s dispatch chain: %s\n", phase, joinAttempts(attemptLog))
+	}
+	durationMS := b.nowFn().Sub(start).Milliseconds()
+	verified, fenceDiags := restoreWorktreeFence(context.WithoutCancel(ctx), phase, fence)
+	req.WorktreeVerified = verified
+
+	return phaseDispatchResult{
+		bridgeResponse:   bres,
+		bridgeErr:        bridgeErr,
+		resolvedModel:    resolvedModel,
+		durationMS:       durationMS,
+		worktreeVerified: verified,
+		fenceDiagnostics: fenceDiags,
+		skills:           skills,
+	}
+}
+
+func logFallbackStep(phase string, attemptLog []string, cli, tier string, previousExit int) {
+	i := len(attemptLog)
+	if i == 0 {
+		return
+	}
+	log.Diag().Infof("[runner] phase=%s fallback %d: trying cli=%s tier=%s (previous=%s exit=%d)\n",
+		phase, i+1, cli, tier, attemptLog[i-1], previousExit)
+}
+
+func overlayDispatchFor(req core.PhaseRequest, phase, cli, tier string) policy.OverlayDispatch {
+	d := policy.DispatchFromPhaseRequest(phase, cli, tier, tier)
+	d.Signals = req.Signals
+	d.WritesSource = req.WritesSource()
+	return d
+}
+
+func terminalTier(walk llmroute.TieredDispatchResult, resolved string) string {
+	if walk.Tier == "" {
+		return resolved
+	}
+	return walk.Tier
+}
+
+func (b *BaseRunner) baseRequest(req core.PhaseRequest, prep phasePreparation, resolved phaseDispatchPlan) core.BridgeRequest {
+	return core.BridgeRequest{
+		Profile:             prep.profilePath,
+		Prompt:              prep.prompt,
+		Workspace:           req.Workspace,
+		Worktree:            req.Worktree,
+		RunID:               req.RunID,
+		ProjectRoot:         req.ProjectRoot,
+		ArtifactPath:        prep.artifactPath,
+		SecondaryArtifacts:  secondaryArtifacts(b.hooks, req),
+		Completion:          req.BridgeCompletion(),
+		Agent:               prep.phase,
+		Cycle:               req.Cycle,
+		Attempt:             req.Attempt,
+		Effort:              resolved.plan.Effort,
+		BudgetScale:         req.BudgetScale,
+		RequireSandbox:      requiresExplanationSandbox(prep.phase, req),
+		Env:                 req.Env,
+		PermissionMode:      resolved.permissionMode,
+		InteractivePolicy:   resolved.interactivePolicy,
+		SystemPrompt:        resolved.systemPrompt,
+		CorrectionDirective: req.CorrectionDirective,
+		OperatorDirectives:  req.OperatorDirectives,
+		ChainAttempt:        true,
+		Ladder:              req.Ladder,
+		BeforeClose:         req.BeforeClose,
+	}
+}
+
+func joinAttempts(attempts []string) string {
+	if len(attempts) == 0 {
+		return ""
+	}
+	out := attempts[0]
+	for _, a := range attempts[1:] {
+		out += " -> " + a
+	}
+	return out
+}
+
+func FormatSkillOverlayLog(phase string, skills []string, tier string) string {
+	return "[runner] phase=" + phase +
+		" skill-overlays=[" + strings.Join(skills, ",") + "]" +
+		" (tier=" + tier + ")"
+}
+
+func withCause(err error, cause string) error {
+	if err == nil || cause == "" {
+		return err
+	}
+	return core.LaunchCause{Cause: cause, Err: err}
+}
+
+func withWalk(err error, walked []string) error {
+	if err == nil || len(walked) == 0 {
+		return err
+	}
+	return core.WalkError{CLIs: walked, Err: err}
+}

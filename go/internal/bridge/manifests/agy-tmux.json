@@ -1,0 +1,188 @@
+{
+  "schema_version": 1,
+  "cli": "agy-tmux",
+  "binary": "agy",
+  "probe_unsandboxed_reason": "A version, update, model or doctor probe of agy reads its sign-in and writes its state and its own install under $HOME. The phase sandbox grants no write outside the cell, so the probe runs outside it.",
+  "env_passthrough": ["XDG_CONFIG_HOME", "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION", "GOOGLE_GENAI_USE_VERTEXAI", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "no_proxy", "all_proxy"],
+  "model_family": "gemini",
+  "parsers": {"pane": "agy-repl-v1"},
+  "collectors": {"tokens": "agy-conversation-v1"},
+  "capabilities": ["tools", "edit"],
+  "home_reads": ["~/.gemini"],
+  "context_window": 200000,
+  "binary_min_version": "1.0.0",
+  "update_argv": ["agy", "update"],
+  "auto_update_off_env": "AGY_CLI_DISABLE_AUTO_UPDATE",
+  "probe_boot_retries": 1,
+  "default_env": {"AGY_CLI_DISABLE_AUTO_UPDATE": "1"},
+  "transport": "tmux",
+  "default_tier": "hybrid",
+  "tier_dependencies": {
+    "full": [
+      "agy",
+      "tmux"
+    ],
+    "hybrid": [
+      "agy",
+      "tmux"
+    ],
+    "degraded": [
+      "agy"
+    ]
+  },
+  "prompt_marker": "? for shortcuts",
+  "transient_regex": "(?i)(\\b5\\d{2}\\b\\s*(unavailable|internal)|model is overloaded|unavailable \\(code 5\\d{2}\\))",
+  "default_model": "gemini-3.5-flash",
+  "default_args": [],
+  "mcp_config_files": ["~/.gemini/config/mcp_config.json", "~/.gemini/antigravity/mcp_config.json"],
+  "params": {
+    "model_tier": {
+      "channel": "flag",
+      "flag": "--model",
+      "from": "model_tier_map"
+    },
+    "effort": {
+      "channel": "noop"
+    },
+    "permission": {
+      "channel": "flag",
+      "values": {
+        "bypass": [
+          "--dangerously-skip-permissions"
+        ]
+      }
+    },
+    "settings_scope": {
+      "channel": "noop"
+    },
+    "session_mode": {
+      "channel": "controller"
+    }
+  },
+  "controls": {
+    "usage": {
+      "send": "/usage",
+      "await": "prompt_marker",
+      "exhausted_regex": "(?i)(usage limit reached|quota (exceeded|reached)|\\b0%\\s*(left|remaining))",
+      "drift_probe_regex": "(?i)(limit reached|usage limit|weekly limit|(?:reached|hit) your|\\b0%\\s*(left|remaining)|out of (usage|credits|tokens)|rate.?limit|too many requests|quota (exceeded|reached)|upgrade to (a paid plan|continue))",
+      "windows": {
+        "section_regex": "^\\s*(?P<scope>[A-Z][A-Z0-9 &/-]*(?:MODELS|ARGON))\\s*$",
+        "models_regex": "Models within this group:\\s*(?P<models>.+?)\\s*$",
+        "labels": [
+          {
+            "regex": "^\\s*Weekly Limit Remaining\\s*$",
+            "kind": "week"
+          },
+          {
+            "regex": "^\\s*Five Hour Limit Remaining\\s*$",
+            "kind": "5h"
+          },
+          {
+            "regex": "^\\s*Gemini 4 Argon Weekly Limit\\s*$",
+            "kind": "week",
+            "scope": "Gemini 4 Argon"
+          }
+        ],
+        "value_regex": "(?P<pct>\\d{1,3}(?:\\.\\d+)?)%",
+        "value_direction": "remaining",
+        "reset_regex": "(?i)refreshes in\\s+(?P<reset>\\d+\\s*[hms](?:\\s*\\d+\\s*[hms])*)",
+        "exhausted_at_used_pct": 99.5,
+        "scopes": {
+          "GEMINI MODELS": {
+            "family": "agy"
+          },
+          "CLAUDE AND GPT MODELS": {
+            "family": "agy-claude"
+          },
+          "Gemini 4 Argon": {
+            "family": "agy",
+            "per_model": true
+          }
+        }
+      }
+    },
+    "status": {
+      "send": "/usage",
+      "await": "prompt_marker"
+    },
+    "clean_ctx": {
+      "send": "/clear"
+    },
+    "model": {
+      "send": "/model"
+    },
+    "help": {
+      "send": "/help"
+    }
+  },
+  "interactive_prompts": [
+    {
+      "name": "cli_feedback_rating",
+      "regex": "How's the CLI experience so far\\?|Help us improve:",
+      "response_keys": "0,Enter",
+      "policy": "auto_respond",
+      "once": true,
+      "note": "Quick feedback rating prompt from the CLI wrapper; '0' skips/cancels"
+    },
+    {
+      "name": "trust_prompt",
+      "regex": "Do you trust the contents of this project|Antigravity CLI requires permission",
+      "response_keys": "Enter",
+      "policy": "auto_respond",
+      "once": true,
+      "note": "agy asks to trust dir on first launch; default selection is 'Yes, I trust this folder'. `once`: one-time boot dialog \u2014 must not re-fire after a single response (its text lingers in the scrollback capture during the artifact-wait loop)."
+    },
+    {
+      "name": "auth_recheck",
+      "regex": "Please log in|Authentication required|Login expired",
+      "response_keys": null,
+      "policy": "escalate"
+    },
+    {
+      "name": "model_not_recognized",
+      "regex": "is not recognized as a known model or custom model",
+      "response_keys": null,
+      "tail_lines": 30,
+      "policy": "escalate",
+      "note": "agy 1.2.17 ignores a --model it cannot validate (an unknown name, or any name while its model list fetch fails on an upstream 503) and runs without the dispatched model; a run must never continue on a model other than the one dispatched, so the chain moves on (exit 85). Live-captured 2026-10-06 on agy-claude-tmux, after the prompt was submitted. At boot an escalate verdict leaves readiness to the marker (ADR-0118), and agy shows this warning only briefly there, so an unknown name can still boot on agy's default model: see docs/architecture/packages/internal-bridge.md. tail_lines keeps the rule to the live screen, as codex's model_unsupported does."
+    },
+    {
+      "name": "rate_limit",
+      "regex": "(usage|rate)[ -]limit (reached|exceeded|hit)|too many requests|RESOURCE_EXHAUSTED",
+      "response_keys": null,
+      "policy": "escalate"
+    },
+    {
+      "name": "quota_exhausted",
+      "regex": "quota.*exceed|daily limit|monthly limit|free.tier limit",
+      "response_keys": null,
+      "policy": "escalate",
+      "note": "Distinguishable from transient rate-limit; usually requires plan upgrade"
+    },
+    {
+      "name": "permission_prompt",
+      "regex": "Allow .*\\?|Grant permission|Approve action",
+      "response_keys": "y,Enter",
+      "policy": "auto_respond",
+      "note": "Belt-and-suspenders alongside --dangerously-skip-permissions; harmless if bypass already accepted it"
+    },
+    {
+      "name": "session_rating",
+      "regex": "Rate (this|your|the) (response|session)|How helpful|Thank you.*feedback",
+      "response_keys": "4,Enter",
+      "policy": "auto_respond",
+      "note": "agy end-of-session rating dialog; '4' = neutral skip"
+    }
+  ],
+  "busy_line_regex": "^\\s*([⣾⣽⣻⢿⡿⣟⣯⣷])\\s+\\S",
+  "token_line_regex": "(?m)^\\s*▸\\s*Thought for [^,\\n]*,\\s*(?P<count>[0-9][0-9,]*(?:\\.[0-9]+)?)(?P<scale>k?)\\s+tokens",
+  "model_label_regex": "^(?P<footer>esc to cancel|\\? for shortcuts)?\\s{2,}(?P<model>[[:alnum:]][^·()]*?(?:\\s*·\\s*[^·\\s]+|\\s*\\([^)]+\\)))(?:\\s*·\\s*[^·]*?)*\\s*$",
+  "stub": false,
+  "model_tier_map": {
+    "fast": "Gemini 3.8 Flash (Low)",
+    "balanced": "Gemini 3.8 Flash (High)",
+    "deep": "Gemini 4 Argon (Medium)",
+    "top": "Gemini 4 Argon (High)"
+  },
+  "note": "Interactive agy via tmux. Preserves Google AI Pro subscription billing (OAuth). REPL marker is the '? for shortcuts' footer text \u2014 unique to the idle state. model_tier is channel=flag via --model (probed live 2026-07-02, agy 1.0.15: `agy --model \"Claude Opus 4.6 (Thinking)\"` boots the REPL in ~2s with the model in banner+footer; `agy models` lists the selectable tokens, which are display names with spaces/parens \u2014 launchCmdLine shell-quotes every realized flag token). `-m` remains UNDEFINED ('flags provided but not defined: -m'), so the cycle-154 incident claim about -m still holds; agy 1.0.3 had no model flag at all and channel was noop 2026-05-31..2026-07-02 (docs/incidents/cycle-154-agy-tmux-m-flag-repl-boot-timeout.md). model_tier_map holds offline defaults only; the LIVE model catalog overlays real per-tier picks at LoadManifest (catalog_overlay.go). See docs/architecture/cli-capability-matrix.md. probe_boot_retries: 1 because agy's first launch after an idle period can miss the 60s REPL boot budget while the next launch boots in seconds; the probes that run first retry one bare boot timeout (docs/incidents/agy-cold-start-boot-timeout-2026-10-06.md). controls.usage.windows reads agy 1.3.0's /usage screen as one weekly and one five-hour window per model group and maps each group to its routing family; exhausted_regex is the fallback for a screen the reader finds no window on (docs/architecture/packages/internal-usageprobe.md)."
+}

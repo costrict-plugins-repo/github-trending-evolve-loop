@@ -1,0 +1,279 @@
+# ADR-0072 — System-Failure Policy: classify, justify, and halt-and-diagnose instead of retrying the pipeline
+
+- **Status:** Accepted (2026-07-17)
+- **Supersedes/refines:** the standing rule `never_stop_queue_inject_inbox` (adds a bounded exception for system-level failures); complements ADR-0064 (pipeline-integrity boundary), ADR-0070 (signal-center exhaustion), the `failureadapter` kernel.
+- **Deciders:** operator + session (post-mortem of the cycle 862→899 false-FAIL storm).
+
+## Context — a loop that burned 38 cycles repeating the same result
+
+The clean-exit deliverable-authority bug (fixed in `38b961d2`) caused the runner to synthesize a **FAIL** verdict from contaminated tmux scrollback whenever a phase agent exited clean-and-idle, even though the on-disk `audit-report.md` verdict was **PASS** and `acs-verdict.json` was **PASS**. The loop treated each occurrence as an ordinary task-level audit FAIL:
+
+1. The cycle recorded FAIL → retro fired → the inbox items were released back to `.evolve/inbox/` root with **no memory of why they failed**.
+2. Triage re-read the inbox root fresh the next cycle and re-selected the *same* task.
+3. The task produced the *same* forged FAIL. Goto 1.
+
+Result: the loop re-attempted **skill-overlay 5×** and **scoped-review 8×** across cycles 862–899, discarding verified-green work every time and burning tokens for an identical outcome. The consecutive-fail breaker did not save us because in fluent mode (`strict_audit` off) the failure-adapter's BLOCK rules degrade to `PROCEED`, and the breaker's default `max=1` is bypassed by the fleet/resume paths that re-triage released items.
+
+### Root cause is architectural, not a single bug
+
+The loop has **no progress monovariant**. It can repeat work indefinitely without checking whether the *outcome* is changing. "Burning tokens for the same result" is a livelock. Two properties were missing:
+
+- **(P1) Coherence.** A recorded verdict is only trustworthy if it agrees with the artifacts the phases actually wrote. The clean-exit bug *forged a task-level verdict* — so any classifier reading the recorded verdict alone (human or LLM) would misclassify it as "task audit-fail → retry," the exact wrong call. A broken pipeline can lie about whose fault it is.
+- **(P2) Termination.** The loop may only repeat work after a **coherent, progressing, task-level** result. Any incoherence, or any non-progress (same task/failure-class recurring, verified work not landing), is a **system fault** and must halt for diagnosis — not feed another retry.
+
+## Decision
+
+Introduce a **system-failure policy** that classifies every failure into a category, and — per the operator directive — **stops the loop and escalates for pipeline diagnosis on system-level failures** instead of retrying the todo. The decision is made by the **orchestrator** (LLM judgment, bounded by declarative policy), while **Go hard-enforces a non-negotiable floor** so a broken pipeline cannot be talked out of halting.
+
+### Three-layer split
+
+| Layer | Owns | Location |
+|---|---|---|
+| **Policy** (declarative) | Failure **categories**, each category's **level** (system/task), prescribed **action**, **fix-type**, thresholds | `.evolve/policy.json` → new `failure_policy` block; struct in `internal/policy` |
+| **Orchestrator** (judgment) | Read the evidence dossier + policy → **classify** into one category, **justify** with cited evidence, **choose** next action + fix-type | `evo:evolve-orchestrator` / retrospective instructions → structured `failure-decision.json` |
+| **Go** (deterministic) | Build the **evidence dossier** (coherence signal, non-progress counters, classification inputs); **enforce the floor**; enforce the chosen action; write escalation; deterministic **fallback** classification | `internal/failureadapter`, `internal/core`, `internal/inboxmover`, `cmd/evolve/cmd_loop*.go` |
+
+**Authority model (operator-chosen): "orchestrator decides, Go enforces floor."** The orchestrator's classification/action is adopted *except* that two categories ALWAYS halt regardless of what the orchestrator says: `verdict-incoherence` and `infra-systemic`. When the orchestrator cannot run, the deterministic `failureadapter` (extended to read `failure_policy`) is the fallback (per `retro_always_on_failure`).
+
+### The policy schema
+
+```jsonc
+// .evolve/policy.json  → additive block; compiled defaults live in internal/policy
+"failure_policy": {
+  "categories": {
+    "verdict-incoherence": { "level":"system", "action":"halt-and-diagnose", "fix_type":"pipeline-repair",
+      "signature":"recorded FAIL/WARN but on-disk audit AND acs verdicts are PASS",
+      "floor":true },
+    "infra-systemic":      { "level":"system", "action":"halt-and-diagnose", "fix_type":"pipeline-repair",
+      "floor":true },
+    "transport-hang":      { "level":"system", "action":"halt-and-diagnose", "fix_type":"pipeline-repair" },
+    "non-progress":        { "level":"system", "action":"halt-and-diagnose", "fix_type":"pipeline-repair",
+      "signature":"same task or same failure-class recurs >= repeat_ceiling cycles with no landed progress, OR verified-green work not landed >= verified_not_landed_ceiling times" },
+    "code-build-fail":     { "level":"task", "action":"retry-with-fix", "fix_type":"build-repair",           "max_retries":2 },
+    "code-audit-fail":     { "level":"task", "action":"retry-with-fix", "fix_type":"address-audit-findings", "max_retries":2 },
+    "intent-malformed":    { "level":"task", "action":"defer-or-quarantine", "fix_type":"reintent" }
+  },
+  "thresholds": { "repeat_ceiling": 2, "verified_not_landed_ceiling": 2, "task_retry_ceiling": 2 },
+  "on_task_retry_ceiling": "quarantine",       // stop re-picking a task-level poison todo
+  "on_system_level":       "halt-loop-and-escalate"
+}
+```
+
+Compiled Go defaults (in `internal/policy`, surfaced when the block is absent) match the table above so behavior is correct without editing the checked-in `policy.json` (mirrors the `gates` default pattern).
+
+### The evidence dossier (deterministic, Go)
+
+Built at cycle finalization from **independent on-disk artifacts** — never from the recorded verdict alone:
+
+- **Coherence signal**: `(recordedVerdict, auditVerdict, acsVerdict, bridgeErrClass)` → `coherent | incoherent`. Incoherent ⇔ `recorded ∈ {FAIL,WARN}` **and** `auditVerdict==PASS` **and** `acsVerdict==PASS` **and** the audit phase actually ran (artifacts present) **and** no substantive bridge error occurred. This is a pure comparison (`CheckVerdictCoherence`), the deterministic input that lets the orchestrator (and the Go floor) catch a forged verdict.
+- **Non-progress counters**: per-task failure count (from the inbox item's new failure memory) + verified-not-landed count (audit PASS + ACS PASS but no landed SHA) + same-class streak (from `state.failedApproaches`).
+- **Classification inputs**: the existing `failureadapter.Entry` history + the bridge error class (`IsInfraTeardownError`, `ErrAllFamiliesExhausted`, transport-hang).
+
+The dossier is written to `failure-dossier.json` in the cycle workspace and injected into the orchestrator/retrospective prompt.
+
+### The floor (Go, always-on, cannot be overridden)
+
+Before adopting any orchestrator/adapter decision, the loop checks the dossier:
+
+- `coherence == incoherent` → `verdict-incoherence` → **HALT** (`ActionHaltDiagnose`).
+- bridge error class == infra-systemic (`ErrAllFamiliesExhausted` / systemic teardown) → `infra-systemic` → **HALT**.
+
+The floor is independent of `strict_audit` and independent of the orchestrator. It would have stopped the 862→899 storm at **cycle 862**, on the first forged verdict.
+
+### Halt behavior — stop + escalate + diagnose
+
+On any `halt-and-diagnose`:
+
+1. Batch loop sets `StopReason = "system_failure_halt"` (new; distinct rc from task-fail/quota-pause/integrity-breach) and breaks.
+2. Writes `.evolve/pipeline-escalation.json`: `{category, level, signature, evidence, suspectPhase, cyclesAffected, reproPointers, hypothesis}` (hypothesis from the orchestrator when present).
+3. Auto-files a **P0 `pipeline-defect-<category>` inbox item** tagged `kind=pipeline-repair`, so on resume the pipeline fix is worked **before** any feature task (honoring the operator directive "deep dive into the pipeline issue and fix first"), and honoring `never_stop_queue_inject_inbox` for the *queue* even as the loop *halts*.
+
+### Task-level: quarantine instead of infinite re-pick
+
+For task-level categories, the inbox item gains a **durable failure memory** (`failureHistory: [{cycle, classification, verdict}]`) written by `inboxmover` on release. When a task's failure count reaches `task_retry_ceiling`, `inboxmover.Promote` routes it to `.evolve/inbox/quarantine/` (with the diagnostic) instead of back to root — triage stops re-selecting it, and the loop keeps working other tasks. This wires up the previously-dead `CyclesUnpicked` counter with real semantics.
+
+### Reconciling with `never_stop_queue_inject_inbox`
+
+That HIGHEST rule ("NEVER stop queue/loop") is **refined, not broken**: it governs **task-level** progress — never stop for permission, keep grinding the backlog, queue via inbox. A **system-level** failure is a different regime where continuing is damage, not progress. New unified rule:
+
+> **Task-level failure → never stop** (retry within ceiling / defer / quarantine, queue via inbox). **System-level failure (verdict-incoherence, infra-systemic, non-progress) → halt + escalate + auto-file a P0 pipeline-repair item.** The *queue* is still injected (rule honored); the *loop* halts so the pipeline is fixed first.
+
+## Alternatives considered
+
+1. **Smarter deterministic retry only (no orchestrator).** Rejected: a pure classifier reading the recorded verdict is fooled by a forged verdict (P1). Deterministic logic is kept only as the *floor* + *fallback*, not the primary decider — categorization/justification is judgment work (Core Rule 5).
+2. **Orchestrator full authority, no Go floor.** Rejected by the operator: a mis-classification could still let a system failure be retried. The floor guarantees a broken pipeline cannot be talked out of halting.
+3. **Quarantine the poison task, keep looping (no halt).** Insufficient for *system*-level failures: a broken pipeline poisons *all* tasks, not one. Quarantine is the correct response for *task*-level repetition; halt is correct for system-level. The policy encodes both.
+4. **Raise the consecutive-fail breaker threshold.** Treats the symptom (count) not the cause (incoherence/non-progress) and still repeats N times before stopping. The coherence floor stops at N=1.
+
+## Consequences
+
+- **Positive:** the loop gains a termination/progress guarantee; forged verdicts are caught on the first cycle; token burn on repeated system failures ends; single poison tasks are quarantined without stopping the whole loop; every failure carries a cited category + justified fix-type for the next cycle; system-level halts hand the operator a diagnostic + a queued P0 pipeline-repair task.
+- **Negative / cost:** an autonomous overnight run now *halts* on a system-level failure instead of grinding — by design, this is the point (better to halt-and-wait than burn tokens repeating). Mitigation: the auto-filed P0 pipeline-repair item + escalation dossier make resumption a fast, guided fix.
+- **Testing:** deterministic layers (coherence signal, floor, non-progress counters, quarantine routing, escalation write) are unit-tested TDD-first; the orchestrator decision is contract-tested against `failure-decision.json` schema with the deterministic fallback exercised when the artifact is absent.
+
+## Extension: resolved-fingerprint ack ledger (cycle 1332)
+
+The mid-batch pipeline-blocker breaker (`core.EvaluateBlockerBreaker`, Rule B
+"identical-fingerprint") re-scans `.evolve/runs/cycle-N/failure-digest.json`
+fresh on every relaunch with no memory across invocations. Incident: cycle
+1329 halted on fingerprint `ship|unknown|76d0f4fca190`; its root cause was
+fixed and the P0 inbox item consumed **twice** in one day, yet the SAME
+fingerprint re-tripped the breaker on every subsequent relaunch, because (a)
+the breaker has no concept of "already diagnosed and consumed" and (b)
+`lastCycleNumber` does not advance on a halted/FAILed cycle, so the offending
+digest never leaves the batch window.
+
+Fix: an append-only ack ledger, `.evolve/resolved-fingerprints.json`
+(`{fingerprint, resolved_at, resolved_by}[]`), loaded via
+`core.LoadResolvedFingerprints` and threaded into
+`BlockerBreakerConfig.AckedFingerprints` — Rule B's identical-fingerprint
+loop excludes any digest whose fingerprint is in that set. The exclusion is
+scoped to the exact fingerprint acked; a *different* recurring fingerprint
+still halts at the ceiling unchanged (no blanket Rule B disable). An operator
+writes the ledger via `evolve loop --reset --fingerprint <fp>`
+(`core.AppendResolvedFingerprint`, wired in `cmd_loop.go`'s existing
+`--reset` block); `cmd_loop_blockerbreaker.go` loads the ledger before every
+`EvaluateBlockerBreaker` call. Wiring proof: `TestBlockerBreakerHalt_AckedFingerprintDoesNotReHalt`
+replays the exact 3x-identical-fingerprint incident shape through the real
+`blockerBreakerHalt` call site with and without the ack record.
+
+Deferred (out of this cycle's scope, unscoped design decision): transactionally
+writing the ledger entry as part of *inbox consumption itself* (`kind:
+"pipeline-repair"` items) — today inbox consumption has no existing Go
+production caller to wire into; the CLI `--fingerprint` path above is the
+sanctioned operator-driven alternative until that caller exists.
+
+## Extension: ship-phase explained-failure carrier (cycle 1338)
+
+The same cycle-1329 halt (`ship|unknown|76d0f4fca190`) exposed a second, more
+fundamental gap upstream of the ack-ledger workaround above: the coherence
+floor's `SubstantiveError` signal (`coherence.VerdictInputs.SubstantiveError`,
+consumed by `detectVerdictIncoherence` in `system_failure.go` and its twin
+`buildFailureDossier` in `failure_dossier.go`) was computed from
+`cs.AuditFailReasons` alone. That carrier is populated only at the audit
+floor-verdict chokepoint (`persistFloorFailReasons`, called with
+`failed == PhaseAudit`); a post-audit **ship-phase** dispatch error (e.g. the
+`REPO_CONTRACT_GATE` rejection that actually caused cycle 1329 — a real,
+correctly-firing repo-wide guard, not a forged verdict) never touched it. A
+green audit (161/161 ACS) + green ACS + a legitimate ship-gate FAIL was
+therefore indistinguishable from an actual forged verdict, and repeated
+firings of the same (new, default-ON) `repocontract.go` guard would keep
+reproducing this exact false-positive class independent of the ack ledger.
+
+Fix (the `pipeline-defect-pipeline-blocker` P0 inbox item, dual-call-site,
+mirroring the `AuditFailReasons` shape/lifecycle exactly):
+
+- `cyclestate.CycleState.ShipFailReasons []string` — the ship-phase twin of
+  `AuditFailReasons`. Set in orchestrator memory (never a workspace file, the
+  same trust boundary `AuditFailReasons` documents) at the ONE chokepoint a
+  ship dispatch error ever passes through — `recordFailureLearning` when
+  `fl.Failed == PhaseShip` — since ship has no success-path FAIL verdict the
+  way audit does; every ship failure is an `err != nil` dispatch error.
+  Cleared on ship re-dispatch by the existing `resetFloorFailReason`, extended
+  to handle `PhaseShip` alongside `PhaseAudit`.
+- `SubstantiveError` at both `system_failure.go:184` and
+  `failure_dossier.go:86` now reads
+  `len(cs.AuditFailReasons) > 0 || len(cs.ShipFailReasons) > 0` — the
+  cycle-1046 lockstep discipline this ADR's own code comments require.
+- Compounding fix: `classifyPreClass`'s `gate-block` rule
+  (`failure_digest.go`) gained needles for the repo-contract gate's actual
+  message vocabulary (`"repo-contract"`, `"would red main"`,
+  `"scanner pack"`), so this failure class fingerprints distinctly instead of
+  falling into the `"unknown"` bucket that let 3 recurrences look identical
+  enough to trip the Rule B breaker in the first place.
+
+Wiring proof:
+`TestDetectVerdictIncoherence_ShipPhaseExplainedFail_NoHalt` and
+`TestDetectVerdictIncoherence_AuditPhaseBehaviorUnchangedByShipField`
+(`system_failure_test.go`) replay cycle-1329's exact input shape (recorded
+FAIL, audit=PASS, acs=PASS, `ShipFailReasons` set) through the real
+`detectVerdictIncoherence` call site and assert no halt, while pinning the
+existing audit-phase-only behavior unchanged; `failure_dossier_test.go`'s
+`ship_phase_explained_no_floor_candidate` covers the `buildFailureDossier`
+twin; `failure_digest_test.go`'s `c1329_ship_repo_contract_gate` case covers
+the classifier fix.
+
+## Extension: a static gate reading refutes a prose floor claim (cycle 1828)
+
+Cycle 1828's audit FAIL was forced by one deterministic gate (skills-drift) over a PASS
+narrative, and its retrospective wrote `failure-decision.json` with category `infra-systemic`.
+`applyFailureDecisionFloor` halted the loop on it (`LOOP_SYSTEM_FAILURE_HALT`). The orchestrator's
+judgment (gate 2) had one evidence-based overrule, and only for `verdict-incoherence`: a recorded
+FAIL that carries persisted substantive fail reasons is a diagnosed downgrade, not a forgery.
+
+Fix: the overrule is one rule over persisted evidence, `floorClaimRefutation` in
+`core/decision_branch.go`. It keeps the `verdict-incoherence` case as it was, and adds one: any
+prose floor claim is refuted when only deterministic gates forced the FAIL over a PASS or WARN
+narrative (a verdict-conflict record exists), every gate among them reads the tree statically,
+and no `ShipFailReasons` entry is recorded. The static gates are the rows of the gate table
+(`core/audit_gate_remedy.go`, `auditGateRemedies`) marked `isStaticReading`: gofmt,
+solution-contract, skills-drift and new-package graduation. Such a FAIL is task-level with a named
+remedy, so the failure adapter disposes of it instead of the loop halting. The evidence is
+orchestrator memory, the trust boundary `AuditFailReasons` already documents; no workspace file can
+produce it.
+
+A gate that executes code cannot refute the halt, because its offenders can be the host's
+symptoms: `go vet` turns any non-zero exit into offenders (a full disk reads as an issue), the
+integration tier keeps attempt 1's offenders when its serialized retake cannot start (deliberately:
+a real red is never laundered by retake trouble), and acs-durable, apicover-enforce and EGPS
+`red_count>0` all run code. Those rows
+keep their bounded repair grant (ADR-0093) and never count here. The table also refuses an EGPS
+reason that carries the harness-red clause (`HarnessRedClauseMarker`: predicates the harness could
+not run), so it is no gate diagnosis at all. gofmt counts because an I/O error is no longer an
+offender: `codequality.UnformattedGoFiles` returns an error (the gate warns and is skipped) unless
+every line gofmt wrote to stderr is a positioned parse diagnostic. A genuine systemic failure keeps
+the halt: a CLI wall ends the dispatch before the gates run, a host failure reaches the reasons as
+a gate that could not run (a warning, not a reason), as a reason outside the table, or as an
+executed gate's offenders, which do not refute; gate 1 (the deterministic dossier candidate) runs
+first and is unchanged.
+
+Wiring proof: `TestAuditGateFail_ProseInfraSystemicRetroDoesNotHaltAGateDiagnosedFail` drives the
+cycle-1828 shape through `recordAndBranch` (audit, then retro);
+`TestDecideAfterRetroFloor_StaticGateDiagnosisRefutesProseInfraSystemic` pins the refutation for
+each static gate; `TestDecideAfterRetroFloor_AGateThatExecutesCodeKeepsTheHalt` pins the halt for
+a `go vet` diagnosis of a full disk, an integration tier whose retake could not run, acs-durable,
+apicover-enforce and an EGPS red; `TestAuditGateFail_AnIntegrationTierRedKeepsItsRepairAndTheProseInfraSystemicHalt`
+drives a tier FAIL through `recordAndBranch` to its bounded repair and then the halt;
+`TestAuditGateFail_AHarnessRedEGPSEarnsNoRepairAndKeepsTheHalt`
+and `TestAuditGateFail_AFailNarrativeBesideAGateDiagnosisDerivesNothingAndKeepsTheFloor` pin the
+harness-red and no-conflict-record cases; `TestDecideAfterRetroFloor_ProseInfraSystemicWithAnyNonGateReasonStillHalts`
+pins the halt for a CLI wall, a gate beside a non-gate or ship reason, a conflict record alone,
+`ship_eligible=false`, a host predicate failure and no reason. See the
+[incident](../../incidents/2026-10-07-cycle-1828-gate-forced-fail-earned-no-repair-and-halted.md).
+
+## Extension: a builder's system class defers, never halts (cycle 1841)
+
+Cycle 1841 met the cycle-1828 shape again. The auditor wrote PASS, and only the skills-drift gate forced the FAIL. In the repair round the build handed off WARN with the class `infrastructure-systemic`. The dossier read only the audit's block, so the cycle spent its 2/2 `code-audit-fail` rounds and filed nothing.
+
+A first fix (#1083, round 1) made the build's class a floor candidate, so it halted the loop. The independent review and the operator rejected it:
+
+- `build-report.md` is a file that the build agent writes. The build is the agent whose work failed, so its word is the least trusted input (ADR-0064). The cycle-1828 extension above refutes the same claim from the retrospective, an independent agent.
+- A probe halted the loop with one unformatted file and a WARN that claimed `infrastructure-systemic`.
+- A halt stops every lane of the batch and files a P0 item, so a false claim cost the whole batch.
+
+The decision:
+
+| Id | Decision | Rejected options and why |
+|---|---|---|
+| D1 | The build's system class never halts and never sets the floor candidate. | Halt on the class: one agent-written line stops the batch. |
+| D2 | The class counts only with orchestrator corroboration. At least one repair round ran. The last two audits of the run bound the same worktree tree (the auditor ledger rows). | Trust the class alone: no evidence that the remedy round failed. |
+| D3 | A corroborated class declines further repair rounds. It defers the item with fix type `pipeline-repair`, so the item waits on a console `pipeline-repair-cycle-<N>` item (the route of `reintent-fix-type-routes-the-item`). | Retry until the budget is spent: cycle 1841 spent 2/2 rounds on a reading no rebuild moves. |
+| D4 | The defer inputs are fresh for this cycle. The build's class comes from the ledger and the build report, not from `failure-dossier.json`. The host removes `failure-decision.json` before each retro, on the live path and on resume. When the host cannot remove it, the orchestrator does not read it. The closeout gets the defer as a value on the cycle result. | Read the files back: any agent that can write the workspace can plant a read-only `failure-dossier.json` that claims a system class. |
+
+The limits of D4:
+
+- The class itself still comes from `build-report.md`, which the build writes. D2 corroborates that the repair round did not move the tree. It does not prove the class.
+- The clear before the retro makes `failure-decision.json` fresh, not unforgeable. An agent that writes the workspace during the retro can still replace it. That file also feeds the retro floor (`applyFailureDecisionFloor`), which can halt the batch. Thus this limit can cost the batch, not one lane. Only `floorClaimRefutation` and the disposition check guard it.
+- The host does not clear `audit-report.md` before the first audit, so a report that is planted before round 0 is still a defer input. The item `planted-audit-report-before-the-first-audit` tracks this.
+
+The consequence: a false build class costs one lane and one console item, not the batch. A true pipeline defect still reaches the console. The halt paths of this ADR are unchanged: an incoherent verdict, an audit-declared floor class, and a retro floor claim that `floorClaimRefutation` does not refute.
+
+## Implementation slices (one campaign)
+
+- **S1 — Policy schema + loader:** `failure_policy` struct in `internal/policy` + compiled defaults + policy.json block. TDD.
+- **S2 — Evidence dossier + coherence signal:** `CheckVerdictCoherence` + non-progress counters + `failure-dossier.json`. TDD.
+- **S3 — Floor + halt:** `ActionHaltDiagnose`, floor enforcement in the retro-decision path, `StopReason="system_failure_halt"` + rc in `cmd_loop`. TDD.
+- **S4 — Orchestrator integration:** instructions + `failure-decision.json` schema + consumption in `decideAfterRetro*`, Go floor override, deterministic fallback. Contract-tested.
+- **S5 — Task quarantine:** inbox failure memory + `inboxmover` quarantine routing at `task_retry_ceiling`. TDD.
+- **S6 — Escalation + auto-file:** `pipeline-escalation.json` + P0 `pipeline-defect` inbox item. TDD.
+- **S7 — Docs + rule update:** this ADR, `runtime-reference.md` (StopReason table + failure_policy), AGENTS.md rule refinement, memory `feedback` update.

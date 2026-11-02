@@ -1,0 +1,165 @@
+//go:build integration
+
+package core
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/mintregistry"
+)
+
+func writeMintSpec(t *testing.T, root, name, body string) {
+	t.Helper()
+	if body == "" {
+		body = `{"name":"` + name + `","optional":true}`
+	}
+	dir := filepath.Join(root, ".evolve", "phases", name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "phase.json"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func runScoutLeakCycle(t *testing.T, root, leakPath string) error {
+	t.Helper()
+	dirty := &fakeGitDirty{baseline: []string{}, afterLeak: []string{leakPath}}
+	runners := minimalRunners(PhaseScout, &leakInjector{name: PhaseScout})
+	o := NewOrchestrator(&fakeStorage{}, &fakeLedger{}, runners,
+		WithWorktreeProvisioner(&fakeWorktree{path: t.TempDir()}),
+		WithGitDirtyPaths(dirty.Fn()),
+	)
+	_, err := o.RunCycle(context.Background(), CycleRequest{ProjectRoot: root, GoalHash: "g"})
+	return err
+}
+
+func TestGuardExemptsConcurrentLaneMintedPhaseConfig(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	const mintLeak = ".evolve/phases/xlane-mint/phase.json"
+	if err := mintregistry.Append(mintregistry.Path(root), "xlane-mint", time.Now()); err != nil {
+		t.Fatalf("registry append: %v", err)
+	}
+	writeMintSpec(t, root, "xlane-mint", "")
+	err := runScoutLeakCycle(t, root, mintLeak)
+	if err != nil && strings.Contains(err.Error(), "tree-diff") {
+		t.Errorf("guard must not abort on a concurrent lane's registered mint; got: %v", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "no runner") {
+		t.Fatalf("expected the cycle to advance past scout's guard to a no-runner phase; got: %v", err)
+	}
+}
+
+func TestGuardStillAbortsUnregisteredPhaseConfigLeak(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	const leak = ".evolve/phases/evil/phase.json"
+	err := runScoutLeakCycle(t, root, leak)
+	if err == nil {
+		t.Fatal("expected tree-diff abort for unregistered phase-config leak; got nil error")
+	}
+	if !strings.Contains(err.Error(), "tree-diff") {
+		t.Errorf("abort must come from the tree-diff guard; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), leak) {
+		t.Errorf("abort error must name the leaked path %q; got: %v", leak, err)
+	}
+}
+
+func TestGuardAbortsForgedRegistryEntryWithUnclampedSpec(t *testing.T) {
+	t.Parallel()
+
+	const leak = ".evolve/phases/xlane-mint/phase.json"
+	cases := []struct {
+		label string
+		body  string
+	}{
+		{"missing-spec-file", "-"},
+		{"garbage-json", "{not json"},
+		{"non-optional-spec", `{"name":"xlane-mint","optional":false}`},
+		{"name-mismatch", `{"name":"other-phase","optional":true}`},
+		{"invalid-kind", `{"name":"xlane-mint","optional":true,"kind":"exec"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.label, func(t *testing.T) {
+			root := t.TempDir()
+			if err := mintregistry.Append(mintregistry.Path(root), "xlane-mint", time.Now()); err != nil {
+				t.Fatalf("registry append: %v", err)
+			}
+			if tc.body != "-" {
+				writeMintSpec(t, root, "xlane-mint", tc.body)
+			}
+			err := runScoutLeakCycle(t, root, leak)
+			if err == nil || !strings.Contains(err.Error(), "tree-diff") {
+				t.Fatalf("guard must abort a registered name whose spec fails the clamp (%s); got: %v", tc.label, err)
+			}
+		})
+	}
+}
+
+func TestGuardAbortsCompanionPayloadUnderRegisteredMint(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	const payload = ".evolve/phases/xlane-mint/payload.sh"
+	if err := mintregistry.Append(mintregistry.Path(root), "xlane-mint", time.Now()); err != nil {
+		t.Fatalf("registry append: %v", err)
+	}
+	writeMintSpec(t, root, "xlane-mint", "")
+	err := runScoutLeakCycle(t, root, payload)
+	if err == nil || !strings.Contains(err.Error(), "tree-diff") || !strings.Contains(err.Error(), payload) {
+		t.Fatalf("guard must abort a companion payload under a registered mint; got: %v", err)
+	}
+}
+
+func TestGuardQuarantinesCorruptRegistryAndStaysArmed(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	const leak = ".evolve/phases/xlane-mint/phase.json"
+	regPath := mintregistry.Path(root)
+	if err := os.MkdirAll(filepath.Dir(regPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(regPath, []byte("{corrupt"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeMintSpec(t, root, "xlane-mint", "")
+	err := runScoutLeakCycle(t, root, leak)
+	if err == nil || !strings.Contains(err.Error(), "tree-diff") {
+		t.Fatalf("corrupt registry must keep the guard armed; got: %v", err)
+	}
+	if _, statErr := os.Stat(regPath); !os.IsNotExist(statErr) {
+		t.Errorf("corrupt registry must be quarantined (renamed away); stat err: %v", statErr)
+	}
+	matches, _ := filepath.Glob(regPath + ".corrupt-*")
+	if len(matches) != 1 {
+		t.Errorf("expected exactly one quarantined registry file; got %v", matches)
+	}
+	names, readErr := mintregistry.ActiveNames(regPath, time.Now())
+	if readErr != nil || len(names) != 0 {
+		t.Errorf("post-quarantine registry must read empty/no-error; got %v, %v", names, readErr)
+	}
+}
+
+func TestGuardStillAbortsExpiredMintPhaseConfigLeak(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	const leak = ".evolve/phases/stale-mint/phase.json"
+	if err := mintregistry.Append(mintregistry.Path(root), "stale-mint", time.Now().Add(-mintregistry.TTL-time.Minute)); err != nil {
+		t.Fatalf("registry append: %v", err)
+	}
+	err := runScoutLeakCycle(t, root, leak)
+	if err == nil || !strings.Contains(err.Error(), "tree-diff") {
+		t.Fatalf("expected tree-diff abort for expired mint; got: %v", err)
+	}
+}

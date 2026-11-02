@@ -1,0 +1,61 @@
+package phasecmd
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"strconv"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/phasewatchdog"
+)
+
+func RunPhaseWatchdog(args []string, _ io.Reader, stdout, stderr io.Writer) int {
+	var pos []string
+	for _, a := range args {
+		switch a {
+		case "--help", "-h":
+			fmt.Fprintln(stdout, "Usage: evolve phase-watchdog <workspace> <target_pgid> <cycle> <cycle_state_path>")
+			fmt.Fprintln(stdout, "Config: .evolve/policy.json observer.{stall_s,watchdog_poll_s,watchdog_warn_pct,watchdog_grace_s,watchdog_disabled}")
+			return 0
+		default:
+			pos = append(pos, a)
+		}
+	}
+	if len(pos) < 4 {
+		fmt.Fprintln(stderr, "[phase-watchdog] ERROR: requires 4 arguments: <workspace> <target_pgid> <cycle> <cycle_state_path>")
+		return phasewatchdog.ExitInvalidArg
+	}
+	pgid, err := strconv.Atoi(pos[1])
+	if err != nil {
+		fmt.Fprintf(stderr, "[phase-watchdog] ERROR: target_pgid must be a positive integer, got: %s\n", pos[1])
+		return phasewatchdog.ExitInvalidArg
+	}
+	cycle, err := strconv.Atoi(pos[2])
+	if err != nil {
+		fmt.Fprintf(stderr, "[phase-watchdog] ERROR: cycle must be a positive integer, got: %s\n", pos[2])
+		return phasewatchdog.ExitInvalidArg
+	}
+	cfg := watchdogEnvConfig(stderr)
+	cfg.Workspace = pos[0]
+	cfg.TargetPGID = pgid
+	cfg.Cycle = cycle
+	cfg.CycleStatePath = pos[3]
+	return phasewatchdog.Run(cfg, stderr)
+}
+
+func watchdogEnvConfig(stderr io.Writer) phasewatchdog.Config {
+	pol, path, err := loadPolicy()
+	if err != nil {
+		fmt.Fprintf(stderr, "[phase-watchdog] WARN %s path=%s: policy load failed (using compiled watchdog defaults): %v\n",
+			CodePolicyLoadFailed, path, err)
+	}
+	cfg := pol.ObserverConfig()
+	return phasewatchdog.Config{
+		ProjectRoot: os.Getenv("EVOLVE_PROJECT_ROOT"),
+		ThresholdS:  *cfg.StallS,
+		PollS:       *cfg.WatchdogPollS,
+		WarnPct:     *cfg.WatchdogWarnPct,
+		GraceS:      *cfg.WatchdogGraceS,
+		Disabled:    cfg.WatchdogDisabled,
+	}
+}

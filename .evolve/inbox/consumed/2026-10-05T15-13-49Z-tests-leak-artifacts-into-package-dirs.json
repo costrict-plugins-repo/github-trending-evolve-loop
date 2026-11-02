@@ -1,0 +1,26 @@
+{
+  "acceptance": [
+    "A before-and-after filesystem walk of the tree around the test tiers shows no new file or directory (empty directories included), with no allowlist; red first against the leaks named in the summary",
+    "The walk-delta guard is written in Go and runs through the evolve CLI and make, so a new leaking test fails in CI; a git status diff is not acceptable because git does not show empty directories (the subagent leak was empty .evolve/runs/cycle-0 and cycle-1) and it needs an allowlist"
+  ],
+  "consumed": {
+    "at": "2026-10-17T15:37:09Z",
+    "cycle": "",
+    "via": "ship"
+  },
+  "created_at": "2026-10-05T15:13:49Z",
+  "files": [
+    "go/internal/core/audit_fail_decision_test.go",
+    "go/cmd/evolve",
+    "go/internal/deliverable",
+    "go/internal/subagent"
+  ],
+  "fix": "The four leaks the summary names were fixed with t.TempDir() roots in the real-tree-writes console landing (2026-10-06). Remaining: a Go component that walks the tree before and after the test tiers and fails on any new file or directory, with no allowlist, run through the evolve CLI and make; it lands as the next component and consumes this item.",
+  "id": "tests-leak-artifacts-into-package-dirs",
+  "kind": "bug",
+  "priority_class": "stability",
+  "source": "console, floor-budget landing, 2026-10-05",
+  "summary": "Every floor run leaves ignored files inside package directories: go/internal/core/audit-report.md, go/cmd/evolve/.evolve/guards.log, go/internal/deliverable/.evolve/ledger.*, go/internal/subagent/.evolve/runs. One source is audit_fail_decision_test.go:218, which writes to req.Workspace when that is empty, so the write lands in the package's working directory. The files are gitignored, so nothing fails, but they pollute worktrees, can feed later tests stale state (the real-ledger seal test already reads a stray ledger), and hide which test wrote what.",
+  "title": "Package tests write ignored artifacts into their own source directories on every run",
+  "weight": 0.35
+}

@@ -1,0 +1,108 @@
+package clihealth
+
+import (
+	"testing"
+	"time"
+)
+
+func TestParseResetHintTable(t *testing.T) {
+	t.Parallel()
+	loc := time.FixedZone("TEST", 8*3600)
+	now := time.Date(2026, 6, 11, 0, 30, 0, 0, loc)
+	day := 24 * time.Hour
+
+	cases := []struct {
+		name string
+		pane string
+		want time.Time
+		ok   bool
+	}{
+		{"cycle283 AM ahead", "or try again at 6:11 AM.", time.Date(2026, 6, 11, 6, 13, 0, 0, loc), true},
+		{"PM same day", "try again at 5:26 PM.", time.Date(2026, 6, 11, 17, 28, 0, 0, loc), true},
+		{"passed today rolls to tomorrow", "try again at 12:10 AM", time.Date(2026, 6, 12, 0, 12, 0, 0, loc), true},
+		{"noon", "try again at 12:00 PM", time.Date(2026, 6, 11, 12, 2, 0, 0, loc), true},
+		{"midnight as 12 AM tomorrow", "try again at 12:00 AM", time.Date(2026, 6, 12, 0, 2, 0, 0, loc), true},
+		{"case-insensitive", "TRY AGAIN AT 6:11 am", time.Date(2026, 6, 11, 6, 13, 0, 0, loc), true},
+		{"relative hours", "Rate limited. Try again in 2 hours.", now.Add(2*time.Hour + resetMargin), true},
+		{"relative minutes", "try again in 45 minutes", now.Add(45*time.Minute + resetMargin), true},
+		{"relative mins short", "try again in 5 mins", now.Add(5*time.Minute + resetMargin), true},
+		{"relative combined", "try again in 1 hour 30 minutes", now.Add(90*time.Minute + resetMargin), true},
+		{"relative singular", "try again in 1 hour", now.Add(time.Hour + resetMargin), true},
+		{"capped at 24h", "try again in 90 hours", now.Add(day), true},
+		{"garbage", "no hint here", time.Time{}, false},
+		{"empty", "", time.Time{}, false},
+		{"invalid hour", "try again at 13:00 PM", time.Time{}, false},
+		{"invalid minute", "try again at 6:75 AM", time.Time{}, false},
+		{"bare try again", "please try again later", time.Time{}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := ParseResetHint(c.pane, now)
+			if ok != c.ok {
+				t.Fatalf("ok=%v, want %v (got=%v)", ok, c.ok, got)
+			}
+			if ok && !got.Equal(c.want) {
+				t.Errorf("got %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+func TestParseResetHintHonorsNowLocation(t *testing.T) {
+	t.Parallel()
+	tokyo := time.FixedZone("UTC+9", 9*3600)
+	now := time.Date(2026, 6, 11, 1, 0, 0, 0, tokyo)
+	got, ok := ParseResetHint("try again at 6:11 AM", now)
+	if !ok {
+		t.Fatal("must parse")
+	}
+	if got.Location() != tokyo {
+		t.Errorf("result location %v, want now's location", got.Location())
+	}
+	want := time.Date(2026, 6, 11, 6, 13, 0, 0, tokyo)
+	if !got.Equal(want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestEvidenceLine_PrefersBannerOverFirstLine(t *testing.T) {
+	pane := "   53 +\t\tFamily: \"codex\",\n" +
+		"some intermediate output\n" +
+		"You've hit your usage limit. try again in 3 hours.\n"
+	got := evidenceLine(pane)
+	if got != "You've hit your usage limit. try again in 3 hours." {
+		t.Errorf("evidenceLine picked %q, want the reset-hint banner line", got)
+	}
+}
+
+func TestEvidenceLine_FallsBackToFirstLine(t *testing.T) {
+	pane := "first line here\nsecond line\n"
+	if got := evidenceLine(pane); got != "first line here" {
+		t.Errorf("evidenceLine = %q, want firstLine fallback", got)
+	}
+}
+
+func TestClaudeSessionResetBench(t *testing.T) {
+	banner := "You've hit your session li" + "mit · resets 5:10am (Asia/Taipei)"
+	for _, tc := range []struct{ name, now, want string }{
+		{"ahead across UTC date", "2026-09-08T20:00:00Z", "2026-09-08T21:12:00Z"},
+		{"passed rolls calendar day", "2026-09-08T22:00:00Z", "2026-09-09T21:12:00Z"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now, _ := time.Parse(time.RFC3339, tc.now)
+			want, _ := time.Parse(time.RFC3339, tc.want)
+			entry := NewBenchEntry(Entry{}, "claude", "exhausted", "unrelated first line\n"+banner, now)
+			if !entry.BenchedUntil.Equal(want) {
+				t.Errorf("bench deadline=%v want %v", entry.BenchedUntil, want)
+			}
+			if entry.Evidence != banner {
+				t.Errorf("evidence=%q want captured banner", entry.Evidence)
+			}
+		})
+	}
+	for _, hint := range []string{"resets 13:10am (Asia/Taipei)", "resets 5:75am (Asia/Taipei)", "resets 5:10am (Invalid/Zone)", "resets 5:10am (Asia/Taipei", "resets 5:10am ()"} {
+		if _, ok := ParseResetHint(hint, time.Now()); ok {
+			t.Errorf("invalid hint accepted: %s", hint)
+		}
+	}
+}

@@ -1,0 +1,495 @@
+# Signal Center codes
+
+> Generated from the code registry — `signalcenter.RegisterCode`, one call per code, in the module
+> that owns it — by `evolve signals codes generate`. `evolve signals codes check` (run by a `cmd/evolve`
+> test, so by CI) exits 2 when this file drifts from the registry. Design:
+> [signal-center-design.md](signal-center-design.md) §5.4 · [ADR-0101](adr/0101-signal-center.md).
+
+Every WARN or INCIDENT signal carries one of these codes; an INFO signal can carry one too. A code names the
+**rule** that fired (`MODULE_SNAKE_CASE`, prefix = the owning module); `kind` names the event and
+`origin` the function. Triage kind-first (design §9): the kind says what happened, the code says
+which rule decided it, `fields` name the artifact to open. The Center does not drop a code that
+is not registered here. It stamps the event `SIGNALCENTER_UNREGISTERED_CODE` and keeps the raw
+value in `fields.raw_code`, so the drift is visible in the same file.
+
+Ship codes are the `shiperr` vocabulary projected verbatim (`SHIP_` + code, `shiperr.SignalCode`);
+the ship phase's own `ship-error.json` and ledger entries keep the unprefixed spelling.
+
+<!-- GENERATED:signal-codes BEGIN — do not edit by hand; run `evolve signals codes generate` -->
+
+### advisor
+
+| Code | Meaning |
+|---|---|
+| `ADVISOR_CAPTURE_WRITE_FAILED` | a redacted capture artifact (advisor-prompt-, advisor-response- or advisor-span-<kind>) could not be persisted (fields.artifact = prompt / response / span; fields.op = marshal / write — marshal is dormant, a Span always marshals); the decision still returns and the remaining artifacts are still attempted; the ledger binds nothing for an absent capture; fields.step=capture, path, decision, contract |
+| `ADVISOR_LAUNCH_FAILED` | the routing/plan dispatch produced no response — the preflight refused (nil bridge, empty workspace, the depth guard; fields.step=preflight) or every CLI in the router profile's fallback chain failed (fields.step=dispatch, cli, chain, exit_code, profile); the error is still returned and the caller degrades to the static spine or keeps the initial plan; fields.decision, contract |
+| `ADVISOR_MINT_REJECTED` | a plan entry minted a reserved control-plane identity (router/advisor/failure-advisor and their aliases) and was dropped by the recursion guard; the rest of the plan stands, one event per drop at decision time (never on resume or replay); fields.step=mint, minted_phase, decision, contract |
+| `ADVISOR_RECON_GIT_FAILED` | the pre-plan recon's recent-files reader (git log over the project root) failed while the recon digest was on; the digest is composed without file facts and planning proceeds; fields.step=compose, project_root, decision, contract |
+| `ADVISOR_RESPONSE_UNPARSEABLE` | the launch returned but no decision decoded from its output (fields.cause = no_json / invalid_json / empty); the wrapped error is still returned and the caller degrades — on the per-transition Propose path this is the first visibility the fault ever had; fields.step=parse, stdout_bytes, artifact, decision, contract |
+
+### audit
+
+| Code | Meaning |
+|---|---|
+| `AUDIT_CIPARITY_CHANGESET_UNDERIVABLE` | the cycle's changed-package set was underivable (git failed — e.g. a concurrent-fleet .git/index.lock race) and a whole-repo CI-parity gate (go vet, acs-durable, integration tier) SKIPPED fail-open with a WARN diagnostic; one event per gate, CI backstops the check; fields.gate, root |
+| `AUDIT_CIPARITY_GATE_FAILED` | a CI-parity gate returned offenders — the audit FAILs and the cycle routes to retro; fields.cause ∈ {exit, retake_exec_failed, deadline_with_markers, retake_red, underivable, apicover, ungraduated}, fields.gate, offenders (count), first (the first offender), log (the integration-tier.log when written), exit |
+| `AUDIT_CIPARITY_GATE_STEP_FAILED` | a CI-parity gate's pre-verdict step could not run and the gate failed OPEN (the diagnostic is the WARN the audit renders): fields.step ∈ {exec, tier_attempt, tier_list, bin_dir, cover_run, cover_func, write_func_cover, pkg_dirs, measure}; fields.gate, err, cmd (the exec/list/fork steps) |
+| `AUDIT_CIPARITY_GRADUATION_DEFERRED` | an ungraduated new package has no production .go surface (test-only or absent) so the graduation gate did not flag it; the enrollment obligation re-raises when production code lands; fields.gate, pkg, dir |
+| `AUDIT_CIPARITY_TIER_DEADLINE_NO_VERDICT` | the serialized integration-tier retake hit its per-attempt budget with no test verdict in the truncated output — a deadline kill is not a judgment, degraded to WARN; fields.gate, budget, log, lock_note |
+| `AUDIT_CIPARITY_TIER_ENV_EXCLUSIVE_SKIPPED` | touched package(s) are env-exclusive under a live loop: scope=all — the integration tier skipped with a WARN; scope=mixed — the runnable remainder ran without them; fields.gate, scope, pkgs, remainder, backstop (the record's honest backstop, verbatim) |
+| `AUDIT_CIPARITY_TIER_FLAKE_ABSORBED` | the integration tier was RED under fleet contention but GREEN on the serialized clean-env retake — a contention flake absorbed as a WARN, not a code defect; fields.gate, attempt1_exit, log, lock_note |
+| `AUDIT_CIPARITY_TIER_LOCK_UNAVAILABLE` | the cross-lane integration-tier retake lock degraded (best-effort by design — the retake ran unserialized): fields.reason ∈ {no_root, error, timeout}; fields.gate, path, err, wait |
+| `AUDIT_CIPARITY_TIER_LOG_WRITE_FAILED` | integration-tier.log could not be opened or appended for an attempt (an empty Workspace is a declared no-op, not a fault); an earlier successful write keeps its pointer in the offenders; fields.gate, path, attempt, err |
+| `AUDIT_CIPARITY_TIER_RETAKE_EXEC_FAILED` | the serialized integration-tier retake could not START (silent before unit 14); the gate still FAILs on attempt 1's offenders — a real red is never laundered by retake infra trouble — and a GATE_FAILED cause=retake_exec_failed follows; fields.gate, err, log |
+| `AUDIT_LEDGER_ANCESTOR_EMPTY` | the ancestor left no reconcilable defect-ledger.json (absent or empty), so NO inherited defect is enforced this cycle; expected for an ancestor that predates the ledger, but a deleted ledger looks identical — recorded, never assumed benign; fields.step=grade, ancestor_cycle, path |
+| `AUDIT_LEDGER_DEFECTS_UNACCOUNTED` | inherited defects are neither FIXED with resolving evidence nor DEFERRED with a reason (fields.count; the first ids in fields.ids, ids_truncated when more); the cycle is blocked — disposition each id in defect-dispositions.json (the per-id reasons are in the diagnostic and the written-back ledger); fields.step=grade, ancestor_cycle, path |
+| `AUDIT_LEDGER_DISPOSITIONS_INCOMPLETE` | defect-dispositions.json covers only some inherited OPEN ids (fields.open, covered, the first uncovered ids, uncovered_truncated when more); the cycle is blocked — finish the file that exists; fields.step=preflight, ancestor_cycle, path |
+| `AUDIT_LEDGER_DISPOSITIONS_MISSING` | a continuation owing dispositions holds no defect-dispositions.json at all (fields.open inherited OPEN ids); the cycle is blocked — author the file from scratch, one entry per inherited id; fields.step=preflight, ancestor_cycle, path |
+| `AUDIT_LEDGER_DISPOSITIONS_UNREADABLE` | defect-dispositions.json is present but cannot be read or parsed (fields.op = read | parse; an object, number or bool evidence shape is a parse fault); the cycle is blocked — the diagnostic carries the expected schema; fields.step=read, path |
+| `AUDIT_LEDGER_EMIT_FAILED` | a rejecting audit's defect ledger could not be read or written while recording this cycle's defects (fields.op = read | parse | write); the verdict stands, a later continuation has nothing to reconcile against — repair the workspace ledger; fields.step=emit, path |
+| `AUDIT_LEDGER_LINEAGE_DISAGREES` | the workspace manifest and the root-owned registry name different ancestors; the rewritable copy is the suspect and the cycle is blocked until the disagreement is resolved; fields.step=arm, manifest_cycle, registry_cycle |
+| `AUDIT_LEDGER_MANIFEST_MISSING` | the root-owned continuation registry binds this lane's scope to an ancestor but the workspace holds no manifest — it was deleted or never written; inherited defects are reconciled from the registry binding and the cycle is blocked; the missing manifest is the finding; fields.step=arm, registry_path, ancestor_cycle |
+| `AUDIT_LEDGER_MANIFEST_UNREADABLE` | the workspace continuation-manifest.json is present but unreadable, so the continuation cannot be graded against its lineage; the cycle is blocked from PASS (cycle-1285 F2) — repair the manifest; fields.step=arm, workspace |
+| `AUDIT_LEDGER_OVERFLOW` | a rejecting audit carried more defects than the ledger cap; the first rows are recorded and ONE synthetic OPEN row stands for the truncated tail (fields.overflow, cap) — fix the emitter or widen the cap; fields.step=emit, path |
+| `AUDIT_LEDGER_PROMPT_DEGRADED` | while composing the audit prompt the continuation manifest (fields.reason=manifest; fallback = registry | none) or the ancestor ledger (fields.reason=ledger, op = read | parse) could not be read, so the auditor was NOT told its inherited ids; stream-only — the same fault blocks at Classify under its own WARN code; fields.step=prompt, path |
+| `AUDIT_LEDGER_UNREADABLE` | the ancestor's or this cycle's own defect-ledger.json is present but unreadable (fields.which = ancestor | own, op = read | parse); the continuation is blocked — repair the file named by fields.path; fields.step=grade, ancestor_cycle |
+| `AUDIT_LEDGER_WRITEBACK_FAILED` | the reconciled ledger could not be written back into the workspace; an invisible disposition is not a disposition, so the cycle is blocked; fields.step=grade, path |
+
+### bridge
+
+| Code | Meaning |
+|---|---|
+| `BRIDGE_AUTH_BENCH_CLEARED` | a launch, live smoke or usage read of a CLI family succeeded, so the cli-health store removed the auth bench (auth_recheck) of that family; quota benches stay; fields family, reason, source (clihealth.ClearSource: launch, smoke or usage_probe), key |
+| `BRIDGE_BOOT_STRIKE_CLEAR_FAILED` | the boot-strike store could not clear the driver's consecutive boot-timeout strike after a non-80 exit (the REPL booted); the strike count may stay stale and bench the driver early; fields step=clear_boot_strike, call_id, cli, agent |
+| `BRIDGE_BOOT_STRIKE_RECORD_FAILED` | the boot-strike store could not record the driver's boot-timeout strike after exit 80; the bench never escalates for this driver; the launch error still wraps the transient sentinel; fields step=record_boot_strike, call_id, cli, agent |
+| `BRIDGE_COMPLETED_ON_WORKTREE_EVIDENCE` | a correction re-dispatch of a source-writing phase went idle without rewriting its deliverable, and the agent had changed the worktree since dispatch (host state under .evolve/, the workspace and the deliverable's own locations never count), so the bridge completed on the carried deliverable instead of letting the idle wait end in exit 81; core's phase verify and review gate then judge the unchanged deliverable; the reason is the completion note; fields deliverable, changed_paths, paths (at most eight, then +N more), cli |
+| `BRIDGE_CONTEXT_FILL_HIGH` | an attempt's context fill crossed the configured warn threshold; the reason names the fill and the threshold |
+| `BRIDGE_DISPATCH_MODEL_MISMATCH` | a target whose manifest declares launch_model_verification showed no footer label of its model_family within label_wait_s (the label on the footer-prefix line decides; any other label never counts; no prefix line means unreadable, which means 87; a footer label naming two families is no evidence), after the REPL booted and before the prompt was delivered; the session is killed and the launch exits 87, a walk trigger, so the attempt moves to the next CLI. The mismatch itself benches nothing; the usage-evidence decorator queries the family's usage as for any quota-explainable exit, and an exhausted verdict benches it (agy boots its Gemini default when the Claude group is exhausted); fields.expected (the target's model_family), observed (the last labelled footer's family, ambiguous, or unreadable), label (the last footer label read), cli, phase |
+| `BRIDGE_DISPATCH_PROCESS_SURVIVED` | a process of a finished dispatch was still alive after SIGTERM, the grace time and SIGKILL; it carried the dispatch tag or was in the pane tree recorded before kill-session; fields dispatch, pids |
+| `BRIDGE_DISPATCH_REAP_FAILED` | the sweep at dispatch end could not list the processes or could not send a signal; the processes of the dispatch can still run, and gc is the backstop; fields dispatch, errors |
+| `BRIDGE_DISPATCH_SWEEP_REFUSED` | the sweep at dispatch end did not look for orphans by cwd, because the worktree is not a safe base: it is relative, it cannot be resolved, it is not the top of a git checkout, or it holds the project root or the home directory; the tag and pane-tree proofs still run; fields dispatch, reason |
+| `BRIDGE_EXIT_ARTIFACT_TIMEOUT` | the artifact never appeared within the wait window (exit 81); wraps core.ErrArtifactTimeout — one code whatever the sub-cause, which rides cause_code (context_cancelled, pane_lost (the tmux session or its server is gone: an infrastructure loss, never a stall), completion_detector_error, submit_wedged, transient_upstream, review_stop, review_pause, incomplete); the reason is the classified launch error (the exact string the outcome record and the retry backoff parse), fields exit_code, cause_code, transient, ctx_cancelled, launch_error (the persisted <agent>-launch-error.txt when written), call_id, cli, agent, step=classify |
+| `BRIDGE_EXIT_BAD_FLAGS` | a launch died in the validate gauntlet — bad flags, a missing profile, an unreadable or empty prompt, no driver for the CLI (exit 10); plain failure; the reason is the classified launch error (the exact string the outcome record and the retry backoff parse), fields exit_code, cause_code, transient, ctx_cancelled, launch_error (the persisted <agent>-launch-error.txt when written), call_id, cli, agent, step=classify |
+| `BRIDGE_EXIT_COMMAND_TIMEOUT` | the driver was killed by a command-level timeout (exit 124, the gnu timeout convention); transient — infra weather, the sibling of 81; the reason is the classified launch error (the exact string the outcome record and the retry backoff parse), fields exit_code, cause_code, transient, ctx_cancelled, launch_error (the persisted <agent>-launch-error.txt when written), call_id, cli, agent, step=classify |
+| `BRIDGE_EXIT_COST_LEAK` | a launch refused to leak a forbidden credential into the inner CLI's environment (exit 3); plain failure; the reason is the classified launch error (the exact string the outcome record and the retry backoff parse), fields exit_code, cause_code, transient, ctx_cancelled, launch_error (the persisted <agent>-launch-error.txt when written), call_id, cli, agent, step=classify |
+| `BRIDGE_EXIT_DRIVER_ERROR` | a launch exited with a code the table does not name; plain failure, ledger cause driver_error; the reason is the classified launch error (the exact string the outcome record and the retry backoff parse), fields exit_code, cause_code, transient, ctx_cancelled, launch_error (the persisted <agent>-launch-error.txt when written), call_id, cli, agent, step=classify |
+| `BRIDGE_EXIT_MISSING_BINARY` | a required external binary is missing (exit 127); deliberately plain — an absent CLI is an environment defect, and the family fallback sees the raw 127; the reason is the classified launch error (the exact string the outcome record and the retry backoff parse), fields exit_code, cause_code, transient, ctx_cancelled, launch_error (the persisted <agent>-launch-error.txt when written), call_id, cli, agent, step=classify |
+| `BRIDGE_EXIT_MODEL_MISMATCH` | a tmux REPL booted a model outside the dispatched target's model_family, or showed no readable model label, before the prompt was delivered (exit 87); plain failure that walks the chain to the next CLI; the exit benches nothing by itself, while the usage-evidence decorator's query can bench an exhausted family — BRIDGE_DISPATCH_MODEL_MISMATCH carries the expected and observed families; the reason is the classified launch error (the exact string the outcome record and the retry backoff parse), fields exit_code, cause_code, transient, ctx_cancelled, launch_error (the persisted <agent>-launch-error.txt when written), call_id, cli, agent, step=classify |
+| `BRIDGE_EXIT_REPL_BOOT_TIMEOUT` | a tmux REPL never showed its prompt marker within the boot budget (exit 80); transient — the boot strike is recorded before this event; the reason is the classified launch error (the exact string the outcome record and the retry backoff parse), fields exit_code, cause_code, transient, ctx_cancelled, launch_error (the persisted <agent>-launch-error.txt when written), call_id, cli, agent, step=classify |
+| `BRIDGE_EXIT_REQUIRED_TIER_UNAVAILABLE` | --require-full was set and the full model tier is unavailable (exit 99); plain failure; the reason is the classified launch error (the exact string the outcome record and the retry backoff parse), fields exit_code, cause_code, transient, ctx_cancelled, launch_error (the persisted <agent>-launch-error.txt when written), call_id, cli, agent, step=classify |
+| `BRIDGE_EXIT_RESPOND_LOOP_GUARD` | the auto-respond loop guard tripped (exit 86); transient; the reason is the classified launch error (the exact string the outcome record and the retry backoff parse), fields exit_code, cause_code, transient, ctx_cancelled, launch_error (the persisted <agent>-launch-error.txt when written), call_id, cli, agent, step=classify |
+| `BRIDGE_EXIT_SAFETY_GATE` | a launch died in a safety gate (exit 2: e.g. a launch without --allow-bypass, or a --human-input with no audit); plain failure; the reason is the classified launch error (the exact string the outcome record and the retry backoff parse), fields exit_code, cause_code, transient, ctx_cancelled, launch_error (the persisted <agent>-launch-error.txt when written), call_id, cli, agent, step=classify |
+| `BRIDGE_EXIT_SIGNAL_DEATH` | the driver died of a signal or failed to start (exit -1): transient under a cancelled context (our own teardown — the deliverable-authority door), plain with a live one (a start failure); the ledger cause stays driver_error; the reason is the classified launch error (the exact string the outcome record and the retry backoff parse), fields exit_code, cause_code, transient, ctx_cancelled, launch_error (the persisted <agent>-launch-error.txt when written), call_id, cli, agent, step=classify |
+| `BRIDGE_EXIT_UNKNOWN_PROMPT` | the auto-responder escalated on an interactive prompt and wrote the escalation report, or a checkpoint corroborated a quota wall (exit 85); transient — one code whatever the pattern, which rides cause_code (rate_limit, model_unsupported, …; unknown_prompt for a prompt nobody recognised); the reason is the classified launch error (the exact string the outcome record and the retry backoff parse), fields exit_code, cause_code, transient, ctx_cancelled, launch_error (the persisted <agent>-launch-error.txt when written), call_id, cli, agent, step=classify |
+| `BRIDGE_FRESH_SESSION_RETRY` | a launch runs as the ONE fresh session of the same CLI that core.LaunchRecoverable starts after the session before it ended on a session-recoverable cause (dead_shell, cli_self_updated: the REPL process is gone, the CLI and account are fine); the dead row is on the ledger marked session_recoverable and this row is marked fresh_session_retry; the bridge marks a response session-recoverable never for a named session, a delivered run, a cancelled context or a deadline with no room for another wait interval (F31); fields call_id (the fresh dispatch), cli, agent |
+| `BRIDGE_INBOX_DRAIN_FAILED` | the inbox of the running dispatch could not be read at a tick; the envelopes after the read offset stay unread and the next tick tries again; fields dispatch, agent, error |
+| `BRIDGE_LAUNCH_ERROR_PERSIST_FAILED` | the captured launch stderr could not be persisted as <workspace>/<agent>-launch-error.txt after a non-zero exit (the forensic file a validate-gauntlet death leaves); the classified error is unchanged and the BRIDGE_EXIT_* event carries no launch_error field; fields step=persist_launch_error, path, call_id, cli, agent |
+| `BRIDGE_RESULT_READ_FAILED` | the launch exited 0 but its result (the artifact, or the stdout scrollback under the stdout completion contract) could not be read into the response; Launch still returns nil with an empty Stdout — the on-disk report is the verdict source; fields step=read_result, path, completion, call_id, cli, agent |
+| `BRIDGE_SUBAGENT_ADAPTER_EXEC_FAILED` | the bridge adapter returned an infrastructure error (exit -1 on a launch fault); the ledger line is still written and the verdict fields carry what the artifact ladder found; the ONE outcome signal of such a run; fields.step=exec, exit_code, verdict, integrity |
+| `BRIDGE_SUBAGENT_ARTIFACT_HASH_FAILED` | the artifact stood the ladder (PASS or FAIL) but could not be hashed, so the ledger line stamps artifact_sha256="" — silent before unit 16; fields.step=hash, artifact |
+| `BRIDGE_SUBAGENT_ARTIFACT_INTEGRITY_FAIL` | the adapter returned but the artifact failed the integrity ladder (fields.rung = missing | stale | unreadable | empty | token_missing); the reason is the ladder's diagnostic the run's result used to drop; fields.step=verify, artifact, exit_code |
+| `BRIDGE_SUBAGENT_GIT_STATE_UNKNOWN` | git HEAD or the tree-diff sha could not be captured (an error or an empty value), so the ledger line stamps "unknown" — silent before unit 16; fields.step=provenance, head, tree_state, project_root |
+| `BRIDGE_SUBAGENT_LEDGER_WRITE_FAILED` | the agent_subprocess ledger line or its tip could not be written (fields.op = mkdir | flock | chain_link | open | write | close | tip_tmp | tip_rename); the returned error keeps its bare text and masks any adapter error, exactly as before; fields.step=ledger, path |
+| `BRIDGE_SUBAGENT_LLM_RESOLVE_FALLBACK` | the LLM router returned an error, so the cli was taken from the profile's cli field with source=profile — silent before unit 16; fields.step=cli, source, cli |
+| `BRIDGE_SUBAGENT_PREPARE_FAILED` | the artifact directory, the challenge token, the prompt read or the prompt temp file failed before the adapter ran (fields.step = artifact_dir | token | prompt | stage; fields.op = create | write on stage) |
+| `BRIDGE_SUBAGENT_REQUEST_REJECTED` | an `evolve subagent run` request was rejected at admission (no prompt reader, an unknown agent role, a negative cycle, a missing workspace, the retired in-process escape hatch, or the recursion depth cap); no port was consulted; fields.step=validate, reason_class |
+| `BRIDGE_SUBAGENT_RESOLUTION_FAILED` | the dispatch could not resolve its profile, cli, driver, model tier or capability manifest (fields.step names which: profile | cli | driver | tier | capability; the profile step's reason carries the read error the returned text drops) |
+| `BRIDGE_SUBAGENT_VERDICT_FAIL` | the artifact is sound but the adapter exited non-zero (the bridge's exit codes reach here as fields.exit_code); fields.step=verify, cli, artifact |
+| `BRIDGE_SUBAGENT_WORKTREE_FALLBACK` | WorktreePath was not propagated, so WORKTREE_PATH falls back to the project root and the agent runs against the main tree (the Warns entry callers print is kept); fields.step=env, worktree, project_root |
+| `BRIDGE_TELEMETRY_APPEND_FAILED` | the per-attempt telemetry record could not be appended to the workspace ledger; fields name the path |
+| `BRIDGE_TELEMETRY_TRIPWIRE` | a successful attempt ran past the tripwire threshold with no measurable token usage — telemetry blind spot, not a phase failure |
+| `BRIDGE_TOKEN_RESOLVER_FAILED` | the token resolver returned an error for a completed attempt; usage recorded as resolver-error |
+| `BRIDGE_TOKEN_RESOLVER_MISSING` | the engine was built without a token resolver; lifecycle and outcome records continue without token counts (fail-open) |
+| `BRIDGE_TOKEN_USAGE_WARNING` | the token resolver measured the attempt with a caveat (invalid counters, partial measurement); the caveat is the reason |
+| `BRIDGE_USAGE_EVIDENCE` | a CLI failed in a way quota could explain (a REPL boot timeout, no response, an escalation, a stall, a failed doctor probe), so the failure path queried the CLI's usage in a fresh session and recorded the verdict for the failing family: exhausted (a family-scoped window is used up: the verified cause, and the family is benched until the reset), healthy (quota ruled out for the family; an exhausted per-model window is named as a note, never as the cause), unavailable (the usage query failed too, which points at auth, install or network) or unknown (no usage window could be read); the reason is the verdict summary; fields driver, cli, family, verdict, trigger (exit N or stall), exit_code, cached, and record_error when the workspace record could not be written |
+
+### build
+
+| Code | Meaning |
+|---|---|
+| `BUILD_SELFCHECK_FINDINGS` | a build closed with no GREEN self-check receipt for its tree and the handoff floor found findings (ADR-0158 decision 18); fields.stage is shadow or enforce; fields.source is gate (shadow: the findings of the review gate, no floor run in the wait) or bridge (enforce: the floor run before the close); fields.decision is would_return_in_session (shadow), delivered (enforce, the paste into the live session succeeded) or delivery_failed (enforce, fields.error names why); fields.receipt is absent, red or stale; fields.findings is the count |
+
+### carryover
+
+| Code | Meaning |
+|---|---|
+| `CARRYOVER_PERSIST_FAILED` | state.json could not take this run's failure-learning arrays (fields.step: write = the legacy whole-state write, update = the serialized read-modify-write); the in-memory state stands and the caller proceeds — the FailedRecord and the P0 todo may be lost from disk |
+| `CARRYOVER_WORKSPACE_MALFORMED` | a cycle-workspace carryover document is not its documented JSON shape; the file is skipped whole, never aborting the cycle — a persona defect for the memo or audit owner; the reason carries the decode error |
+| `CARRYOVER_WORKSPACE_READ_FAILED` | a cycle-workspace carryover document (carryover-todos.json or defect-ledger.json) exists but could not be read (not absence: permissions, a directory at the path); nothing is merged, the closeout proceeds; fields name the document and path |
+
+### cli
+
+| Code | Meaning |
+|---|---|
+| `CLI_QUEUE_FAILED` | the boundary could not apply a queued CLI request (cli-contract.md §4 rule 3); the request moved to .evolve/queue/failed/; fields verb, request, rc, shelf |
+| `CLI_QUEUE_UNLANDED` | the applied queue left tracked changes beyond the loop stamps; the next sync-main refuses them until an operator lands them (cli-contract.md §4.6); fields paths |
+
+### config
+
+| Code | Meaning |
+|---|---|
+| `CONFIG_INERT_PHASE_ENABLE` | a phase is force-enabled (enabled: on) while dynamic_routing is below advisory and it is neither mandatory nor in the static state machine, so the enable never runs it (the cycle-120 confusion); set dynamic_routing>=advisory or remove the enable; fields.step=inert, phase, stage |
+| `CONFIG_PHASE_ROUTING_DEFECT` | loading or routing the phase catalog found a defect that the cycle survives: a builtin registry that does not load, a user spec dropped, clamped or demoted (no persona), an invalid spec left unrouted, a minted phase that is rejected or clashes with a runner, or an anchor that does not resolve, so the phase is placed before audit, a pre-build phase whose slot falls after build, which is left unrouted; the reason is the warning verbatim and the origin names the composition step (cycle wiring or a mint) |
+| `CONFIG_REGISTRY_MALFORMED` | docs/architecture/phase-registry.json was read but is not valid JSON (a trailing comma is the classic); the same compiled-baseline degrade as CONFIG_REGISTRY_UNREADABLE — no triage, no registry order — with the decoder's error in the reason; fields.step=registry, path, err |
+| `CONFIG_REGISTRY_UNREADABLE` | docs/architecture/phase-registry.json exists but could not be read (permissions, a directory at the path — absence is silent); every cycle runs on the compiled baseline, which omits triage, the registry order, the enabled/routing blocks, the goal recipes and the deliverable kinds; fields.step=registry, path, err |
+| `CONFIG_SPINE_ORDER` | the registry's phases[] order places ship before audit, so the artifact-backed floor cannot gate ship on a shippable audit by position; the legality graph and the audit verdict branch still block it; fields.step=spine, audit_pos, ship_pos |
+| `CONFIG_UNKNOWN_VALUE` | a routing dial's value is outside its closed vocabulary, or a registry contract is incomplete, and the documented fail-safe was taken — never a kill-path enable (a stage word → off, routing_mode → llm, model_routing → static, enabled → content, a bad conditional rule or max_optional_insertions ignored); fields.step names the resolving step (registry or policy), fields.key the dial, fields.value the word, fields.default the fallback |
+| `CONFIG_WEAK_SPINE` | the mandatory_phases of the phase registry omit audit and/or ship, so the audit-before-ship guarantee rests on the legality graph and the audit verdict branch alone; the cycle proceeds; fields.step=spine, fields.missing = audit, ship or audit+ship |
+
+### control
+
+| Code | Meaning |
+|---|---|
+| `CONTROL_BYPASS_USED` | an audited bypass is in use (ADR-0156 I-16, X18d): an operator parameter, after its control_bypass ledger entry is written, or a policy opt-in at the bridge adapter start; fields name, actor, reason and at |
+
+### cycle
+
+| Code | Meaning |
+|---|---|
+| `CYCLE_SPEND_LIMIT` | the spend of the cycle passed a limit of workflow.cycle_spend at a phase boundary (ADR-0158 decisions 14 to 16); fields.decision is would_stop (shadow, once for each cycle, the flow of today runs), over (enforce, the first boundary over the limit where no stop is legal) or stop (enforce, at the failed audit where the cycle goes to retro and seals handed-off; a passing audit still ships); fields.stage is shadow or enforce, fields.partial is true when the ledger did not load whole, fields.limit names the limit, fields.value and fields.max give the spend and the limit, and fields.phase the boundary |
+
+### failurediag
+
+| Code | Meaning |
+|---|---|
+| `FAILUREDIAG_SIDECAR_WRITE_FAILED` | the phase's <phase>-failure-diag.json could not be written (temp write or rename); the reason names the step and the error, fields name the path; the phase abort proceeds unchanged and the diagnosis is lost from disk |
+
+### failurelearning
+
+| Code | Meaning |
+|---|---|
+| `FAILURELEARNING_FLOOR_WRITE_FAILED` | the deterministic floor could not write retrospective-report.md, the lesson YAML or the inbox remediation (a faillearn error, including the id-collision refusal); the FailedRecord and the P0 todo already stand in memory, the recurrence closure still runs, the phase failure is never masked; fields.step=floor, lessons_dir, workspace |
+| `FAILURELEARNING_POLICY_LOAD_FAILED` | .evolve/policy.json exists but could not be read or parsed while writing the deterministic floor (absence is silent); the novelty threshold and the remediation weight fall back to the compiled defaults and the floor proceeds — ONE read where two reads of one file fired two lines before; fields.step=floor, path |
+| `FAILURELEARNING_RECURRENCE_LEDGER_FAILED` | the recurrence ledger keyed by the failing pattern could not be loaded, updated or saved (fields.op = load | record | save); Count() stays stale for this pattern, the phase failure is never masked; fields.step=recurrence, path |
+| `FAILURELEARNING_REMEDIATION_TRUNCATED` | a failed phase self-reported more defects than the remediation cap; the first ones are filed as inbox items and the rest dropped — fix the emitter or raise the cap; fields.step=floor, reported, filed |
+
+### gate.contract
+
+| Code | Meaning |
+|---|---|
+| `GATE_CONTRACT_DEMOTED` | the breaker opened after N consecutive blocks and demoted enforce→advisory; the phase advanced UNVERIFIED — inspect the failing phase and policy.gates.contract_gate |
+| `GATE_CONTRACT_FAIL_OPEN` | the gate could not decide (unknown phase, read fault) and failed open; re-dispatching an agent cannot fix this — the reason is the error |
+| `GATE_CONTRACT_REJECTED` | the gate refused the deliverable at enforce; the reason is the correction directive (one [code] message per violation), fields carry the codes and the breaker count (0 for a breaker-exempt phase, an optional evaluate phase whose exhausted ladder degrades to SKIPPED) — the orchestrator's ladder re-dispatches |
+| `GATE_CONTRACT_SALVAGED` | a sole recoverable bad_verdict was repaired on disk and re-verified clean; the phase advanced on the repaired artifact |
+| `GATE_CONTRACT_VERIFIED` | the phase's declared deliverables were found in place (fields name the artifact, its size, the agent-owed files and the effects verified) and the phase advanced |
+| `GATE_CONTRACT_WOULD_BLOCK` | the deliverable violated its contract but the stage (shadow/advisory, or the report-size gate's) lets the phase advance; the reason is what enforce would have refused |
+
+### healing
+
+| Code | Meaning |
+|---|---|
+| `HEALING_ESCALATED` | the catalog validator sent an incident to the operator: a second refusal, two failed repairs, an open breaker or a halt-and-escalate action; the same fields as HEALING_PROPOSAL_REFUSED (llm-isolation.md §19.1, §19.2, §24) |
+| `HEALING_I10_VIOLATION` | the gate classifier flagged a loop cycle diff that changes a kernel surface or weakens a gate (invariant I-10, llm-isolation.md §20.3); the build floor fails and ship refuses the cycle; fields.patterns names each pattern, fields.paths each flagged path |
+| `HEALING_INCIDENT_OPENED` | the incident detector opened an incident record under .evolve/incidents; fields incident, class, fingerprint, tier, state, transition, recurrence, stage, and from the live reaction on a sealed FAIL also reaction: would_brake, braked, brake_already_engaged or brake_failed (llm-isolation.md §18, §24) |
+| `HEALING_INCIDENT_REOPENED` | the incident detector reopened a closed incident, because its signal fired again after the close; the same fields as HEALING_INCIDENT_OPENED (llm-isolation.md §18, §22) |
+| `HEALING_PROPOSAL_REFUSED` | the catalog validator refused a proposal of the orchestrator agent; fields incident, class, tier, action, verdict, precondition, reason, stage (llm-isolation.md §19, §19.2, §24) |
+
+### inbox
+
+| Code | Meaning |
+|---|---|
+| `INBOX_CLAIM_MOVE_FAILED` | a claim could not create processing/cycle-N/ (fields.step=mkdir, dest_dir) or could not rename the item into it (fields.step=rename — the item may already be claimed); ErrMvFailed (exit 2), the item stays where it was; fields.task_id, err |
+| `INBOX_CLAIM_NOT_FOUND` | a lane claim named an id the inbox root does not hold (absent, already claimed into processing/, or parked); the claim returns ErrNotFound (exit 1) and moves nothing — the FAIL closeout's lane-scope claim of an id the triage persona already claimed reports this for an expected state; fields.step=locate, task_id, inbox_dir |
+| `INBOX_CLAIM_REFUSED` | a lane claim named an operator-owned item (route:console-* or a protected fix surface, ADR-0074 I1); the claim returns ErrConsoleRouted (exit 3) and the item stays at the root; fields.step=route, task_id, reason |
+| `INBOX_CONTINUATION_MANIFEST_UNREADABLE` | the FAILed cycle's continuation manifest exists but could not be read or parsed; every item of the drain releases unstamped (a later claim starts fresh instead of resuming the salvage); fields.step=manifest, workspace, err |
+| `INBOX_CURATOR_PROPOSAL` | the inbox curator proposes a change to one open item: consume it, reroute it or merge it (fields.kind, id, target, trigger, deterministic, stage, applied, evidence); the curator applies a deterministic proposal only in the enforce stage at the wave boundary, and a judgment proposal waits for the operator or the orchestrator |
+| `INBOX_ITEM_REWRITE_FAILED` | an item record could not be rewritten atomically: the closeout's route-console rewrite (step=route), the quarantine release's counter reset (fields.step=counter_reset — the item releases with its stale count), the drain's failure_count bump (fields.step=failure_bump — quarantine is skipped, the item releases to the root) or the drain's continuation stamp (fields.step=continuation_stamp — the item releases unstamped); fields.task_id, path, err |
+| `INBOX_ITEM_ROUTED_CONSOLE` | a closeout routed an item to console-manual: the FAIL closeout when a phase gate refused it deterministically (a top_n card naming a protected surface — the per-item breaker of the 2026-09-14 poison-loop incident), or the planned-no-work closeout when a fleet lane's triage answered for its scoped item without committing it (F30 — the reason names the bucket and the lane's evidence): fields.task_id, path, reason, step=route — the item is operator-owned from here on and no lane claims it again |
+| `INBOX_LANDED_CHECK_FAILED` | the landing probe could not answer for a processed-promotion's sha — in production the host's git probe (shaLandedOnMain) on an exec fault or a git exit outside {0,1}: an unknown sha, no local main, a non-git ProjectRoot; the promote fails OPEN (the sha is treated as landed) so a gate fault never blocks a promotion, and the item lands in processed/ with this line as the only trace; fields.step=landing, task_id, sha, err |
+| `INBOX_PROMOTE_MOVE_FAILED` | a promote could not create its destination dir (fields.step=mkdir — ErrMvFailed, NoOp false, ledger promote-warn/mkdir-failed) or could not rename the item into it (fields.step=rename — the compat NoOp success, ledger promote-warn/mv-failed); the item stays where it was; fields.task_id, state, src_rel, dest, err |
+| `INBOX_PROMOTE_NOT_FOUND` | a promote named an id neither processing/cycle-*/ nor the inbox root holds — already moved; the ship.sh-compat NoOp success is returned; fields.step=locate, task_id, state |
+| `INBOX_PROMOTE_UNLANDED_SHA` | a processed-promotion carried a ship sha the landing probe says is not on main; the item is rerouted to retry/ under reason ship-promote-retry-unlanded-sha instead of buried in processed/; fields.step=landing, task_id, sha, state=retry |
+| `INBOX_QUARANTINE_FAILED` | an item at the ADR-0072 S5 retry ceiling could not be parked in quarantine/ (fields.outcome=error: the park's promote errored; outcome=noop: the park's rename failed) and falls open to a root release — the poison item WILL be re-picked; the preceding INBOX_PROMOTE_MOVE_FAILED from Mover.Promote names the cause; fields.step=quarantine, task_id, failure_count, ceiling |
+| `INBOX_RELEASE_DOUBLE_MOVE` | the cycle drain found the item's basename already at the inbox root (a concurrent release landed it first); the root copy is never clobbered, the processing copy stays and is not counted; fields.step=release_cycle, task_id, base |
+| `INBOX_RELEASE_MOVE_FAILED` | an item could not be renamed back to the inbox root — by the cycle drain (fields.step=release_cycle, origin Mover.Release) or by orphan recovery (fields.step=recover_orphans, origin Mover.RecoverOrphans); the item stays in processing/cycle-N/ and the walk continues; fields.task_id, base, err |
+| `INBOX_ROUTE_NOT_FOUND` | the FAIL closeout could not find the item it was told to route (fields.task_id, inbox_dir, step=locate) — or found it held by another cycle's claim (fields.held_by_cycle) — the refusal is NOT recorded on it and it WILL be re-picked; neither processing/cycle-*/ nor the inbox root holds the id |
+| `INBOX_ROUTING_FALLBACK` | the lane-routing predicate could not load the build profile (fields.profile, fields.project_root; the reason is the load error), so routing judges protected surface only and a sandbox-denied item can reach a lane; emitted once per predicate, on its first routing question |
+
+### isolation
+
+| Code | Meaning |
+|---|---|
+| `ISOLATION_CONTEXT_BUDGET_OVER` | the cell context index: required entries of a layer passed its token budget and lost the flag; fields layer, limit_tokens, over (cell-context-index.md §6) |
+| `ISOLATION_CONTEXT_REQUIRED_UNOPENED` | the cell context index: a cell closed without a read of a required entry; fields.unopened lists the ids, and fields.source is sandbox (cell-context-index.md §8) |
+| `ISOLATION_I1_VIOLATION` | I-1 single launcher: a code path started an LLM binary outside the bridge launch API; fields.target names the binary (ADR-0154) |
+| `ISOLATION_I2_VIOLATION` | I-2 hermetic environment: the allowlist dropped a variable of the launcher; in shadow the child still got it (action=logged), in enforce it did not (action=refused); fields invariant, stage, action, cell, family, target (the name, never its value), rule, source (ADR-0154) |
+| `ISOLATION_I3_VIOLATION` | I-3 no nested agency: a cell tried to start an LLM binary or an evolve dispatch; fields.target names it (ADR-0154) |
+| `ISOLATION_I4_VIOLATION` | I-4 pipeline-mediated communication: a cell tried to read raw output or to write its inputs; fields.target names the path (ADR-0154) |
+| `ISOLATION_I5_VIOLATION` | I-5 read isolation: a cell tried to read outside its index, its worktree and its CLI files; fields.target names the path (ADR-0154) |
+| `ISOLATION_I6_VIOLATION` | I-6 family-agnostic flow: a launch resolved through a compiled family default, not through routing data; fields.cell names the seat (ADR-0154) |
+| `ISOLATION_I7_VIOLATION` | I-7 CLI-neutral guarantees: a gate or the fence stopped a write that no hook stopped; fields.target names the path (ADR-0154) |
+| `ISOLATION_I8_VIOLATION` | I-8 typed flow decisions: a flow parser fell back to stdout or prose; fields.cell names the seat (ADR-0154) |
+| `ISOLATION_I9_VIOLATION` | I-9 proven substitution: no run-time emitter; the conformance matrix TestE2ECycleCLIMatrix is its guard (ADR-0154) |
+| `ISOLATION_REQUEST_FAILED` | the request channel approved a request of a cell, and the dispatch of the agent failed; the same fields as ISOLATION_REQUEST_REFUSED (llm-isolation.md §7.2.1) |
+| `ISOLATION_REQUEST_REFUSED` | the request channel refused a request of a cell: the validator (schema, kind, role, input, cap or depth) or the orchestrator agent; fields request, kind, role, decision, precondition, reason, stage (cli-contract.md §4.5, llm-isolation.md §7.2.1) |
+
+### ladder
+
+| Code | Meaning |
+|---|---|
+| `LADDER_AUDIT_FIX` | the audit_fix rule ran after an audit FAIL or on the residual findings of the build handoff floor after the last build correction; fields.source is audit or build_floor, fields.audit_fix is would (shadow), chosen (enforce) or decline, fields.audit_fix_rule names the rule that decided, and the other fields give its data: the findings, the prescriptions, the estimated files, lines, production code lines and tokens, and if a rung handler is registered |
+| `LADDER_DECISION` | the retry ladder chose the rung of the next try of a phase (ADR-0142); fields.stage is shadow (recorded, the dispatch does not change) or enforce, fields.origin the retry path, fields.rung the rung before, fields.next the chosen rung, fields.action raise, retry or stop, fields.class and fields.fingerprint the classified failure, fields.tier and fields.effort the target |
+| `LADDER_NO_HEADROOM` | no family of the chain has headroom at the next tier, so the ladder holds at R1 or stops; fields.rung is the rung before |
+| `LADDER_STOP_SPEC` | two tiers failed on the same check, so the ladder reclassified the failure as spec and stopped; fields.fingerprint names the check |
+
+### ledger
+
+| Code | Meaning |
+|---|---|
+| `LEDGER_APPEND_FAILED` | the ledger could not append an entry (lock, chain or I/O failure); the reason is the error, fields name the entry |
+
+### liveness
+
+| Code | Meaning |
+|---|---|
+| `LIVENESS_PANE_EXHAUSTED` | a tmux pane shows the CLI's quota/rate-limit exhaustion (LivenessCenter edge: exhausted; the exhaustion gate corroborates before rc 85) |
+| `LIVENESS_PANE_HUNG` | a tmux pane is hung: no progress and no completion (LivenessCenter edge: hung) |
+| `LIVENESS_PANE_STAGNANT` | a tmux pane is busy but its output stopped changing (LivenessCenter edge: busy-stagnant) |
+| `LIVENESS_PHASE_STALLED` | the per-phase observer saw no progress for the stall threshold, between the bridge's review checkpoints: for a tmux phase the pane-watch snapshot's transcript hash stopped changing (kind pane.liveness), for a headless phase the stdout log and workspace stopped growing (kind observer.warning); log and signal only, nothing is killed; fields source (pane | stdout), session, busy, stall_s |
+
+### loop
+
+| Code | Meaning |
+|---|---|
+| `LOOP_BOUNDARY_REFRESH_AUDIT_FAILED` | the boundary-refresh-log.jsonl audit entry could not be appended AFTER the state.json pin had already moved; the refresh continues to re-exec — the pin and the audit trail now disagree; fields.batch, path, error |
+| `LOOP_BOUNDARY_REFRESH_SKIPPED` | the boundary binary refresh degraded to 'continue on the current binary' at fields.step (ahead_check | lane_check | lane_active | breaker | interrupted | rebuild | target | repin | argv | arm | reexec): the ahead-check errored, a sibling fleet lane held a fresh lease (or the check was unverifiable), the loop breaker refused a second refresh for the same build commit, an interrupt (SIGINT/SIGTERM) was pending before the rebuild, after it or before the exec (no re-exec, so the loop stops on the signal), `make -C go build` failed, no executable at go/bin/evolve, the state.json re-pin was refused, the re-exec argv was empty, the breaker marker could not be written, or exec failed; fields.batch, commit (the running build commit), error |
+| `LOOP_CHAIN_BATCH_ERROR` | a chained batch exited with a non-continuable rc (not 0/3/5) and the chain stopped, propagating rc; the batch's own signals name the failure (an rc=2 batch may have emitted none); fields.batch, rc, stop_reason=chain_batch_error |
+| `LOOP_CHAIN_INBOX_ITEM_INVALID` | a root-level .evolve/inbox/*.json did not parse as an inbox item (no object with a non-empty id) and is NOT counted as pending work — usually a real todo lost to a typo; fields.batch, name, path |
+| `LOOP_CHAIN_INBOX_UNREADABLE` | the chain could not read .evolve/inbox (a read error other than not-exist) and stopped rather than loop blind; fields.batch, path, error, stop_reason=chain_inbox_unreadable, exit=2 |
+| `LOOP_CHAIN_QUOTA_DEFER` | a chained batch exited with the resumable rc=5 quota-pause code; the chain defers instead of relaunching into the wall (resume with evolve loop --resume); fields.batch, cycle, wake_at, source are the checkpoint block's (empty when no block is on disk) |
+| `LOOP_ESCALATION_BOUNDARY` | the escalation boundary staged inbox items (bumped/filed/planned) or refused a staged autofile intent that names no priority_class after a cycle; fields carry the counts (refused among them, each refused id also printed as a WARN line) and the stage |
+| `LOOP_FLEET_LANE_HALT` | a fleet lane exited with the system-failure halt code; the lane's own LOOP_SYSTEM_FAILURE_HALT names the failure and the escalation it filed |
+| `LOOP_FLEET_POLICY_INVALID` | the loop could not load .evolve/policy.json at batch start (unreadable, malformed, or a key the strict schema rejects such as a misspelt fleet.orchestrator field), so the fleet config fell back to its defaults and the loop runs sequential (count 1) until the file is fixed; the reason carries the load error; fields.path |
+| `LOOP_HALT` | the batch halted at a boundary (plane diverged, sync refused, main CI red, disk below the floor, or a boundary CLI update whose smoke test failed: fields.families and fields.versions name it); the reason is the halt error |
+| `LOOP_LOST` | a reader saw a loop process end without its loop.exit event; a reader makes this record and no log holds it; fields.pid, run_id, exit (crash or unknown) and historical (true when the loop was gone before the reader looked) |
+| `LOOP_MIN_WIDTH_REPAIR` | the fleet shrank below its committed width and one isolated lane was dispatched instead (min-width repair) |
+| `LOOP_ORCH_ADMISSION_OPTIMISTIC` | at fleet.orchestrator.admission enforce (ADR-0143 W1b) the pool launched a lane that only the optimistic rule admitted: the import-reach rule would have held it behind a lane in flight; held_by is the first such holder when more than one lane in flight reaches the todo; the lane carries that holder in EVOLVE_FLEET_REACH_HOLDER; the count of the wave; INFO; fields.todo, held_by, reason (the package where an edit meets the reach) |
+| `LOOP_ORCH_ADMISSION_SHADOW` | at fleet.orchestrator.admission shadow (ADR-0143 W1) the import-reach rule held a todo that the optimistic rule (a shared edited package or a second hub todo) would admit; the reach rule still governs; published once for each todo and holder in a pool run; INFO; fields.todo, held_by, rank, cells, reason (the package where an edit meets the reach) |
+| `LOOP_ORCH_ADMIT_WAIT` | the admission shadow (fleet.orchestrator.stage, ADR-0139 O3) found a planned todo whose package cell or id family (family:<token>) overlaps the cell of a todo ranked before it, so admission by cell holds it back; in shadow the event only records the hold and no lane changes; fields.todo, rank, cells, blocked_by, blocked_by_lane (the partition lane of the blocker, or none), stage |
+| `LOOP_ORCH_FAMILY_PAUSED` | a bench left a CLI family with no healthy family after it in some lane chain, so the sizing step costs a slot and the family stops taking new lanes (ADR-0139 decision 13); lanes in flight finish; published once for each pause; at stage shadow it records the pause and changes nothing (applied false); INFO; fields.family, target (the window after the pause), stage, applied |
+| `LOOP_ORCH_LANE_BACKFILLED` | the orchestrator pool gave a freed slot to the next admissible todo at once; INFO; fields.todo, live, target |
+| `LOOP_ORCH_LANE_DEADLINE` | a lane passed its lease deadline (the p95 lane time of the last 50 cycles without the longest one, at least fleet.orchestrator.deadline_floor_minutes, ADR-0139 O5); action recorded at stage shadow (nothing stops), action stopped at stage enforce (the lane's own launch context is cancelled, its dispatches are reaped, its inbox claim is released and its cells free); fields.todo, stage, action, deadline_minutes |
+| `LOOP_ORCH_LANE_EXITED` | a lane of the orchestrator pool exited and freed its slot and its cells; INFO; fields.todo, live, target |
+| `LOOP_ORCH_LANE_LATE_EXIT` | a lane exited after its lease deadline had passed; the shadow exit measure of ADR-0139 O5: status ok means a deadline stop would have stopped a lane that passed; fields.todo, stage, status, rc, stopped |
+| `LOOP_ORCH_LANE_LAUNCHED` | the orchestrator pool (fleet.orchestrator.stage enforce, ADR-0139 O4) launched a lane in its first fill; INFO; fields.todo, live (lanes in flight), target |
+| `LOOP_ORCH_LANE_RECOVERY_FAILED` | after a deadline stop the orchestrator could not release the todo's inbox claim (step release) or park it with route console (step park, reason deadline twice); the todo needs the console; fields.todo, step, error |
+| `LOOP_ORCH_LANE_STALLED` | a lane had no live signal (its cycle signals, its phase pane-watch, events or stdout file) for fleet.orchestrator.stall_minutes (ADR-0139 O5); published once for each lane; a lane whose cycle is not found has an unknown heartbeat and no stall; the lane keeps its slot; fields.todo, stage, last_heartbeat, stall_minutes |
+| `LOOP_ORCH_OPTIMISTIC_ADMISSION_FAILED` | a lane that only the optimistic rule admitted (ADR-0143 W1b) hit a composed-tree gate failure or a fleet rebase conflict; published once for each lane, at its first such failure, which names the gate; the D3 rate counts a failure only when the admission of the same todo is in the wave, so it stays in [0,1]; WARN; fields.todo, held_by, gate (the failed composed-tree gates, or rebase) |
+| `LOOP_ORCH_OVERSIGHT_ACTION` | the oversight loop (ADR-0139 O6) mapped one event of the cycle, ship, errors or loop channel to an action on its own lanes: record_verdict, free_cells, count_clean_landing, count_conflict, backfill, resize or stop_admission; at stage shadow the action is recorded and changes nothing (applied false), at stage enforce it is applied (applied true); INFO; fields.actions, lane, cycle, event, stage, applied, and verdict or target for the actions that have one |
+| `LOOP_ORCH_POOL_HELD` | a fill round of the orchestrator pool stopped below its width because admission refused every pending todo while a lane was in flight; it fires once per change of the live and pending counts, at the start of a wave and after each round; INFO; fields.live, target |
+| `LOOP_ORCH_POOL_IDLE` | a slot of the orchestrator pool stays free after a lane exit: no pending todo is admissible, the supply is empty, the operator stop is engaged or the run reached fleet.orchestrator.run_max_lanes; INFO; fields.live, target |
+| `LOOP_ORCH_POOL_RESUPPLIED` | a slot of the orchestrator pool stayed free after a lane exit, so the pool ran the plan source again and added a ready todo that the run did not hold; one event for each added todo; INFO; fields.todo, live, target |
+| `LOOP_ORCH_POOL_UNDERFILLED` | the orchestrator pool had an idle or a held transition while fewer lanes than fleet.min_lanes were in flight and the pool was not stopped; WARN; fields.live, target, min_lanes, ready, and family_held when admission holds a todo behind a lane of its id family (each "<todo> (family:<token>, behind <lane>)"), so the hold does not read as a supply failure |
+| `LOOP_ORCH_SUPPLY` | the supply census (ADR-0139 O6, spec section 4) before a plan: the count of the inbox items in each class (admissible, waiting_cell, waiting_deps, console_route, console_kind, console_protected), the window, and the first console items with the reason of the routing authority; the full record is .evolve/waves/supply.json; INFO; fields are the six class names, window and console |
+| `LOOP_ORCH_SUPPLY_SHORT` | the supply census found fewer admissible items than the window, so the lanes of the plan cannot all be filled; the cause of each refusal is in the supply record and in evolve wave supply; INFO; fields are the six class names and window |
+| `LOOP_ORCH_WINDOW` | the adaptive window of the orchestrator pool (ADR-0139 O8) changed size: it grows by 1 for each clean landing, halves on each landing conflict (never under fleet.orchestrator.window.min) and follows the sized count; published once for each change; INFO; fields.old, new, sized, cause (clean_landing, conflict or resize); the loop builds the window inside the enforce pool only, so nothing publishes at stage shadow; that pool admits a lane only while the lanes in flight number fewer than new |
+| `LOOP_PIPELINE_BLOCKER_HALT` | the pipeline-blocker breaker halted the batch (identical fingerprints, unexplained failures or consecutive failures over the ceiling, or consecutive fleet lanes deferred for want of a worktree: rule lane-deferrals, category lane-provisioning, the git cause in the reason; or console hand-offs of planned no-work lanes among the last failure_policy.thresholds.no_work_handoff_window cycles at no_work_handoff_halt_ceiling: rule no-work-handoffs, category no-work-handoff, fingerprint no-work-handoffs|cycle|<N> to acknowledge, the cycles in the reason); fields.rule and fields.fingerprint name the rule, the rest are the system-failure halt's own fields (next, escalation, inbox_item) |
+| `LOOP_SYSTEM_FAILURE_HALT` | the batch halted on an ADR-0072 system failure the cycle itself signalled (the pipeline, not the task, is the cause); fields.category names the floor, fields.next is the escalation dossier's next_action, fields.escalation and fields.inbox_item the dossier and the P0 item the halt wrote |
+| `LOOP_WAVE_ALL_LANES_STALE` | every planned lane of the wave was stale at the last-moment freshness gate (consumed, or a declared dep still unmet) and the backlog refill found nothing, so the wave launched nothing — a shorter wave, never a doomed lane; the per-lane skips are fleet's own freshness-gate lines; fields.planned, skipped |
+| `LOOP_WAVE_DISPATCH_FAILED` | a wave (fields.path=wave) or the min-width repair (path=repair) could not dispatch: the control-plane preflight refused (step=preflight — uncommitted control-plane edits in the main checkout), the triage plan could not be produced (step=plan — no prior triage decision and the inbox seed found fewer than 2 file-disjoint lanes, or the last-cycle read failed) or the plan could not be adapted into disjoint lanes (step=adapt); the batch falls back to the sequential path, the only unisolated execution mode; fields.error is the step's own error |
+| `LOOP_WAVE_EMPTY_PLAN` | the wave planned zero lanes and the batch falls back to sequential: cause=empty_triage_plan — fleet.count <= 1 so the one-lane repair guard is not met (the operator wanted one lane; fires whatever the dispatcher's own reason was); cause=empty_backlog — the guard was met but the one-lane repair found no disjoint candidate; fields.desired = fleet.count, realized = the wave-sized count |
+| `LOOP_ZERO_SHIP_HALT` | the zero-ship breaker halted the batch: consecutive waves (fleet) or cycles (sequential) landed no ship, failed and no-work lanes alike, up to failure_policy.thresholds.zero_ship_halt; fields.rule and fields.waves name the rule and the run, the rest are the system-failure halt's own fields (next, escalation, inbox_item) |
+
+### observer
+
+| Code | Meaning |
+|---|---|
+| `OBSERVER_EVENTS_SINK_OPEN_FAILED` | the live per-phase observer could not open <phase>-observer-events.ndjson, so the phase runs UNOBSERVED (ADR-0030: the observer never blocks the phase); fields.step=open_sink, path |
+| `OBSERVER_EVENT_APPEND_FAILED` | one line of <agent>-observer-events.ndjson was lost (fields.op = marshal | mkdir | open | write); reported ONCE per op for the observer's life, later losses on the same op are silent; an INCIDENT is still retained for the report when the open succeeded; fields.step=emit, op, path, event_type |
+| `OBSERVER_KILL_FAILED` | the SIGTERM to the agent's process group returned an error (ESRCH: already gone; EPERM: not ours) — the kill was attempted exactly once; fields.step=respond, pgid, signal, kind |
+| `OBSERVER_NUDGE_APPEND_FAILED` | the soft-stall nudge could not be appended to the agent inbox; the soft_stall_nudge envelope still emits and the nudge is not retried; fields.step=nudge, idle_s, threshold_s, agent |
+| `OBSERVER_POLICY_LOAD_FAILED` | .evolve/policy.json exists but could not be read or decoded when `evolve phase-observer` or `evolve phase-watchdog` resolved its settings (absence is silent); the poll, stall, nudge and watchdog thresholds and the --enforce stall chain's artifact extends fall back to the compiled defaults; fields.step=policy, path |
+| `OBSERVER_REPORT_WRITE_FAILED` | <agent>-observer-report.json could not be marshalled, its directory created, its .tmp written or renamed into place; the subcommand still exits 0 (the report is best-effort); fields.step=report, path |
+| `OBSERVER_STALL_KILL_SENT` | the observer sent SIGTERM to the agent's process group after a stall INCIDENT — an act, not a fault — after the INCIDENT envelope was appended and before the signal; fields.step=respond, kind (stuck_no_output | stuck_no_progress | process_dead), pgid, action (legacy_enforce | kill_retry), action_reason, idle_s/threshold_s when the incident carries them |
+| `OBSERVER_STDOUT_TAIL_FAILED` | the agent's stdout log could not be stat'ed (a non-ENOENT error), opened, seeked or fully scanned (a line over the 10 MiB buffer); reported ONCE per op; an absent log stays silent by design (tmux drivers dump it at exit); the prior offset is kept on stat/open/seek, the file size after a scan error; fields.step=tail, op, path |
+| `OBSERVER_WATCHER_LEAKED` | the live observer's watcher goroutine did not exit within the bound after the phase finished; the goroutine and its sink fd are leaked on purpose (closing would race its writes) and the OS reclaims them at exit; fields.step=cancel, timeout_s |
+
+### orchestrator
+
+| Code | Meaning |
+|---|---|
+| `ORCHESTRATOR_AUDIT_REPAIR_DECLINED` | an audit FAIL earned no repair round and the cycle goes to retro; fields.reason is the retry envelope's verdict (unrecognised class, budget spent, system-level or non-retry class, no class declared), fields.declared_class the audit's class: its report's own, else the one its deterministic gates' diagnoses derive |
+| `ORCHESTRATOR_AUDIT_REPAIR_GRANTED` | an audit FAIL earned a repair round; fields.next is the re-entry phase (tdd | build), fields.attempt the repair attempt about to be spent, fields.reason the envelope's basis |
+| `ORCHESTRATOR_BLOCKER_REFUSED` | a phase's verdict declared a BLOCKER defect that the host could not prove, or that does not explain every gate failure; the correction rounds continue as for any rejection; the reason lists each refusal |
+| `ORCHESTRATOR_BLOCKER_ROUTED` | a phase's gate failures are all explained by a blocker the host proved (a protected path the fix needs, or two of the cycle's own predicates that conflict); the correction rounds stop, the cycle seals FAIL with termination reason blocked-needs-console and the BLOCKER_ROUTE diagnostic routes the item to the console; the reason is the proof and the lane's diagnosis |
+| `ORCHESTRATOR_COMPOSED_GATE_DECLINED` | a composed-tree gate did not report pass at a MissingComposedGates trip site (RUNG 2 scopedMergeCarryForward or the ADR-0105 B3 identityCarryForward); fields.tail_<gate> carries each failing gate's output tail and the cycle falls back to a full re-audit instead of carrying the audit verdict forward |
+| `ORCHESTRATOR_CYCLE_FAILED` | the cycle sealed with final verdict FAIL; fields carry the termination reason and retro decision |
+| `ORCHESTRATOR_EXPLANATION_CORRECTION_EXHAUSTED` | a passing audit still reviews the explanation document as NEEDS_CORRECTION after the explanation-correction budget is spent, so the verified code ships with the review on record |
+| `ORCHESTRATOR_EXPLANATION_CORRECTION_RUNG` | a passing audit reviewed the explanation document as NEEDS_CORRECTION, so Build corrects only that document and the audit re-reviews it before ship; fields.round and fields.budget count the rung |
+| `ORCHESTRATOR_EXPLANATION_REAUTHOR_ROUTED` | a post-Build source writer left the Build explanation's content stale (a cited path no longer in the diff, Changed Areas drift) and the cycle routed back to Build for the owner to re-author it instead of aborting — fields.next is the re-entry phase; fields.charged is false when every legal successor of the writer already leads to Build (tdd), so the round costs nothing, and true when it spends one code-audit-fail attempt, with fields.attempt the attempt spent and fields.envelope the budget's reason; the reason is the validator's verdict |
+| `ORCHESTRATOR_FLEET_REBASE_CONFLICT` | the fleet rebase of the ship recovery hit a merge conflict, and the cycle routes to the debugger (ADR-0143 W1b reads it for a lane that only the optimistic admission rule admitted); not a landing-conflict ship error, so the oversight does not count it again; WARN; fields.paths (the conflicted paths) |
+| `ORCHESTRATOR_GATE_CORRECTION` | the correction ladder ran a rung after a gate rejection — fields name the correction ordinal, the budget (max), the rung, the CLI re-dispatched on and whether that CLI was escalated; the reason is the rejection being corrected |
+| `ORCHESTRATOR_HOST_EFFECT_FAILED` | the host could not perform a declared effect before the phase's review; the effects gate still judges it |
+| `ORCHESTRATOR_IDENTITY_PROOF_SKIPPED` | the fleet-rebase recovery did not run the identity proof, so Build re-authors the explanation; fields.reason says why the proof could not run (for example, the rebased change is committed, not pending on the new base) |
+| `ORCHESTRATOR_LANE_DEFERRED` | a fleet lane could not provision its worktree (after the fetch retries and one re-provision) and ended before any phase dispatched: outcome DEFERRED, its claims released to the queue unbumped, no failure digest, failure learning or retrospective; the lane exits 5, and lane_deferral_halt_ceiling consecutive deferrals halt the batch (LOOP_PIPELINE_BLOCKER_HALT rule lane-deferrals); fields.step=worktree, cause |
+| `ORCHESTRATOR_LANE_RESUMED` | a fleet lane found that the last cycle of its todo paused on a quota wall, so it resumed that cycle at the paused phase instead of a fresh cycle; the dispatch chain gives the phase to the first healthy family; the resume counts against the auto-resume budget of the checkpoint; INFO; fields.scope, phase, attempts, max_attempts |
+| `ORCHESTRATOR_PHASE_ABORTED` | the cycle aborted after this phase's outcome (review reject, guard, persistence); the abort reason is in fields.abort_reason |
+| `ORCHESTRATOR_PHASE_VERDICT_FAIL` | a phase recorded verdict FAIL; the reason is the phase's own error-severity diagnostics |
+| `ORCHESTRATOR_PHASE_VERDICT_WARN` | a phase recorded verdict WARN; the reason carries its error-severity diagnostics, if any |
+| `ORCHESTRATOR_PLAN_PHASE_GATED` | the phase registry removed a phase the advisor's plan runs, at that phase's turn in the walk: its declared skip_when fired (rule skip-when-gates-plan, e.g. a bugfix phase on a deliverable_kind=document cycle) or its insert_when, its whole admission rule, did not fire (rule insert-when-gates-plan); fields.phase, rule, next_phase; the walk continues and routing-decision-<n>.json keeps the clamp |
+| `ORCHESTRATOR_QUOTA_PAUSED` | every CLI family is quota-exhausted; the cycle is paused at the named phase and resumable |
+| `ORCHESTRATOR_REBASE_REENTRY_ABORTED` | after a debugger resolved a fleet-rebase conflict, the host could not carry, rebase, pend or route the resolved tree (the reason names which), or the recovery budget was spent; the cycle ended instead of a reship on the base the ship diverged from |
+| `ORCHESTRATOR_RESUME_CARRIER_PENDED` | a resume found this cycle's Evolve-Carrier commit at the lane's HEAD (a crash between the fleet rebase and the pend) and pended it on its fork point before any phase ran, so the resumed cycle sees the change pending and never re-audits an empty diff |
+| `ORCHESTRATOR_SCOPE_DELTA` | the build handoff floor found a changed path outside the lane's declared scope (ADR-0087): fields.path, fields.class (closure, opportunistic, boundary or cross-lane) and fields.disposition (keep, carve or refuse) carry scopedelta's classification, and the reason is the classifier's own; WARN for carve and refuse, INFO for a computed closure; the floor reports and never blocks (shadow rollout) |
+| `ORCHESTRATOR_SHIP_RECOVERY_PATH` | a ship error that names a moved main (AUDIT_BINDING_HEAD_MOVED or GIT_FLEET_REBASE_NEEDED) took a recovery path; fields.path is rebind (the identity carry re-checked the merged tree and re-bound the audit, with no audit round), reaudit (an LLM audit round), rebuild, debugger, end, or the name of the next phase for any other route; fields.code is the routed code, fields.original_code the code ship raised and fields.reason why a moved HEAD was audited again |
+| `ORCHESTRATOR_SHIP_WINDOW_LEASE_BROKEN` | a ship recovery broke the ship-window lease of a live holder whose heartbeat passed the TTL, so two lanes can overlap in the window; fields.owner_pid and fields.heartbeat_at name the broken holder |
+| `ORCHESTRATOR_SYSTEM_FAILURE` | an ADR-0072 system-level failure was attached to the cycle (INCIDENT when it halts the loop, WARN otherwise); fields.category names the floor |
+
+### outcome
+
+| Code | Meaning |
+|---|---|
+| `OUTCOME_SIDECAR_SKIPPED` | the phase's <phase>-usage.json sidecar was not written because the workspace is empty (the CWD-relative leak guard); the in-memory record and the phase.outcome event still stand |
+| `OUTCOME_SIDECAR_WRITE_FAILED` | the phase's <phase>-usage.json sidecar could not be encoded or written; the reason names the step and the error, fields name the phase and the path; the in-memory record stands |
+| `OUTCOME_TIMING_SKIPPED` | phase-timing.json was not written because the workspace is empty; the composed timing set is returned to the caller unchanged |
+| `OUTCOME_TIMING_WRITE_FAILED` | phase-timing.json could not be encoded or written (marshal, temp write or rename); the reason names the step and the error; the composed set is still returned |
+
+### quality
+
+| Code | Meaning |
+|---|---|
+| `QUALITY_CQ1_BREACH` | the whole 95% interval of CQ1 (unit conformance) is on the bad side of its threshold at stage report or gate (ADR-0153) |
+| `QUALITY_CQ2_BREACH` | the whole 95% interval of CQ2 (packages per ship) is on the bad side of its threshold at stage report or gate (ADR-0153) |
+| `QUALITY_CQ3_BREACH` | the whole 95% interval of CQ3 (interface depth) is on the bad side of its threshold at stage report or gate (ADR-0153) |
+| `QUALITY_CQ4_BREACH` | the whole 95% interval of CQ4 (duplication) is on the bad side of its threshold at stage report or gate (ADR-0153) |
+| `QUALITY_CQ5_BREACH` | the whole 95% interval of CQ5 (judgment surface) is on the bad side of its threshold at stage report or gate (ADR-0153) |
+| `QUALITY_JQ1_BREACH` | the whole 95% interval of JQ1 (seeded-defect recall) is on the bad side of its threshold at stage report or gate (ADR-0153) |
+| `QUALITY_JQ2_BREACH` | the whole 95% interval of JQ2 (false-PASS rate) is on the bad side of its threshold at stage report or gate (ADR-0153) |
+| `QUALITY_JQ3_BREACH` | the whole 95% interval of JQ3 (independent-review escalation) is on the bad side of its threshold at stage report or gate (ADR-0153) |
+| `QUALITY_OQ1_BREACH` | the whole 95% interval of OQ1 (escape rate) is on the bad side of its threshold at stage report or gate (ADR-0153) |
+| `QUALITY_OQ2_BREACH` | the whole 95% interval of OQ2 (14-day churn) is on the bad side of its threshold at stage report or gate (ADR-0153) |
+| `QUALITY_OQ3_BREACH` | the whole 95% interval of OQ3 (revert rate) is on the bad side of its threshold at stage report or gate (ADR-0153) |
+| `QUALITY_OQ4_BREACH` | the whole 95% interval of OQ4 (recovery count) is on the bad side of its threshold at stage report or gate (ADR-0153) |
+| `QUALITY_PQ1_BREACH` | the whole 95% interval of PQ1 (ship rate) is on the bad side of its threshold at stage report or gate (ADR-0153) |
+| `QUALITY_PQ2_BREACH` | the whole 95% interval of PQ2 (pass^k per phase) is on the bad side of its threshold at stage report or gate (ADR-0153) |
+| `QUALITY_PQ4_BREACH` | the whole 95% interval of PQ4 (deadline rate) is on the bad side of its threshold at stage report or gate (ADR-0153) |
+| `QUALITY_SOURCE_ABSENT` | a declared source of a quality index does not exist; fields.index and fields.source name it (ADR-0153) |
+| `QUALITY_SOURCE_UNREADABLE` | a source of a quality index exists but does not parse; fields.source names it, the reason holds the error (ADR-0153) |
+| `QUALITY_TQ1_BREACH` | the whole 95% interval of TQ1 (mutation efficacy on changed functions) is on the bad side of its threshold at stage report or gate (ADR-0153) |
+| `QUALITY_TQ2_BREACH` | the whole 95% interval of TQ2 (revert sensitivity) is on the bad side of its threshold at stage report or gate (ADR-0153) |
+| `QUALITY_TQ3_BREACH` | the whole 95% interval of TQ3 (test value) is on the bad side of its threshold at stage report or gate (ADR-0153) |
+| `QUALITY_TQ4_BREACH` | the whole 95% interval of TQ4 (held-out share) is on the bad side of its threshold at stage report or gate (ADR-0153) |
+| `QUALITY_VACUOUS_DENOMINATOR` | a quality reading has n = 0 where the index expects data; a rule that holds on an empty set proves nothing (ADR-0153) |
+
+### repair
+
+| Code | Meaning |
+|---|---|
+| `REPAIR_HANDOFF` | the fixability check found a hand-off finding before a repair round (ADR-0158); fields.stage is shadow or enforce, fields.decision is none, would_stop (shadow) or stop (enforce: the cycle seals handed-off with no repair round), fields.reason is handoff_blocker on a stop or a would_stop, fields.blockers, fields.handoff and fields.lane list the finding ids, fields.console_items the console items the findings name and fields.salvage the worktree of the cycle |
+
+### review
+
+| Code | Meaning |
+|---|---|
+| `REVIEW_AGENT_RUN_VERDICT_MISMATCH` | evolve agent run found that the report body of a review fails while the verdict field passes: the body states FAIL, states no verdict, or lists a CRITICAL or HIGH finding; the run verdict is FAIL; run_id names the run, fields.field_verdict the field, fields.stated the stated verdict, fields.critical and fields.high the counts |
+| `REVIEW_FINDINGS` | a code-review dispatch completed and its findings were recorded in the cycle's defect-ledger.json (source code-review); INFO, or WARN when the rows could not be recorded (fields.error) or the findings_repair or quality_index config fell back (fields.config_warning); fields.findings (counts by severity), verdict, would_repair (any finding or a scores gap: the round-1 projection of the loop's decision), stage, threshold, round, recorded, scores (the quality-index vector), gaps (empty when the scores qualify), overflow |
+| `REVIEW_SKIPPED` | a code-review dispatch was skipped and recorded nothing, so the walk continued and the audit stays the only gate; WARN; fields.reason malformed (the contract-correction ladder exhausted on the report, or its verdict stayed non-canonical after every retry), fields.round |
+
+### runner
+
+| Code | Meaning |
+|---|---|
+| `RUNNER_ATTEMPT_POSTMORTEM_FAILED` | the runner could not list the stored attempt postmortems of a phase before a launch (fields.step=read, the dispatch goes on without the Previous attempts section), could not read one stored record (fields.step=read, fields.path names it; the section keeps the valid records), or could not collect and write the postmortem of an attempt that ended abnormally (fields.step=collect); the reason is the error (ADR-0130) |
+| `RUNNER_DELIVERABLE_UNVERIFIED` | a CONTRACTED deliverable was still not well-formed after the settle window on the clean-exit path AND the final verdict is FAIL — the ship guard downgraded a clean-ship verdict (fields.downgraded=true) or Classify itself returned FAIL on the malformed or absent bytes; fault-only, a legitimate WARN/SKIPPED pass-through emits nothing; fields.codes, verdict_before, verdict, settle_attempts, deliverable |
+| `RUNNER_HOST_EFFECT_FAILED` | the runner could not perform a declared host effect before judging the phase; the engine and the gate still judge the effect; the reason is the performer's error |
+| `RUNNER_OPTIONAL_PHASE_DEGRADED` | an optional phase hit a bridge infra teardown with no trustworthy deliverable and degraded to WARN; the cycle continues — a stream and console ADDITION (the arm was a response diagnostic only); fields.teardown, exit, cause, verr, stale_leftover, settle_attempts, deliverable |
+| `RUNNER_RECONCILED` | a bridge infra teardown was overridden by a well-formed deliverable (fields.via=verify) or by the ACS deterministic floor (via=acs_floor, overridden_codes); the response carries Reconciled=true and core files the reconciled_timeout ledger disposition — ONE event where two INFO lines (ACS-FLOOR, RECONCILED) fired before; fields.verdict, deliverable, teardown, exit, settle_attempts |
+| `RUNNER_SELF_REVIEW_MISSING` | a source-writing dispatch loaded the self-review skill (code-review-simplify) and handed off a report the phase accepted with no Self-Review section; advisory only, the verdict is unchanged (logic blocks, format does not); fields.skill, section |
+| `RUNNER_STDOUT_FILTER_FAILED` | the clean-stdout companion of the phase's raw log (the logfilter writer's <phase>-stdout.clean.txt) could not be written; the phase continues and the raw log stays the forensic source; fields.workspace (the phase is the event's own) |
+| `RUNNER_TEARDOWN_FAIL` | a bridge INFRA teardown (artifact-wait timeout or transient failure) ended the session and no trustworthy deliverable rescued it — a mandatory phase FAILs and core's retry loop classifies the wrapped sentinel; the reason is the FAIL diagnostic's own text; fields.teardown = timeout / transient, exit, cause = stale_leftover / unverifiable / malformed, codes, verr, roots (ws= wt= evolve=), report and acs (size=N tail=… or absent), stale_leftover, settle_attempts (re-probes: never flushed vs malformed), deliverable |
+
+### ship
+
+| Code | Meaning |
+|---|---|
+| `SHIP_ARGS` | args: invalid ship arguments |
+| `SHIP_AUDIT_BINDING_ARTIFACT_MISSING` | verify-class: the audit artifact the ledger binds is missing |
+| `SHIP_AUDIT_BINDING_ARTIFACT_SHA` | verify-class: the audit artifact's SHA does not match the ledger binding |
+| `SHIP_AUDIT_BINDING_AUDITOR_EXIT` | verify-class: the auditor exited abnormally, so its verdict cannot bind |
+| `SHIP_AUDIT_BINDING_DUAL_VERDICT` | verify-class: the bound audit report carries two contradicting verdicts |
+| `SHIP_AUDIT_BINDING_HEAD_MOVED` | verify-class: main HEAD moved after the audit bound the tree |
+| `SHIP_AUDIT_BINDING_MALFORMED_VERDICT` | verify-class: the bound audit report carries no parseable verdict |
+| `SHIP_AUDIT_BINDING_NO_AUDITOR` | verify-class: no auditor ledger entry binds this cycle |
+| `SHIP_AUDIT_BINDING_NO_LEDGER` | verify-class: the ledger is unreadable, so no audit binding can be verified |
+| `SHIP_AUDIT_BINDING_STALE` | verify-class: the audit binding predates the tree being shipped |
+| `SHIP_AUDIT_BINDING_TREE_MISMATCH` | verify-class: the audited tree differs from the tree being shipped |
+| `SHIP_AUDIT_BINDING_VERDICT_FAIL` | verify-class: the bound audit verdict is FAIL |
+| `SHIP_AUDIT_BINDING_VERDICT_WARN_STRICT` | verify-class: the bound audit verdict is WARN under strict audit |
+| `SHIP_BACKSTOP_FLAKE` | the importer backstop named red tests that were green when their packages re-ran by themselves, without the pack's concurrent load; the ship proceeded on that evidence — recurrence is a hygiene item, not proof of a timing window |
+| `SHIP_CARRY_NOT_REPROVEN` | an identical-rebase carry record named the bound audit but ship could not re-prove it; the reason names the failed check (record, ledger chain, ancestry, tree bytes or patch-id) and the change is audited again; fields.carry_cycle |
+| `SHIP_COMMITTED_DOC_DELETED` | atomic-ship: the landing deletes a path under docs/ or knowledge-base/ that the target branch holds; a rename into docs/, or within knowledge-base/, ships |
+| `SHIP_COMMIT_GATE_MALFORMED` | verify-class: the commit-gate attestation cannot be parsed |
+| `SHIP_COMMIT_GATE_MISSING` | verify-class: no commit-gate attestation exists for the staged tree |
+| `SHIP_COMMIT_GATE_STALE` | verify-class: the commit-gate attestation is for a different tree |
+| `SHIP_COMMIT_PREFIX_GATE` | atomic-ship: the commit-message prefix gate refused the message |
+| `SHIP_CONTROL_PLANE_VIOLATION` | verify-class: a cycle-class commit touches the control-plane integrity surface (ADR-0064); ship it manually |
+| `SHIP_EGPS_RED_COUNT` | verify-class: the EGPS gate reports red evals; red_count must be 0 to ship |
+| `SHIP_EXPLANATION_DOCUMENTATION` | verify-explanation: the change ships without the explanation documentation its class requires |
+| `SHIP_FOREIGN_PREDICATE_PACKAGE` | atomic-ship: a cycle landing adds a file under go/acs/cycle<M>/ of a cycle other than the shipping one; archive the superseded package with its explanation record |
+| `SHIP_GATE_WEAKENED` | verify-class: the gate classifier flags a cycle-class commit that changes a kernel surface or weakens a gate (I-10, HEALING_I10_VIOLATION); ship it manually |
+| `SHIP_GIT_COMMIT_FAILED` | atomic-ship: the commit step failed |
+| `SHIP_GIT_DETACHED_HEAD` | atomic-ship: the tree is on a detached HEAD |
+| `SHIP_GIT_FF_MERGE_DIVERGED` | atomic-ship: the fast-forward merge to main diverged |
+| `SHIP_GIT_FLEET_REBASE_CONFLICT` | atomic-ship: the fleet rebase hit a genuine merge conflict; routed to the debugger (integrity, ADR-0049 G13a) |
+| `SHIP_GIT_FLEET_REBASE_NEEDED` | atomic-ship: a peer lane moved main; rebase and re-verify the merged tree (transient, ADR-0049 S5b) |
+| `SHIP_GIT_IO` | git I/O failure outside a named stage |
+| `SHIP_GIT_LANDING_UNWIND_DECLINED` | atomic-ship: a landing that cannot complete also cannot unwind the lane to the audited shape, so the cycle stops; the journal holds the commit, and main does not move (integrity) |
+| `SHIP_GIT_LANE_NOT_ON_ORIGIN` | atomic-ship: nothing to commit, but the lane holds commits that origin does not hold, and no landing intent proves them; ship refuses a PASS with no push (integrity) |
+| `SHIP_GIT_PUSH_POLICY_REFUSED` | atomic-ship: origin refused the push by policy (a protected branch, a hook, a rule, a token scope or an access refusal); ship does not retry it, unwinds the lane to the audited shape, and the router ends the cycle with no re-audit (precondition) |
+| `SHIP_GIT_PUSH_REJECTED` | atomic-ship: the remote rejected the push |
+| `SHIP_GIT_STAGE_FAILED` | atomic-ship: staging failed (transient) |
+| `SHIP_HELD_FOR_OPERATOR` | atomic-ship: at held_proposals.stage enforce, a lane change that touches the fence or works a pipeline-kind item waits for evolve landing approve of its tree; main did not move (ADR-0157) |
+| `SHIP_HELD_PROPOSAL_REJECTED` | atomic-ship: the operator rejected this tree of a held proposal with evolve landing reject; main did not move (ADR-0157) |
+| `SHIP_HOLD_SHADOW` | at held_proposals.stage shadow, a lane landing that touches the fence or works a pipeline-kind item lands, and the ship records that enforce would hold it for the operator (ADR-0157); fields.cycle, tree, reasons |
+| `SHIP_INTEGRITY_TREE_DRIFT` | post-ship: the shipped tree drifted from the verified one (integrity) |
+| `SHIP_INVALID_CLASS` | verify-class: unknown ship class |
+| `SHIP_LANDING_BINARY_RESET_FAILED` | git checkout HEAD -- <binary> before the ff-merge exited non-zero or failed to spawn; the merge still runs and may fail if the tracked binary is dirty; fields.step=integrate, path, git_rc, git_err |
+| `SHIP_LANDING_BINDING_WRITE_FAILED` | ship-binding.json could not be created, written or renamed into the run workspace; the push already landed, the caller keeps shipping and keeps its WARN log line; fields.step=binding, path, err |
+| `SHIP_LANDING_HEAD_READ_FAILED` | git rev-parse HEAD after the push landed errored or returned empty; the result's CommitSHA (the dossier's delivery identity) stays empty and the ship proceeds; fields.step=push, ref, err |
+| `SHIP_LANDING_MAIN_ADVANCE_FAILED` | after the push landed, the fast-forward of the plane main to the pushed commit failed; origin holds the commit, and the ship continues; the next landing fast-forwards main to origin under the ship lock when the ship journal holds each commit between them; fields.step=integrate, branch, commit, git_rc, git_err |
+| `SHIP_LANDING_PUSH_REPAIR_DECLINED` | the inline repair after a rejected push declined at the named probe (fetch, origin_ref, head, push_retry, or transport_retry after the bounded backoff); the original transient GIT_PUSH_REJECTED returns with repair_attempted/repair_outcome=declined; fields.step=push, branch, probe |
+| `SHIP_LANDING_RESUME_FETCH_FAILED` | the git fetch of origin before a landing resume failed; the resume decides on the last known origin ref, and its push reports an outage; fields.step=resume, branch, git_rc, git_err |
+| `SHIP_MANIFEST_GATE` | atomic-ship: a staged path was declared by no build/TDD report (cross-lane leak guard) |
+| `SHIP_MANUAL_DECLINED` | verify-class: the operator declined the manual ship |
+| `SHIP_MANUAL_NOT_TTY` | verify-class: a manual ship needs an interactive confirmation (or the audited --auto-confirm=<reason> parameter) |
+| `SHIP_REPO_CONTRACT_GATE` | atomic-ship: a repo-contract guard suite is RED in the lane worktree; pushing would red main |
+| `SHIP_REPO_CONTRACT_INFRA` | atomic-ship: the repo-contract scanner toolchain died twice without a test-level failure (re-dispatchable) |
+| `SHIP_SCAN_SHADOW_ESCAPE` | the scan shadow found a stored green result for the content key of a package, and that package then failed in the real run; the content key misses an input of the test, and the scan cache cannot be enforced until the miss is closed |
+| `SHIP_SCAN_SHADOW_FAULT` | the scan shadow panicked and recovered; the ship scan and its verdict were not affected, and the shadow records for this scan are incomplete |
+| `SHIP_SELF_SHA_IO` | verify-self-sha: the SHA pin could not be read or written |
+| `SHIP_SELF_SHA_TAMPERED` | verify-self-sha: the ship binary's SHA does not match the pinned one (tamper or unpinned rebuild) |
+| `SHIP_STATE_IO` | state file I/O failure |
+| `SHIP_TRIVIAL_CRITICAL_PATHS` | verify-class: a trivial-class ship touches critical paths |
+| `SHIP_TRIVIAL_NOT_TRIVIAL` | verify-class: a trivial-class ship exceeds the trivial diff bound |
+| `SHIP_UNKNOWN` | an unclassified ship failure |
+| `SHIP_WINDOW_LEASE_BROKEN` | a ship broke the ship-window lease of a live holder whose heartbeat passed the TTL, so two lanes can overlap in the window; fields.owner_pid and fields.heartbeat_at name the broken holder |
+| `SHIP_WORKTREE_RESOLVE` | atomic-ship: the cycle worktree could not be resolved |
+
+### signalcenter
+
+| Code | Meaning |
+|---|---|
+| `SIGNALCENTER_BAD_ORIGIN` | an event's origin is not a Func or Type.Method name; raw value in fields.raw_origin |
+| `SIGNALCENTER_LISTENER_PANICKED` | a listener panicked and was unsubscribed; the panic value is in the reason |
+| `SIGNALCENTER_MISSING_CODE` | a WARN or INCIDENT event carried no code |
+| `SIGNALCENTER_MISSING_REASON` | an event carried no reason |
+| `SIGNALCENTER_SINK_DROPPED` | the durable sink had no path for N events (fields.dropped) before this write |
+| `SIGNALCENTER_UNKNOWN_KIND` | an event named a kind outside the closed set; raw value in fields.raw_kind |
+| `SIGNALCENTER_UNKNOWN_MODULE` | an event named a module outside the closed set; raw value in fields.raw_module |
+| `SIGNALCENTER_UNKNOWN_SEVERITY` | an event carried a severity outside INFO/WARN/INCIDENT; raw value in fields.raw_severity |
+| `SIGNALCENTER_UNREGISTERED_CODE` | an event carried a code its module never registered; raw value in fields.raw_code |
+
+### tokens
+
+| Code | Meaning |
+|---|---|
+| `TOKENS_ROW_UNATTRIBUTED` | a cycle workspace wrote an llm-calls row whose request carried no cycle number, so the row cannot be attributed to its cycle; emitted at the enforce stage only; fields call_id, cli, agent |
+
+### triage
+
+| Code | Meaning |
+|---|---|
+| `TRIAGE_CAP_COMPANION_MALFORMED` | the triage-decision.json companion beside the triage report is present but malformed (invalid JSON, or a committed_floors or deferred_floors field that is not a list of strings); the capacity clamp falls back to counting floors in the report prose; WARN; reason names the file and the parse error |
+| `TRIAGE_CAP_DEMOTION_DEFECT_UNWRITTEN` | the triage capacity clamp demoted itself to shadow for one cycle (ADR-0046 Layer 2), but its auto-filed inbox defect could not be written; the cycle is still relieved, but no record marks the one-cycle relief as used, so a later cycle of the same pair can be relieved again; WARN; reason names the defect file and the write error |
+
+<!-- GENERATED:signal-codes END -->
