@@ -1,0 +1,213 @@
+{
+  "acs": {
+    "go_timeout_s": 600,
+    "predicate_env": [
+      "EVOLVE_FLAG_CAMPAIGN"
+    ]
+  },
+  "audit_cascade": {
+    "stage": "shadow",
+    "risk_paths": [
+      "go/internal/core/",
+      "go/internal/guards/",
+      "go/internal/phases/ship/"
+    ],
+    "max_changed_files": 40,
+    "escalate_verdicts": [
+      "FAIL",
+      "WARN"
+    ]
+  },
+  "catalog": {
+    "auto_refresh": true,
+    "refresh_stage": "enforce",
+    "allowed_families": {
+      "agy": [
+        "gemini"
+      ],
+      "agy-claude": [
+        "claude"
+      ],
+      "claude": [
+        "claude"
+      ],
+      "codex": [
+        "gpt"
+      ]
+    }
+  },
+  "cli_health": {
+    "proactive_probe": true
+  },
+  "cli_routing": {
+    "clis": [
+      "agy",
+      "agy-claude",
+      "claude"
+    ],
+    "default": [
+      "agy",
+      "agy-claude",
+      "claude"
+    ],
+    "agents": {
+      "builder": {
+        "cli": [
+          "agy",
+          "agy-claude",
+          "claude"
+        ],
+        "model": "balanced"
+      },
+      "console-builder": {
+        "cli": [
+          "claude",
+          "agy-claude",
+          "agy"
+        ],
+        "model": "balanced"
+      },
+      "reflector": {
+        "effort": "low"
+      },
+      "scout": {
+        "effort": "low"
+      },
+      "tdd-engineer": {
+        "cli": [
+          "claude"
+        ],
+        "model": "balanced",
+        "effort": "high"
+      },
+      "triage": {
+        "effort": "low"
+      }
+    },
+    "tiers": {
+      "deep": {
+        "clis": [
+          "agy",
+          "agy-claude",
+          "claude"
+        ],
+        "share_pct": 50
+      },
+      "top": [
+        "agy-claude",
+        "claude"
+      ]
+    },
+    "floors": {
+      "claude": [
+        "auditor",
+        "adversarial-review",
+        "tdd-engineer",
+        "spec-verifier",
+        "spec-verify",
+        "code-reviewer"
+      ]
+    }
+  },
+  "comment_floor": {
+    "stage": "enforce"
+  },
+  "docs_floor": {
+    "ste_stage": "enforce"
+  },
+  "failure_disposition": {
+    "stage": "enforce"
+  },
+  "fleet": {
+    "count": 4,
+    "plan_source": "triage",
+    "min_lanes": 4,
+    "orchestrator": {
+      "stage": "enforce",
+      "admission": "enforce"
+    }
+  },
+  "floor": [
+    {
+      "id": "dossier-closeout",
+      "description": "Every completed cycle must write a dossier to knowledge-base/cycles/cycle-N.json. Enforced by evolve dossier verify.",
+      "enforced_since_cycle": 2
+    }
+  ],
+  "gc": {
+    "go_cache_ttl_hours": 24,
+    "mode": "enforce",
+    "runs": {
+      "delete_after_days": 14
+    },
+    "temp_ttl_hours": 24,
+    "worktrees": {
+      "salvage_after_hours": 24
+    }
+  },
+  "inbox": {
+    "curator": {
+      "stage": "shadow",
+      "overlap_refuse": 0.5,
+      "overlap_warn": 0.3,
+      "consume_min_share": 0.5
+    }
+  },
+  "inbox_priority": {
+    "class_order": [
+      "correctness",
+      "stability",
+      "performance",
+      "debuggability",
+      "feature",
+      "maintainability",
+      "hygiene",
+      "security"
+    ],
+    "factors": {
+      "base": 0.45,
+      "class": 0.2,
+      "unblocks": 0.15,
+      "recurrence": 0.1,
+      "age": 0.05,
+      "goal": 0.05
+    },
+    "age_halflife_days": 30,
+    "unblocks_cap": 3,
+    "recurrence_cap": 5,
+    "active_campaigns": [
+      "handoff-contract",
+      "wave-orchestrator"
+    ],
+    "preempt_margin": 0.05
+  },
+  "parallel_evaluate": {
+    "stage": "shadow",
+    "concurrency": 3
+  },
+  "regression_tia": {
+    "stage": "shadow"
+  },
+  "retrospectives": {
+    "stage": "enforce"
+  },
+  "isolation": {
+    "i2": {
+      "stage": "enforce"
+    }
+  },
+  "retry": {
+    "contract_correction_retries": 1
+  },
+  "workflow": {
+    "retry_ladder": {
+      "stage": "shadow",
+      "audit_fix": {
+        "stage": "enforce"
+      }
+    },
+    "builder_selfcheck": {
+      "stage": "enforce"
+    }
+  }
+}

@@ -1,0 +1,206 @@
+package ship
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+	"github.com/mickeyyaya/evolve-loop/go/internal/phases/ship/landing"
+	"github.com/mickeyyaya/evolve-loop/go/internal/signalcenter"
+)
+
+func recordingCenter() (*signalcenter.Center, *[]signalcenter.Event) {
+	c := signalcenter.New()
+	got := &[]signalcenter.Event{}
+	c.Subscribe(func(e signalcenter.Event) { *got = append(*got, e) })
+	return c, got
+}
+
+func TestLanding_OneConstructionSite(t *testing.T) {
+	t.Parallel()
+	const onlySite = "internal/phases/ship/gitops_landing.go"
+	offenders, scanned := nonTestSourcesMentioning(t, "landing.New(", onlySite)
+	if len(offenders) > 0 {
+		t.Errorf("landing.New( belongs to ONE non-test file (%s); these use it too: %v", onlySite, offenders)
+	}
+	if scanned < 800 {
+		t.Errorf("the scan must cover the whole module (%d non-test files scanned — the root is three levels up)", scanned)
+	}
+}
+
+func nonTestSourcesMentioning(t *testing.T, needle, allowed string) ([]string, int) {
+	t.Helper()
+	moduleRoot, err := filepath.Abs(filepath.Join("..", "..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var offenders []string
+	scanned := 0
+	walk := func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(moduleRoot, path)
+		rel = filepath.ToSlash(rel)
+		if entry.IsDir() {
+			if entry.Name() == "vendor" || entry.Name() == "bin" || entry.Name() == "testdata" || (strings.HasPrefix(entry.Name(), ".") && path != moduleRoot) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(rel, ".go") || strings.HasSuffix(rel, "_test.go") || strings.HasPrefix(rel, "internal/phases/ship/landing/") {
+			return nil
+		}
+		scanned++
+		body, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return rerr
+		}
+		if strings.Contains(string(body), needle) && rel != allowed {
+			offenders = append(offenders, rel)
+		}
+		return nil
+	}
+	if err := filepath.WalkDir(moduleRoot, walk); err != nil {
+		t.Fatal(err)
+	}
+	return offenders, scanned
+}
+
+func TestWorktreeShipLand_BinaryResetFailureIsTheLandingCodeNotStderr(t *testing.T) {
+	t.Parallel()
+	opts, _, stderr := pinOptions(t, ClassCycle)
+	opts.RunID = "run-7"
+	c, got := recordingCenter()
+	opts.Signals = c
+	r := newArgvRecorder(opts)
+	r.on("checkout HEAD -- go/evolve", scriptedCall{exit: 1})
+	scriptGreenLanding(r, filepath.Join(opts.ProjectRoot, "wt"))
+	res := &RunResult{}
+	s := newWorktreeShip(context.Background(), opts, res, pinBranch, filepath.Join(opts.ProjectRoot, "wt"))
+	s.cycleBranch = pinCycleBranch
+	if err := s.land(""); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stderr.String(), "could not reset go/evolve") {
+		t.Errorf("the raw stderr line is gone (replaced by the code):\n%s", stderr.String())
+	}
+	if len(*got) != 2 || (*got)[0].Code != landing.CodeBinaryResetFailed || (*got)[0].Phase != phaseName || (*got)[0].Cycle != 7 || (*got)[0].RunID != "run-7" {
+		t.Errorf("the Center sees the landing code under the ship phase with the run identity, then the landing: %+v", *got)
+	}
+	if (*got)[1].Kind != signalcenter.KindShipLanded {
+		t.Errorf("the second event is %q, want ship.landed: a failed binary reset does not stop the landing", (*got)[1].Kind)
+	}
+	if !strings.Contains(strings.Join(r.argvs(), "\n"), "checkout HEAD -- go/evolve [discard]\nmerge --ff-only "+pinHead+" [streams]") {
+		t.Errorf("the merge still runs after the failed reset: %v", r.argvs())
+	}
+}
+
+func TestPushWithRepair_WritesBackTheLedgerUnconditionally(t *testing.T) {
+	t.Parallel()
+	opts, _, _ := pinOptions(t, ClassCycle)
+	r := newArgvRecorder(opts)
+	r.on("push origin "+pinBranch, scriptedCall{exit: 1})
+	r.on("fetch origin "+pinBranch, scriptedCall{exit: 1})
+	res := &RunResult{CommitSHA: "untouched"}
+	err := pushWithRepair(context.Background(), opts, res, landing.PushRequest{Branch: pinBranch, Site: landing.SiteDirect})
+	if err == nil {
+		t.Fatal("a declined repair returns the rejection")
+	}
+	if res.RepairAttempted != "GIT_PUSH_REJECTED" || res.RepairOutcome != "declined" || res.CommitSHA != "untouched" {
+		t.Errorf("result after a declined repair: %+v", res)
+	}
+	if !opts.repairAttempted[core.CodeGitPushRejected] {
+		t.Error("the once-guard is written back to the host's ledger")
+	}
+	probes := len(r.calls)
+	if err := pushWithRepair(context.Background(), opts, res, landing.PushRequest{Branch: pinBranch, Site: landing.SiteDirect}); err == nil {
+		t.Fatal("the second rejection returns the rejection")
+	}
+	if len(r.calls) != probes+1 {
+		t.Errorf("a second rejection in the same Run makes zero repair probes: %v", r.argvs()[probes:])
+	}
+	signals := map[string]any{}
+	addRepairSignals(signals, *res)
+	if signals["ship.repair_attempted"] != "GIT_PUSH_REJECTED" || signals["ship.repair_outcome"] != "declined" {
+		t.Errorf("PhaseResponse.Signals unchanged: %v", signals)
+	}
+	fresh, _, _ := pinOptions(t, ClassCycle)
+	r2 := newArgvRecorder(fresh)
+	scriptGreenPost(r2)
+	res2 := &RunResult{}
+	if err := pushWithRepair(context.Background(), fresh, res2, landing.PushRequest{Branch: pinBranch, Site: landing.SiteDirect}); err != nil {
+		t.Fatal(err)
+	}
+	if res2.CommitSHA != pinHead || res2.RepairAttempted != "" || fresh.repairAttempted != nil {
+		t.Errorf("a green push sets CommitSHA and touches no ledger: %+v %v", res2, fresh.repairAttempted)
+	}
+}
+
+func TestShipFromWorktreeGreen_StreamIsByteIdenticalApartFromTheDeclaredCodes(t *testing.T) {
+	t.Parallel()
+	opts, _, _ := pinOptions(t, ClassCycle)
+	c, got := recordingCenter()
+	opts.Signals = c
+	r := newArgvRecorder(opts)
+	wt := filepath.Join(opts.ProjectRoot, "wt")
+	mustMkdir(t, wt)
+	r.on("-C "+wt+" symbolic-ref --short HEAD", scriptedCall{stdout: pinCycleBranch + "\n"})
+	r.on("-C "+wt+" diff --cached --quiet", scriptedCall{exit: 1})
+	scriptGreenLanding(r, wt)
+	res := &RunResult{}
+	if err := newWorktreeShip(context.Background(), opts, res, pinBranch, wt).run(); err != nil {
+		t.Fatalf("green worktree ship: %v\n%s", err, strings.Join(res.Logs, "\n"))
+	}
+	if res.CommitSHA != pinHead || !containsLog(*res, "[ship] OK: pushed to origin/main") {
+		t.Errorf("the ship landed: %+v", res)
+	}
+	if len(*got) != 1 || (*got)[0].Kind != signalcenter.KindShipLanded || (*got)[0].Severity != signalcenter.SeverityInfo || (*got)[0].Code != "" {
+		t.Errorf("a green ship emits one INFO ship.landed and no warning or error: %+v", *got)
+	}
+}
+
+func TestShipOptions_ThreadsSignals(t *testing.T) {
+	t.Parallel()
+	c, _ := recordingCenter()
+	p := New(Config{Runner: execRunner, Signals: c})
+	if !p.signalsWired() {
+		t.Fatal("signalsWired must be true when Config.Signals is set")
+	}
+	opts := p.shipOptions(core.PhaseRequest{ProjectRoot: t.TempDir(), Cycle: 7}, "msg")
+	if opts.Signals != c {
+		t.Error("shipOptions must thread the Center into Options.Signals")
+	}
+	if New(Config{Runner: execRunner}).signalsWired() {
+		t.Error("signalsWired must be false without a Center (the registry factory root)")
+	}
+}
+
+func TestShipBindingLayout_IsSpelledOnce(t *testing.T) {
+	t.Parallel()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cycleDir := regexp.MustCompile(`"cycle-%d"`)
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(src), `"ship-binding.json"`) {
+			t.Errorf("%s spells the binding file name; dossier.ShipBindingFile is the SSOT", name)
+		}
+		if (name == "gitops.go" || name == "native.go") && cycleDir.Match(src) {
+			t.Errorf("%s spells the run-workspace dir; core.RunWorkspacePath is the SSOT", name)
+		}
+	}
+}

@@ -1,0 +1,104 @@
+# ADR-0103: Component breakdown program — small units, one contract each
+
+> **Note (2026-11-06):** Amended by [ADR-0124](0124-code-review-phase.md) (Proposed), unit 09 (the defect ledger): entries gain the fields `source`, `round`, `severity` and `dimension`. The merge rule becomes `defectledger.Append`.
+
+- **Status:** Accepted (operator direction, 2026-09-13)
+- **Related:** [ADR-0101](0101-signal-center.md) (the Signal Center every unit reports through),
+  [signal-center-design.md §12](../signal-center-design.md) (the decomposition order),
+  [ADR-0044](0044-unified-phase-recovery-protocol.md) (the C1 recording chokepoint the first unit extracts)
+
+## Context
+
+The orchestrator's largest files (`orchestrator.go` 1169 lines, `phase_advisor.go` 1144,
+`failure_learning.go` 1068, `cmd_cycle.go` 1058, `inboxmover.go` 993, `gitops.go` 989 …) each
+hold several unrelated responsibilities behind package-internal names. When a cycle misbehaves,
+the reader has to know which of a file's clusters produced a line, and the lines are hand-written
+`[orchestrator] WARN …` strings with no code and no owner. The Signal Center (ADR-0101) gave the
+pipeline one stream and one severity contract; this program gives each responsibility its own
+small unit that reports into that stream under its own module tag and its own codes, so a root
+cause is found by reading a few signal lines and opening one small package.
+
+## Decision
+
+Break the large modules into small, independent units in the order of design §12, one unit per
+PR, each landing with all of the following — a unit without any of them is not done:
+
+1. **A unit design document** at `docs/architecture/decomposition/NN-<unit>.md` in the fixed
+   structure: Context · Boundary (what moves, what stays, why) · API (Go signatures) · Patterns
+   (named, with the force each answers) · Module contract (module tag, error codes with reasons,
+   log/signal lines with origin) · Tests (the red-first list; API and line coverage) · Why it is
+   better than the original (a table: observability, isolation, changeability, measurement) ·
+   Risks and the byte-identity guarantees · Migration (the facade the callers keep).
+2. **One module tag** in the Signal Center's closed set, and **unified error codes**
+   (`MODULE_SNAKE_CASE`, registered with a doc string, projected into `signal-codes.md`) for every
+   condition the unit reports; the unit emits signals with its module and an `origin` naming the
+   type and method, never a hand-written stderr line.
+3. **TDD, red first**: every exported symbol has a test that names it (apicover) and the unit's
+   line coverage is 100 % (`.cover-strict`); unreachable defensive branches are removed rather
+   than excused; behaviour is pinned with build-confirmed mutants.
+4. **Callers untouched** (Strangler Fig): the orchestrator keeps a one-call facade at the old
+   seam, so the extraction changes no call site and no on-disk format; a characterization test
+   proves the files written are byte-identical.
+5. **Clean-code limits**: functions under 50 lines, files under 800, nesting ≤ 4; interfaces at
+   the point of use; explicit dependency injection at construction (functional options).
+6. **The reviewer fleet** (simplifier → architecture ∥ Go review; CRITICAL/HIGH block) and the
+   commit gate, like every other change.
+
+## Consequences
+
+- Triage becomes a read of `signals.ndjson` filtered by module, then one small package: the
+  ultimate goal the operator set (root cause within a few review steps).
+- Each unit is measurable on its own: coverage, API coverage, signal counts by code.
+- The orchestrator shrinks to composition plus the `RunCycle` engine (unit 3), with the units
+  injected — the same explicit-DI shape the Signal Center campaign established.
+- Cost: one more package and one facade per unit; the facade is the price of untouched callers
+  and is removed only when the last caller migrates to the unit's API.
+
+## Units (design §12 order)
+
+| # | Unit | From | Doc |
+|---|---|---|---|
+| 01 | Phase-outcome recorder (the C1 chokepoint: cycle result, phase-timing log, usage sidecar, context fill) | `core/failure_learning.go` | [01-outcome-recorder.md](../decomposition/01-outcome-recorder.md) |
+| 02 | Failure diagnostics and delivery-failure classification (the failure-diag sidecar writer, the delivery-failure classifier, the wire tokens) | `core/failure_learning.go` | [02-failure-diagnostics.md](../decomposition/02-failure-diagnostics.md) |
+| 03 | Carryover-todo lifecycle (mint admission, the closeout merges, the retirements, the state.json persist; three sibling files collapsed) | `core/failure_learning.go` + `carryover_merge.go`, `prescription_carryover.go`, `carryover_triage_retire.go` | [03-carryover-lifecycle.md](../decomposition/03-carryover-lifecycle.md) |
+| 03b | Failure-learning engine (the failed-approach recorder, the deterministic floor, remediation filing, the recurrence closure; `recordFailureLearning` split in place into a pure gate + four named steps for unit 05) | `core/failure_learning.go` | [03b-failure-learning-engine.md](../decomposition/03b-failure-learning-engine.md) |
+| 12 | Phase observer — stall detection, the incident responder, the envelope/report sinks (the manual subcommand's engine) + the live adapter's Signal Center wiring | `internal/phaseobserver/phaseobserver.go` (+ `adapters/observer/core_adapter.go` wiring) | [12-phaseobserver.md](../decomposition/12-phaseobserver.md) |
+| 04 | Phase advisor | `core/phase_advisor.go` | next |
+
+
+| 05 | Orchestrator: composition root vs `RunCycle` engine | `core/orchestrator.go` | after 01–04 |
+| 07 | Ship landing (the fleet ff-merge, the push with its inline push-race repair and its reclassification, the post-push head read, the shared git probes, the ship-binding writer; the rebase engine stays with the orchestrator — unit 05; staging → 07b, run-scope → 07c) | `phases/ship/worktree_ship.go` + `repair.go` + `gitops.go` + `pushonly.go` + `verify.go` | [07-shipgitops.md](../decomposition/07-shipgitops.md) |
+| 08 | Config resolution (the routing-config Loader with an injected reader and Center; the registry/env/policy dials and validators; the malformed-registry and policy-typo blind spots closed; decomposed in place) | `config/config.go` | [08-config.md](../decomposition/08-config.md) |
+| 09 | Defect ledger (schema, writer, readers; the continuation disposition gate with the lane-scope reader and the citation resolver injected; carryover and the adoption seeder decode through it — unit 03 F13 closed) | `phases/audit/defect_ledger.go` | [09-defectledger.md](../decomposition/09-defectledger.md) |
+| 06 | Inbox lifecycle mover (claim, promote, quarantine release, the cycle drain, orphan recovery, the processed-record primitives; outcome.go's door and the continuation trio stay for 06b) | `inboxmover/inboxmover.go` + `claimstate.go` | [06-inboxmover.md](../decomposition/06-inboxmover.md) |
+| 10 | Bridge engine — the launch-outcome classifier (the exit vocabulary as ONE table: sentinel, attempt-ledger cause code, `BRIDGE_EXIT_*` projection; the cause-line miners; the request gauntlet stays in the host as `bridge.ValidateRequest`, shared with the adapter; `Launch` split in place into named steps with four step codes) | `bridge/engine.go` + `bridge/attempt_telemetry.go` | [10-bridgeengine.md](../decomposition/10-bridgeengine.md) |
+| 11 | Phase-runner verdict engine (the settle ladder, the teardown reconcile arms, the stale-leftover gate, the ACS deterministic floor, the verdict-source rule, the ship guard; the first `runner.warning` producer — the dispatch chain follows as 11b) | `phases/runner/runner.go` + `reconciliation.go` + `classification.go` | [11-phaserunner.md](../decomposition/11-phaserunner.md) |
+| 13 | Loop wave/chain engine (the wave gate + one dispatch body, min-width repair, fleet-config reload, the freshness-gated launcher, quota/budget sizing, the plan source → `internal/loopwave`; the chain driver, the boundary binary refresh, the pure chain decisions → `internal/loopchain`) | `cmd/evolve/cmd_loop_wave.go` + `cmd_loop_chain.go` | [13-loopwave.md](../decomposition/13-loopwave.md) |
+| 14 | CI-parity gate (the five local-vs-CI decisions: go vet, acs-durable, the serialized integration tier, apicover -enforce, new-package graduation; two 137/94-line functions split into pure decision tables + thin shells; module `audit` gets its first producers) | `phases/audit/ciparity.go` | [14-ciparity.md](../decomposition/14-ciparity.md) |
+| 16 | Subagent run — the `evolve subagent run` execution path (admission, cli/tier/capability resolution, prompt delivery, the bridge exec port, artifact verification, exit-code mapping, the agent_subprocess ledger record; the second Signal Center root) | `subagent/run.go` + `contract.go` | [16-subagentrun.md](../decomposition/16-subagentrun.md) |
+
+
+
+
+| … | inbox mover, ship gitops, config, audit gates, bridge autorespond (10b) | design §12 | later |
+
+
+
+Row 03b is a numbering insertion (the engine surfaced while unit 03 was designed), not a §12 reorder: it lands before unit 04 because the advisor's `truncateRunes` read now resolves through carryover, and its `ORCHESTRATOR_*` handoff (its doc §5) must be settled before unit 05 splits `RunCycle`. Row 07 is likewise an insertion while 04–06 are unassigned: the ship landing is design §12 row 6 and touches no core file, so it could be built in parallel with the advisor and the orchestrator split; its number is the brief's, not a §12 reorder.
+
+Row 07 grew on 2026-10-07, after cycle 1830 ([incident](../../incidents/2026-10-07-cycle-1830-a-failed-push-stranded-the-audited-commit.md)). The design is ADR-0039 §8.1. The leaf now also owns these parts:
+
+- the landing intent (`Intent`, `IntentPath`, `WriteIntent`, `ReadIntent`), at `.evolve/landing/cycle-<N>.json`;
+- the check before the push (`CheckFastForward`);
+- the classified push with its backoff;
+- the resume decision (`Resume`, and `Admit` for its ancestry checks).
+
+The worktree site pushes the lane commit by refspec before the plane `main` moves. The leaf keeps its contract: stdlib plus `dossier`, `shiperr` and `signalcenter`, and 100 % line coverage. The goldens of the worktree site and the integrate step pinned the old order, so they are retired. Host tests pin the new order (`landing_order_test.go`).
+
+Row 08 (design §12 row 7) landed before units 04-05: it is a leaf with no core dependency, its two blind spots (a malformed registry silently dropping triage, a typo'd policy gate dial silently off) were live risks, and its `Loader` is what unit 05's composition root injects.
+
+Row 12 is likewise a numbering insertion (the observer slice the program named as unit 12): it lands before units 04/05 because its only touch of unit 05's function is one declared line (`ca.Signals = …` inside `wireOrchestratorDeps`, guarded by a count-scan test a unit-05 cut must keep green), and because its module tag `observer` already sat in the closed set with zero codes.
+
+Row 09 is pulled forward from the design's §12 "later wave" (the audit package): unit 03 handed its schema off by name (F13 — three homes for one wire shape), the `audit` module tag had zero producers, and the leaf is importable by audit, core and carryover alike; `acssuite.go` and `ciparity.go` stay in the later wave. It landed 2026-09-14 out of numeric order, before 04 and 05.
+
+Row 13 is the orchestrator's numbering for the loop's two schedulers (cmd/evolve, not core): rows 06–12 are design §12's later slices and stay unassigned until they land. Unit 13 lands before 04/05 because it touches no core file — its leaves sit beside cmd/evolve (`internal/loopwave` is core-tainted through fleet/triagecap and would cycle under `internal/core`; `internal/loopchain` is core-free).

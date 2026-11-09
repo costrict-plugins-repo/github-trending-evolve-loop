@@ -1,0 +1,89 @@
+package main
+
+import (
+	"flag"
+	"fmt"
+	"io"
+	"path/filepath"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/gcpolicy"
+	"github.com/mickeyyaya/evolve-loop/go/internal/policy"
+	"github.com/mickeyyaya/evolve-loop/go/internal/pruneephemeral"
+)
+
+var (
+	pruneEphemeralRun  = pruneephemeral.Run
+	dispatchLogCatalog = gcpolicy.Policy.LogCatalog
+)
+
+func runPruneEphemeral(args []string, _ io.Reader, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("prune-ephemeral", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var (
+		dryRun         bool
+		quiet          bool
+		trackerTTLDays int
+		logTTLDays     int
+	)
+	fs.BoolVar(&dryRun, "dry-run", false, "dry run — show what would be pruned without deleting")
+	fs.BoolVar(&quiet, "quiet", false, "suppress progress output")
+	fs.IntVar(&trackerTTLDays, "tracker-ttl-days", 7, "tracker retention days")
+	fs.IntVar(&logTTLDays, "dispatch-log-ttl-days", 30, "dispatch log retention days; when unset, the TTL of the gc log catalog (gc.logs.dispatch.ttl_days, else gc.logs_ttl_days, else 30)")
+	for _, a := range args {
+		if a == "-h" || a == "--help" {
+			fmt.Fprintln(stdout, "Usage: evolve prune-ephemeral [--dry-run] [--quiet] [--tracker-ttl-days N] [--dispatch-log-ttl-days N]")
+			fmt.Fprintln(stdout, "TTL retention for .evolve/runs/cycle-*/.ephemeral and .evolve/dispatch-logs/batch-*.log")
+			fmt.Fprintln(stdout, "Env: EVOLVE_PROJECT_ROOT")
+			return 0
+		}
+	}
+	if err := fs.Parse(args); err != nil {
+		return 10
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "[prune-ephemeral] unexpected arg: %s\n", fs.Arg(0))
+		return 10
+	}
+
+	projectRoot := envOrCwd("EVOLVE_PROJECT_ROOT")
+	if !flagSet(fs, "dispatch-log-ttl-days") {
+		logTTLDays = dispatchLogTTLDays(projectRoot, stderr)
+	}
+	_, err := pruneEphemeralRun(pruneephemeral.Options{
+		ProjectRoot:    projectRoot,
+		TrackerTTL:     time.Duration(trackerTTLDays) * 24 * time.Hour,
+		DispatchLogTTL: time.Duration(logTTLDays) * 24 * time.Hour,
+		DryRun:         dryRun,
+		Quiet:          quiet,
+		Stderr:         stderr,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "[prune-ephemeral] FAIL: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func flagSet(fs *flag.FlagSet, name string) bool {
+	set := false
+	fs.Visit(func(f *flag.Flag) { set = set || f.Name == name })
+	return set
+}
+
+func dispatchLogTTLDays(projectRoot string, stderr io.Writer) int {
+	pol, err := policy.Load(filepath.Join(projectRoot, ".evolve", "policy.json"))
+	if err != nil {
+		fmt.Fprintf(stderr, "[prune-ephemeral] WARN: policy load failed: %v; using the default log catalog\n", err)
+	}
+	var gcPol gcpolicy.Policy
+	if pol.GC != nil {
+		gcPol = *pol.GC
+	}
+	for _, cat := range dispatchLogCatalog(gcPol) {
+		if cat.Name == gcpolicy.LogCategoryDispatch {
+			return cat.TTLDays
+		}
+	}
+	return gcPol.WithDefaults().LogsTTLDays
+}

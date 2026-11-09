@@ -1,0 +1,474 @@
+//go:build integration
+
+package main
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strings"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/signalcenter"
+)
+
+func okCall(prep func(*testing.T) map[string]string, args ...string) contractCall {
+	return contractCall{kind: contractSuccess, prep: prep, args: args}
+}
+
+func usageCall(prep func(*testing.T) map[string]string, args ...string) contractCall {
+	return contractCall{kind: contractUsage, prep: prep, args: args, want: cliExitUsage}
+}
+
+func failCall(want int, prep func(*testing.T) map[string]string, args ...string) contractCall {
+	return contractCall{kind: contractNegative, prep: prep, args: args, want: want}
+}
+
+func unheld(c contractCall) contractCall {
+	c.unheld = true
+	return c
+}
+
+func silent(c contractCall) contractCall {
+	c.silent = true
+	return c
+}
+
+func withStdin(c contractCall, stdin string) contractCall {
+	c.stdin = stdin
+	return c
+}
+
+func custom(c contractCall, run func(*testing.T, map[string]string) func([]string, io.Writer, io.Writer) int) contractCall {
+	c.run = run
+	return c
+}
+
+const prFlag = "--project-root"
+
+var contractCases = []contractVerbCases{
+	{"status", []contractCall{okCall(contractPlane, "status", prFlag, "{root}"), usageCall(contractPlane, "status", "extra", prFlag, "{root}"), failCall(cliExitIO, contractBareRoot, "status", prFlag, "{root}")}},
+	{"loop status", []contractCall{okCall(contractPlane, "loop", "status", prFlag, "{root}"), usageCall(contractPlane, "loop", "status", "foo", prFlag, "{root}"), failCall(cliExitIO, contractBareRoot, "loop", "status", prFlag, "{root}")}},
+	{"wave status", []contractCall{okCall(contractPlane, "wave", "status", prFlag, "{root}"), usageCall(contractPlane, "wave", "status", "--bogus", prFlag, "{root}"), failCall(cliExitIO, contractBadWaves, "wave", "status", prFlag, "{root}")}},
+	{"integration status", []contractCall{okCall(contractCleanPool, "integration", "status", prFlag, "{root}"), usageCall(contractPlane, "integration", "status", "--bogus", prFlag, "{root}"), failCall(cliExitFailed, contractBareRoot, "integration", "status", prFlag, "{root}")}},
+	{"wave supply", []contractCall{okCall(contractPlane, "wave", "supply", prFlag, "{root}"), usageCall(contractPlane, "wave", "supply", "--bogus", prFlag, "{root}"), failCall(cliExitIO, contractInboxFile, "wave", "supply", prFlag, "{root}")}},
+	{"wave watch", []contractCall{okCall(contractWaveRecorded, "wave", "watch", prFlag, "{root}"), usageCall(contractPlane, "wave", "watch", "--bogus", prFlag, "{root}"), failCall(cliExitIO, contractPlane, "wave", "watch", prFlag, "{root}")}},
+	{"inbox list", []contractCall{okCall(contractInboxItem, "inbox", "list", prFlag, "{root}"), usageCall(contractPlane, "inbox", "list", "--status", "x", prFlag, "{root}"), failCall(cliExitIO, contractInboxFile, "inbox", "list", prFlag, "{root}")}},
+	{"inbox show", []contractCall{okCall(contractInboxItem, "inbox", "show", "cli-inbox-show", prFlag, "{root}"), usageCall(contractPlane, "inbox", "show", prFlag, "{root}"), failCall(cliExitFailed, contractPlane, "inbox", "show", "absent", prFlag, "{root}")}},
+	{"inbox rank", []contractCall{okCall(contractInboxItem, "inbox", "rank", prFlag, "{root}"), usageCall(contractPlane, "inbox", "rank", "--top", "0", prFlag, "{root}"), failCall(cliExitIO, contractBadPolicy, "inbox", "rank", prFlag, "{root}")}},
+	{"inbox lint", []contractCall{okCall(contractInboxItem, "inbox", "lint", prFlag, "{root}"), usageCall(contractPlane, "inbox", "lint", "--bogus", prFlag, "{root}"), failCall(cliExitFailed, contractUndeclaredItem, "inbox", "lint", prFlag, "{root}")}},
+	{"inbox batches", []contractCall{okCall(contractInboxItem, "inbox", "batches", prFlag, "{root}"), usageCall(contractPlane, "inbox", "batches", "--max", "x", prFlag, "{root}"), failCall(cliExitFailed, contractInboxFile, "inbox", "batches", prFlag, "{root}")}},
+	{"signals tail", []contractCall{okCall(contractPlane, "signals", "tail", prFlag, "{root}"), usageCall(contractPlane, "signals", "tail", "--bogus", prFlag, "{root}"), failCall(cliExitFailed, contractPlane, "signals", "tail", "--cycle", "5", prFlag, "{root}")}},
+	{"events channels", []contractCall{okCall(contractPlane, "events", "channels", prFlag, "{root}"), usageCall(contractPlane, "events", "channels", "extra", prFlag, "{root}"), failCall(cliExitIO, contractEvolveFile, "events", "channels", prFlag, "{root}")}},
+	{"events kinds", []contractCall{okCall(contractPlane, "events", "kinds", prFlag, "{root}"), usageCall(contractPlane, "events", "kinds", "extra", prFlag, "{root}")}},
+	{"events watch", []contractCall{okCall(contractLoopChannel, "events", "watch", "--channel", "loop", "--since", "all", "--until", "kind=loop.exit", prFlag, "{root}"), usageCall(contractPlane, "events", "watch", prFlag, "{root}"), failCall(cliExitInput, contractPlane, "events", "watch", "--channel", "nosuch", prFlag, "{root}")}},
+	{"ledger verify", []contractCall{okCall(contractPlane, "ledger", "verify", prFlag, "{root}"), usageCall(contractPlane, "ledger", "verify", "--bogus", prFlag, "{root}"), failCall(cliExitIO, contractBrokenLedger, "ledger", "verify", prFlag, "{root}")}},
+	{"dossier verify", []contractCall{okCall(contractPlane, "dossier", "verify", prFlag, "{root}"), usageCall(contractPlane, "dossier", "verify", "extra", prFlag, "{root}"), failCall(cliExitFailed, contractBadDossier, "dossier", "verify", prFlag, "{root}")}},
+	{"dossier show", []contractCall{silent(okCall(contractDossier, "dossier", "show", "1", prFlag, "{root}")), silent(usageCall(contractPlane, "dossier", "show", prFlag, "{root}")), silent(failCall(cliExitFailed, contractPlane, "dossier", "show", "5", prFlag, "{root}"))}},
+	{"cli-routing show", []contractCall{okCall(contractRouting, "cli-routing", "show", "--static", prFlag, "{root}"), usageCall(contractRouting, "cli-routing", "show", "--bogus", prFlag, "{root}"), failCall(cliExitFailed, contractBadPolicy, "cli-routing", "show", "--static", prFlag, "{root}")}},
+	{"cli-routing check", []contractCall{okCall(contractRouting, "cli-routing", "check", prFlag, "{root}"), usageCall(contractRouting, "cli-routing", "check", "extra", prFlag, "{root}"), failCall(cliExitFailed, contractBadPolicy, "cli-routing", "check", prFlag, "{root}")}},
+	{"cli-routing explain", []contractCall{okCall(contractRouting, "cli-routing", "explain", "auditor", "--static", prFlag, "{root}"), usageCall(contractRouting, "cli-routing", "explain", prFlag, "{root}"), failCall(cliExitFailed, contractBadPolicy, "cli-routing", "explain", "auditor", "--static", prFlag, "{root}")}},
+	{"routing explain", []contractCall{okCall(contractPlane, "routing", "explain", "--cycle", "1", prFlag, "{root}"), usageCall(contractPlane, "routing", "explain", prFlag, "{root}"), failCall(cliExitFailed, contractUnreadableCwd, "routing", "explain", "--cycle", "1")}},
+	{"clihealth list", []contractCall{okCall(contractPlane, "clihealth", "list", prFlag, "{root}"), usageCall(contractPlane, "clihealth", "list", "extra", prFlag, "{root}")}},
+	{"clihealth usage", []contractCall{okCall(contractUsagePanes, "clihealth", "usage", "claude", prFlag, "{root}"), usageCall(contractPlane, "clihealth", "usage", "--bogus", prFlag, "{root}"), failCall(cliExitFailed, contractUsagePanes, "clihealth", "usage", "agy", prFlag, "{root}")}},
+	{"agent list", []contractCall{okCall(contractAgentRoot, "agent", "list", prFlag, "{root}"), usageCall(contractAgentRoot, "agent", "list", "--bogus", prFlag, "{root}"), failCall(cliExitFailed, contractBareRoot, "agent", "list", prFlag, "{root}")}},
+	{"agent capabilities", []contractCall{okCall(contractBareRoot, "agent", "capabilities", prFlag, "{root}"), usageCall(contractBareRoot, "agent", "capabilities", "extra", prFlag, "{root}")}},
+	{"cloud list", []contractCall{okCall(contractBareRoot, "cloud", "list", prFlag, "{root}"), usageCall(contractBareRoot, "cloud", "list", "--bogus", prFlag, "{root}"), failCall(cliExitFailed, contractBadLaunchRecord, "cloud", "list", prFlag, "{root}")}},
+	{"ci classify", []contractCall{okCall(contractCIRoot, "ci", "classify", "run:501", prFlag, "{root}"), usageCall(contractPlane, "ci", "classify", prFlag, "{root}"), failCall(cliExitIO, contractNoGH, "ci", "classify", "run:501", prFlag, "{root}")}},
+	{"scan secrets", []contractCall{okCall(contractGitRoot, "scan", "secrets", "--staged", prFlag, "{root}"), usageCall(contractGitRoot, "scan", "secrets", "--staged", "--diff", "HEAD", prFlag, "{root}"), failCall(cliExitIO, contractBareRoot, "scan", "secrets", "--staged", prFlag, "{root}")}},
+	{"docs ste-lint", []contractCall{okCall(contractSteRoot, "docs", "ste-lint", "note.md", prFlag, "{root}"), usageCall(contractSteRoot, "docs", "ste-lint", "--bogus", prFlag, "{root}"), failCall(cliExitFailed, contractSteRoot, "docs", "ste-lint", "--strict", "bad.md", prFlag, "{root}")}},
+	{"quality report", []contractCall{okCall(contractPlane, "quality", "report", "--scope", "wave", prFlag, "{root}"), usageCall(contractPlane, "quality", "report", prFlag, "{root}")}},
+	{"quality compare", []contractCall{okCall(contractWaveRecorded, "quality", "compare", "--index", "PQ1", "--a", "wave:1", "--b", "wave:2", prFlag, "{root}"), usageCall(contractPlane, "quality", "compare", "--index", "PQ9", prFlag, "{root}"), failCall(cliExitIO, contractPlane, "quality", "compare", "--index", "PQ1", "--a", "wave:1", "--b", "wave:2", prFlag, "{root}")}},
+	{"quality show", []contractCall{okCall(contractPlane, "quality", "show", "--scope", "wave", prFlag, "{root}"), usageCall(contractPlane, "quality", "show", prFlag, "{root}")}},
+	{"agent run", []contractCall{custom(okCall(contractAgentRoot, "agent", "run", "adversarial-review", prFlag, "{root}"), contractAgentRun), usageCall(contractAgentRoot, "agent", "run", "adversarial-review", "--bogus", prFlag, "{root}"), unheld(failCall(cliExitRefused, contractAgentRoot, "agent", "run", "adversarial-review", prFlag, "{root}"))}},
+	{"inbox claim", []contractCall{okCall(contractInboxItem, "inbox", "claim", "cli-inbox-show", "--cycle", "7", prFlag, "{root}"), usageCall(contractInboxItem, "inbox", "claim", "cli-inbox-show", prFlag, "{root}"), failCall(cliExitFailed, contractPlane, "inbox", "claim", "absent", "--cycle", "7", prFlag, "{root}")}},
+	{"inbox add", []contractCall{withStdin(okCall(contractPlane, "inbox", "add", "--file", "-", prFlag, "{root}"), cliInboxItem), usageCall(contractPlane, "inbox", "add", prFlag, "{root}"), withStdin(failCall(cliExitFailed, contractPlane, "inbox", "add", "--file", "-", prFlag, "{root}"), `{"id":"x"}`)}},
+	{"inbox consume", []contractCall{okCall(contractInboxItem, "inbox", "consume", "{item}", prFlag, "{root}"), usageCall(contractPlane, "inbox", "consume", prFlag, "{root}"), failCall(cliExitFailed, contractPlane, "inbox", "consume", "{root}/absent.json", prFlag, "{root}")}},
+	{"inbox edit", []contractCall{okCall(contractInboxItem, "inbox", "edit", "cli-inbox-show", "--set", "weight=0.4", prFlag, "{root}"), usageCall(contractInboxItem, "inbox", "edit", "cli-inbox-show", prFlag, "{root}"), failCall(cliExitRefused, contractLeasedItem, "inbox", "edit", "cli-inbox-show", "--set", "weight=0.4", prFlag, "{root}")}},
+	{"inbox withdraw", []contractCall{okCall(contractInboxItem, "inbox", "withdraw", "cli-inbox-show", "mistake", prFlag, "{root}"), usageCall(contractInboxItem, "inbox", "withdraw", "cli-inbox-show", prFlag, "{root}"), failCall(cliExitRefused, contractLeasedItem, "inbox", "withdraw", "cli-inbox-show", "mistake", prFlag, "{root}")}},
+	{"inbox verify", []contractCall{okCall(contractOriginItem, "inbox", "verify", "stale", "--evidence", "checked", prFlag, "{root}"), usageCall(contractInboxItem, "inbox", "verify", "cli-inbox-show", prFlag, "{root}"), failCall(cliExitRefused, contractLeasedItem, "inbox", "verify", "cli-inbox-show", "--evidence", "checked", prFlag, "{root}")}},
+	{"inbox route-console", []contractCall{okCall(contractInboxItem, "inbox", "route-console", "cli-inbox-show", "operator owns it", "0", prFlag, "{root}"), usageCall(contractInboxItem, "inbox", "route-console", "cli-inbox-show", prFlag, "{root}"), failCall(cliExitRefused, contractLeasedItem, "inbox", "route-console", "cli-inbox-show", "operator owns it", "0", prFlag, "{root}")}},
+	{"inbox route-lane", []contractCall{okCall(contractConsoleItem, "inbox", "route-lane", "cli-inbox-show", "a lane may take it", prFlag, "{root}"), usageCall(contractInboxItem, "inbox", "route-lane", "cli-inbox-show", prFlag, "{root}"), failCall(cliExitRefused, contractLeasedItem, "inbox", "route-lane", "cli-inbox-show", "a lane may take it", prFlag, "{root}")}},
+	{"cli-routing set", []contractCall{okCall(contractRouting, "cli-routing", "set", "default", "claude", prFlag, "{root}"), usageCall(contractRouting, "cli-routing", "set", prFlag, "{root}"), failCall(cliExitRefused, contractLeasedRouting, "cli-routing", "set", "default", "claude", prFlag, "{root}")}},
+	{"cli-routing unset", []contractCall{okCall(contractRoutedAgent, "cli-routing", "unset", "agents.auditor", prFlag, "{root}"), usageCall(contractRouting, "cli-routing", "unset", prFlag, "{root}"), failCall(cliExitRefused, contractLeasedRouting, "cli-routing", "unset", "default", prFlag, "{root}")}},
+	{"cli-routing init", []contractCall{okCall(contractNoRoutingTable, "cli-routing", routingInitVerb, "--clis", "claude", prFlag, "{root}"), usageCall(contractRouting, "cli-routing", routingInitVerb, prFlag, "{root}"), failCall(cliExitRefused, contractLeasedRouting, "cli-routing", routingInitVerb, "--clis", "claude", prFlag, "{root}")}},
+	{"cli-routing migrate", []contractCall{okCall(contractRouting, "cli-routing", "migrate", "--dry-run", prFlag, "{root}"), usageCall(contractRouting, "cli-routing", "migrate", "extra", prFlag, "{root}"), failCall(cliExitRefused, contractLeasedRouting, "cli-routing", "migrate", prFlag, "{root}")}},
+	{"wave note", []contractCall{okCall(contractPlane, "wave", "note", "add", "watch PR 814", prFlag, "{root}"), usageCall(contractPlane, "wave", "note", prFlag, "{root}"), failCall(cliExitIO, contractEvolveFile, "wave", "note", "list", prFlag, "{root}")}},
+	{"checkpoint save", []contractCall{okCall(contractCheckpointHub, "checkpoint", "save", "--all", prFlag, "{root}"), usageCall(contractCheckpointHub, "checkpoint", "save", "--bogus", prFlag, "{root}"), failCall(cliExitFailed, contractBareRoot, "checkpoint", "save", prFlag, "{root}")}},
+	{"checkpoint list", []contractCall{okCall(contractCheckpointHub, "checkpoint", "list", prFlag, "{root}"), usageCall(contractCheckpointHub, "checkpoint", "list", "extra", prFlag, "{root}"), failCall(cliExitFailed, contractBareRoot, "checkpoint", "list", prFlag, "{root}")}},
+	{"checkpoint restore", []contractCall{okCall(contractCheckpointHub, "checkpoint", "restore", "{ref}", "--into", "{into}", prFlag, "{root}"), usageCall(contractCheckpointHub, "checkpoint", "restore", prFlag, "{root}"), failCall(cliExitFailed, contractCheckpointHub, "checkpoint", "restore", "absent/ref", "--into", "{into}", prFlag, "{root}")}},
+	{"checkpoint prune", []contractCall{okCall(contractCheckpointHub, "checkpoint", "prune", prFlag, "{root}"), usageCall(contractCheckpointHub, "checkpoint", "prune", "extra", prFlag, "{root}"), failCall(cliExitFailed, contractBareRoot, "checkpoint", "prune", prFlag, "{root}")}},
+	{"gc", []contractCall{okCall(contractGoCache, "gc", "--dry-run", "--only", "cache", prFlag, "{root}"), usageCall(contractPlane, "gc", "--only", "bogus", prFlag, "{root}"), failCall(cliExitFailed, contractPlane, "gc")}},
+	{"loop-stop", []contractCall{okCall(contractPlane, "loop-stop", "--release", prFlag, "{root}"), usageCall(contractPlane, "loop-stop", "--wait", "--release", prFlag, "{root}"), failCall(cliExitIO, contractBareRoot, "loop-stop", prFlag, "{root}")}},
+	{"wave stop", []contractCall{okCall(contractPlane, "wave", "stop", prFlag, "{root}"), usageCall(contractPlane, "wave", "stop", "now", prFlag, "{root}"), failCall(cliExitIO, contractBareRoot, "wave", "stop", prFlag, "{root}")}},
+	{"wave next", []contractCall{okCall(contractPlane, "wave", "next", "--dry-run", prFlag, "{root}"), usageCall(contractPlane, "wave", "next", "--max-cycles", "0", prFlag, "{root}"), unheld(failCall(cliExitRefused, contractPlane, "wave", "next", "--dry-run", prFlag, "{root}"))}},
+	{"boundary run", []contractCall{okCall(contractPlane, "boundary", "run", "--dry-run", "--goal-text-file", "{goal}", prFlag, "{root}"), usageCall(contractPlane, "boundary", "run", "--dry-run", prFlag, "{root}"), unheld(failCall(cliExitRefused, contractPlane, "boundary", "run", "--dry-run", "--goal-text-file", "{goal}", prFlag, "{root}"))}},
+	{"pr merge", []contractCall{custom(okCall(contractPlane, "pr", "merge", "12", prFlag, "{root}"), contractPRMerge), usageCall(contractPlane, "pr", "merge", prFlag, "{root}"), failCall(cliExitIO, contractBareRoot, "pr", "merge", "12", prFlag, "{root}")}},
+	{"sync-main", []contractCall{okCall(contractSyncRepo, "sync-main", prFlag, "{root}"), usageCall(contractSyncRepo, "sync-main", "extra", prFlag, "{root}"), failCall(cliExitRefused, contractDirtySyncRepo, "sync-main", prFlag, "{root}")}},
+	{"cycle resume", []contractCall{custom(okCall(contractPlane, "cycle", "resume", "--dry-run", prFlag, "{root}"), contractCycleResume), usageCall(contractPlane, "cycle", "resume", "now", prFlag, "{root}"), failCall(cliExitRefused, contractLeasedPlane, "cycle", "resume", prFlag, "{root}")}},
+	{"cycle reset", []contractCall{okCall(contractResetRoot, "cycle", "reset", "--dry-run", prFlag, "{root}"), usageCall(contractResetRoot, "cycle", "reset", "--bogus", prFlag, "{root}"), failCall(cliExitRefused, contractLiveResetRoot, "cycle", "reset", prFlag, "{root}")}},
+	{"cli update", []contractCall{okCall(contractCLIUpdateHost, "cli", "update", "--dry-run", prFlag, "{root}"), usageCall(contractCLIUpdateHost, "cli", "update", "extra", prFlag, "{root}"), failCall(cliExitRefused, contractLiveCLIUpdateHost, "cli", "update", prFlag, "{root}")}},
+	{"loop", []contractCall{okCall(contractPlane, "loop", "--dry-run", "--goal-text", "fix the parser", prFlag, "{root}"), usageCall(contractPlane, "loop", "stop", "now", prFlag, "{root}"), unheld(failCall(cliExitRefused, contractPlane, "loop", "--dry-run", "--goal-text", "fix the parser", prFlag, "{root}"))}},
+}
+
+func contractDossier(t *testing.T) map[string]string {
+	t.Helper()
+	vars := contractPlane(t)
+	contractWrite(t, vars["root"], "knowledge-base/cycles/cycle-1.json", `{"cycle":1,"goal":"fix the parser","final_verdict":"PASS"}`)
+	return vars
+}
+
+func contractLeasedPlane(t *testing.T) map[string]string {
+	t.Helper()
+	vars := contractPlane(t)
+	contractLiveLease(t, vars["root"])
+	return vars
+}
+
+func contractCycleResume(t *testing.T, _ map[string]string) func([]string, io.Writer, io.Writer) int {
+	t.Helper()
+	pausedCycle(t, pausedAtBuild, nil)
+	return func(args []string, stdout, stderr io.Writer) int { return runCycle(args[1:], nil, stdout, stderr) }
+}
+
+func contractLoopChannel(t *testing.T) map[string]string {
+	t.Helper()
+	vars := contractPlane(t)
+	appendEvents(t, vars["root"], "loop", loopEvent(1, signalcenter.KindLoopExit))
+	return vars
+}
+
+func contractBadWaves(t *testing.T) map[string]string {
+	t.Helper()
+	vars := contractPlane(t)
+	contractWrite(t, vars["root"], ".evolve/waves/wave-1.json", "{bad")
+	return vars
+}
+
+func contractInboxFile(t *testing.T) map[string]string {
+	t.Helper()
+	root := t.TempDir()
+	contractWrite(t, root, ".evolve/inbox", "not a directory\n")
+	return map[string]string{"root": root}
+}
+
+func contractUndeclaredItem(t *testing.T) map[string]string {
+	t.Helper()
+	vars := contractPlane(t)
+	contractWrite(t, vars["root"], ".evolve/inbox/2026-10-27T00-00-00Z-no-surface.json", `{"id":"no-surface","kind":"feature","priority_class":"debuggability","weight":0.5,`+
+		`"title":"an item with no files","summary":"s","fix":"f","acceptance":["a"]}`)
+	return vars
+}
+
+func contractBrokenLedger(t *testing.T) map[string]string {
+	t.Helper()
+	vars := contractPlane(t)
+	contractWrite(t, vars["root"], ".evolve/ledger.jsonl", "{not a ledger line\n")
+	return vars
+}
+
+func contractBadDossier(t *testing.T) map[string]string {
+	t.Helper()
+	vars := contractPlane(t)
+	contractWrite(t, vars["root"], "knowledge-base/cycles/cycle-1.json", "{bad")
+	return vars
+}
+
+func contractEvolveFile(t *testing.T) map[string]string {
+	t.Helper()
+	root := t.TempDir()
+	contractWrite(t, root, ".evolve", "not a directory\n")
+	return map[string]string{"root": root}
+}
+
+func contractUnreadableCwd(t *testing.T) map[string]string {
+	t.Helper()
+	prev := routingGetwd
+	routingGetwd = func() (string, error) { return "", errors.New("getwd: gone") }
+	t.Cleanup(func() { routingGetwd = prev })
+	return map[string]string{}
+}
+
+func contractNoGH(t *testing.T) map[string]string {
+	t.Helper()
+	t.Setenv("PATH", t.TempDir())
+	return contractPlane(t)
+}
+
+func contractOriginItem(t *testing.T) map[string]string {
+	t.Helper()
+	root, _ := originMainRoot(t)
+	return map[string]string{"root": root}
+}
+
+func contractConsoleItem(t *testing.T) map[string]string {
+	t.Helper()
+	vars := contractInboxItem(t)
+	var stdout, stderr bytes.Buffer
+	if rc := runInbox([]string{"route-console", "cli-inbox-show", "operator owns it", "0", prFlag, vars["root"]}, nil, &stdout, &stderr); rc != 0 {
+		t.Fatalf("route the item to the console: %s", stderr.String())
+	}
+	return vars
+}
+
+func contractLeasedRouting(t *testing.T) map[string]string {
+	t.Helper()
+	vars := contractRouting(t)
+	contractLiveLease(t, vars["root"])
+	return vars
+}
+
+func contractToolPATH(t *testing.T) string {
+	t.Helper()
+	bin := t.TempDir()
+	for _, tool := range []string{"git", "go", "cat"} {
+		path, err := exec.LookPath(tool)
+		if err != nil {
+			t.Fatalf("%s is not on PATH: %v", tool, err)
+		}
+		if err := os.Symlink(path, filepath.Join(bin, tool)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return bin
+}
+
+func contractArgs(args []string, vars map[string]string) []string {
+	out := make([]string, 0, len(args)+1)
+	for _, a := range args {
+		for k, v := range vars {
+			a = strings.ReplaceAll(a, "{"+k+"}", v)
+		}
+		out = append(out, a)
+	}
+	return append(out, "--json")
+}
+
+func contractSnapshot(t *testing.T, roots []string) map[string]string {
+	t.Helper()
+	snap := map[string]string{}
+	for _, root := range roots {
+		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			sum := sha256.New()
+			if d.Type().IsRegular() {
+				body, err := os.ReadFile(path)
+				if err != nil {
+					return err
+				}
+				sum.Write(body)
+			}
+			snap[path] = fmt.Sprintf("%s %o %d %s", d.Type().String(), info.Mode().Perm(), info.ModTime().UnixNano(), hex.EncodeToString(sum.Sum(nil)))
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	return snap
+}
+
+func contractChanged(before, after map[string]string) []string {
+	var changed []string
+	for path, state := range after {
+		if before[path] != state {
+			changed = append(changed, path)
+		}
+	}
+	for path := range before {
+		if _, ok := after[path]; !ok {
+			changed = append(changed, path)
+		}
+	}
+	sort.Strings(changed)
+	return changed
+}
+
+func contractHashes(v coreVerb, c contractCall) bool {
+	if strings.HasPrefix(v.path, "debug ") {
+		return true
+	}
+	return v.class == availAlways && c.kind == contractSuccess
+}
+
+func contractShims(t *testing.T) string {
+	t.Helper()
+	bin := t.TempDir()
+	log := filepath.Join(t.TempDir(), "calls.log")
+	script := "#!/bin/sh\necho \"$(basename \"$0\") $*\" >> " + log + "\nexit 99\n"
+	for _, tool := range []string{"git", "gh"} {
+		if err := os.WriteFile(filepath.Join(bin, tool), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", bin)
+	return log
+}
+
+func contractScratch(t *testing.T, name string) string {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv(name, dir)
+	return dir
+}
+
+func contractWorkdir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	prev, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(prev) })
+	return dir
+}
+
+func contractGate(t *testing.T, c contractCall) dispatchGate {
+	t.Helper()
+	if c.unheld {
+		return dispatchGate{open: unheldStore(t, "enforce")}
+	}
+	return dispatchGate{open: heldStore(t)}
+}
+
+func runContractCall(t *testing.T, v coreVerb, c contractCall) {
+	t.Helper()
+	vars := map[string]string{}
+	if c.prep != nil {
+		vars = c.prep(t)
+	}
+	args := contractArgs(c.args, vars)
+	gate := contractGate(t, c)
+	shimLog := ""
+	if c.silent {
+		shimLog = contractShims(t)
+	}
+	watched := []string{vars["root"], contractScratch(t, "HOME"), contractScratch(t, "TMPDIR"), contractWorkdir(t)}
+	var before map[string]string
+	if vars["root"] != "" && contractHashes(v, c) {
+		before = contractSnapshot(t, watched)
+	}
+	var stdout, stderr bytes.Buffer
+	var rc int
+	if c.run != nil {
+		rc = runEnveloped(v, func(o, e io.Writer) int { return c.run(t, vars)(args, o, e) }, &stdout, &stderr)
+	} else {
+		rc = dispatchWith(gate, args, strings.NewReader(c.stdin), &stdout, &stderr)
+	}
+	checkContractEnvelope(t, v, c, rc, stdout.String(), stderr.String())
+	if before != nil {
+		if changed := contractChanged(before, contractSnapshot(t, watched)); len(changed) > 0 {
+			t.Errorf("%s is an always verb, but %v changed the tree: %v", v.path, args, changed)
+		}
+	}
+	if raw, _ := os.ReadFile(shimLog); len(raw) > 0 {
+		t.Errorf("%s %v ran a forbidden command: %s", v.path, args, raw)
+	}
+}
+
+func checkContractEnvelope(t *testing.T, v coreVerb, c contractCall, rc int, stdout, stderr string) {
+	t.Helper()
+	if rc != c.want {
+		t.Fatalf("%s %s: exit %d, want %d\nstdout: %s\nstderr: %s", v.path, c.kind, rc, c.want, stdout, stderr)
+	}
+	kind, known := v.exitKind(rc)
+	if rc != cliExitOK && !known {
+		t.Errorf("%s: exit %d is not in the exit table of cli-contract.md §3", v.path, rc)
+	}
+	envs := decodeEnvelopes(t, stdout)
+	if len(envs) == 0 || (!v.stream && len(envs) != 1) {
+		t.Fatalf("%s %s: %d envelopes, want one\n%s", v.path, c.kind, len(envs), stdout)
+	}
+	for _, e := range envs {
+		if e.Schema != v.schema() {
+			t.Errorf("%s: schema %q, want %q", v.path, e.Schema, v.schema())
+		}
+	}
+	last := envs[len(envs)-1]
+	if last.OK != (rc == cliExitOK) || (rc == cliExitOK) != (last.Error == nil) {
+		t.Errorf("%s %s: ok %t error %+v for exit %d", v.path, c.kind, last.OK, last.Error, rc)
+	}
+	if last.Error != nil && (last.Error.Code != rc || last.Error.Kind != kind || last.Error.Message == "") {
+		t.Errorf("%s %s: error %+v, want code %d kind %q and a message", v.path, c.kind, last.Error, rc, kind)
+	}
+}
+
+func contractEnvironment(t *testing.T) {
+	t.Helper()
+	t.Setenv("PATH", contractToolPATH(t))
+	t.Setenv("GOCACHE", t.TempDir())
+	t.Setenv("EVOLVE_PROJECT_ROOT", "")
+	t.Setenv("EVOLVE_DISPATCH_DEPTH", "")
+}
+
+func TestCLIContract_EachCoreVerbPrintsOneEnvelope(t *testing.T) {
+	t.Setenv("EVOLVE_PROJECT_ROOT", "")
+	contractEnvironment(t)
+	seen := map[string]map[string]bool{}
+	for _, vc := range contractCases {
+		v, ok := lookupCoreVerb(vc.verb)
+		if !ok {
+			t.Fatalf("%s: not a core verb", vc.verb)
+		}
+		seen[vc.verb] = map[string]bool{}
+		for _, c := range vc.calls {
+			seen[vc.verb][c.kind] = true
+			t.Run(vc.verb+"/"+c.kind, func(t *testing.T) { runContractCall(t, v, c) })
+		}
+	}
+	for _, v := range coreVerbs {
+		kinds := seen[v.path]
+		_, noNegative := contractNoNegative[v.path]
+		if !kinds[contractSuccess] || !kinds[contractUsage] || kinds[contractNegative] == noNegative {
+			t.Errorf("%s: cases %v; want a success, a usage and a negative case (or a reason in contractNoNegative)", v.path, kinds)
+		}
+	}
+}
+
+func TestCLIContract_AlwaysVerbsWriteNothing(t *testing.T) {
+	t.Setenv("EVOLVE_PROJECT_ROOT", "")
+	contractEnvironment(t)
+	for _, vc := range contractCases {
+		v, _ := lookupCoreVerb(vc.verb)
+		if v.class != availAlways {
+			continue
+		}
+		for _, c := range vc.calls {
+			if c.kind == contractSuccess {
+				t.Run(vc.verb, func(t *testing.T) { runContractCall(t, v, c) })
+			}
+		}
+	}
+}
+
+func contractRoutedAgent(t *testing.T) map[string]string {
+	t.Helper()
+	vars := contractRouting(t)
+	var stdout, stderr bytes.Buffer
+	if rc := runCLIRouting([]string{"set", "agents.auditor", "claude", prFlag, vars["root"]}, nil, &stdout, &stderr); rc != 0 {
+		t.Fatalf("set agents.auditor: %s", stderr.String())
+	}
+	return vars
+}
+
+func contractNoRoutingTable(t *testing.T) map[string]string {
+	t.Helper()
+	return map[string]string{"root": routingWriteProject(t, `{}`)}
+}

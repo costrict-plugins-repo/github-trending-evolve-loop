@@ -1,0 +1,142 @@
+{
+  "name": "triage",
+  "role": "triage",
+  "cli": "codex-tmux",
+  "model_tier_default": "balanced",
+  "allowed_tools": [
+    "Bash(evolve phase verify:*)",
+    "Read",
+    "Grep",
+    "Glob",
+    "Bash(git status:*)",
+    "Bash(git status)",
+    "Bash(git log:*)",
+    "Bash(git diff:*)",
+    "Bash(git show:*)",
+    "Bash(git ls-files:*)",
+    "Bash(ls:*)",
+    "Bash(cat:*)",
+    "Bash(head:*)",
+    "Bash(tail:*)",
+    "Bash(wc:*)",
+    "Bash(find:*)",
+    "Bash(test:*)",
+    "Bash(jq:*)",
+    "Write(.evolve/runs/cycle-*/triage-report.md)",
+    "Edit(.evolve/runs/cycle-*/triage-report.md)",
+    "Write(.evolve/runs/cycle-*/triage-decision.json)",
+    "Edit(.evolve/runs/cycle-*/triage-decision.json)",
+    "Bash(evolve inbox-mover:*)",
+    "Bash(evolve inbox-mover claim:*)",
+    "WebSearch",
+    "WebFetch",
+    "Bash(scripts/research/kb-search.sh:*)"
+  ],
+  "disallowed_tools": [
+    "Bash(git commit:*)",
+    "Bash(git push:*)",
+    "Bash(git reset:*)",
+    "Bash(git checkout:*)",
+    "Bash(git merge:*)",
+    "Bash(git rebase:*)",
+    "Bash(git worktree:*)",
+    "Bash(gh:*)",
+    "Bash(rm:*)",
+    "Bash(mv:*)",
+    "Bash(curl:*)",
+    "Bash(wget:*)",
+    "Bash(npm:*)",
+    "Bash(pip:*)",
+    "Bash(brew:*)",
+    "Edit(skills/**)",
+    "Edit(agents/**)",
+    "Edit(scripts/**)",
+    "Edit(.claude-plugin/**)",
+    "Edit(CHANGELOG.md)",
+    "Edit(README.md)",
+    "Edit(CLAUDE.md)",
+    "Edit(.evolve/state.json)",
+    "Edit(.evolve/ledger.jsonl)",
+    "Edit(.evolve/profiles/**)",
+    "Edit(.evolve/evals/**)",
+    "Edit(.evolve/instincts/**)",
+    "Write(skills/**)",
+    "Write(agents/**)",
+    "Write(scripts/**)",
+    "Write(.claude-plugin/**)",
+    "Write(CHANGELOG.md)",
+    "Write(README.md)",
+    "Write(CLAUDE.md)",
+    "Write(.evolve/state.json)",
+    "Write(.evolve/ledger.jsonl)",
+    "Write(.evolve/profiles/**)",
+    "Write(.evolve/evals/**)",
+    "Write(.evolve/instincts/**)"
+  ],
+  "add_dir": [
+    "."
+  ],
+  "max_budget_usd": 0.75,
+  "max_turns": 18,
+  "turn_budget_hint": 12,
+  "output_artifact": ".evolve/runs/cycle-{cycle}/triage-report.md",
+  "challenge_token_required": true,
+  "settings_scope": "project",
+  "extra_flags_by_cli": {
+    "claude-tmux": [
+      "--strict-mcp-config",
+      "--exclude-dynamic-system-prompt-sections",
+      "--disable-slash-commands"
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "write_subpaths": [
+      ".evolve/runs/cycle-*",
+      ".evolve/inbox"
+    ],
+    "read_only_repo": true,
+    "deny_subpaths": [
+      ".git",
+      "skills",
+      "agents",
+      "scripts",
+      ".claude-plugin",
+      ".evolve/state.json",
+      ".evolve/ledger.jsonl",
+      ".evolve/profiles",
+      ".evolve/evals",
+      ".evolve/instincts",
+      "CHANGELOG.md",
+      "README.md",
+      "CLAUDE.md",
+      ".evolve/inbox/consumed",
+      ".evolve/inbox/processed",
+      ".evolve/inbox/retry"
+    ],
+    "allow_network": false
+  },
+  "parallel_eligible": false,
+  "schema_filter_enabled": true,
+  "context_anchors": [
+    "scout-report.md:proposed_tasks"
+  ],
+  "model_tier_envelope": {
+    "min": "balanced",
+    "default": "balanced",
+    "max": "balanced"
+  },
+  "allowed_clis": [
+    "all"
+  ],
+  "research_quota": {
+    "web_search": 3,
+    "web_fetch": 5,
+    "kb_search": 20
+  },
+  "stream_output": true,
+  "generated_from": "hand-authored",
+  "cli_fallback": [
+    "claude-tmux"
+  ]
+}

@@ -1,0 +1,389 @@
+package ship
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+)
+
+type scriptedRunner struct {
+	scripts map[string]struct {
+		stdout string
+		stderr string
+		exit   int
+		err    error
+	}
+	calls []string
+}
+
+func (s *scriptedRunner) runner() CmdRunner {
+	if s.scripts == nil {
+		s.scripts = map[string]struct {
+			stdout string
+			stderr string
+			exit   int
+			err    error
+		}{}
+	}
+	return func(ctx context.Context, name, cwd string, args, env []string,
+		stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+		key := name
+		for i := 0; i < len(args); i++ {
+			a := args[i]
+			if !strings.HasPrefix(a, "-") {
+				key = name + " " + a
+				break
+			}
+			if a == "-C" || a == "-c" {
+				i++
+			}
+		}
+		s.calls = append(s.calls, key)
+		script, ok := s.scripts[key]
+		if !ok {
+			return 0, nil
+		}
+		if stdout != nil && script.stdout != "" {
+			_, _ = stdout.Write([]byte(script.stdout))
+		}
+		if stderr != nil && script.stderr != "" {
+			_, _ = stderr.Write([]byte(script.stderr))
+		}
+		return script.exit, script.err
+	}
+}
+
+func TestAtomicShip_TypedWorktreeRejectsTamperedRunMirror(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	workspace := filepath.Join(root, ".evolve", "runs", "cycle-7")
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "run.json"), []byte(`{"active_worktree":""}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	trustedWorktree := t.TempDir()
+	runner := &scriptedRunner{scripts: map[string]struct {
+		stdout string
+		stderr string
+		exit   int
+		err    error
+	}{
+		"git symbolic-ref": {stdout: "main\n"},
+	}}
+	opts := &Options{
+		Class:          ClassCycle,
+		ProjectRoot:    root,
+		WorkspacePath:  workspace,
+		ActiveWorktree: trustedWorktree,
+		DryRun:         true,
+		Runner:         runner.runner(),
+	}
+
+	err := atomicShip(context.Background(), opts, &RunResult{})
+	shipError, ok := core.AsShipError(err)
+	if !ok || shipError.Code != core.CodeWorktreeResolve || !strings.Contains(err.Error(), "run.json") {
+		t.Fatalf("tampered run mirror must fail closed with WORKTREE_RESOLVE: %v", err)
+	}
+	for _, call := range runner.calls {
+		if call == "git add" || call == "git commit" || call == "git push" {
+			t.Fatalf("tampered run mirror reached git mutation: calls=%v", runner.calls)
+		}
+	}
+}
+
+func TestTryGitOneShot_Success(t *testing.T) {
+	t.Parallel()
+	r := &scriptedRunner{scripts: map[string]struct {
+		stdout string
+		stderr string
+		exit   int
+		err    error
+	}{}}
+	r.scripts["git rev-parse"] = struct {
+		stdout string
+		stderr string
+		exit   int
+		err    error
+	}{stdout: "abc123\n  ", exit: 0}
+	opts := &Options{Runner: r.runner(), ProjectRoot: "/tmp"}
+	got := tryGitOneShot(context.Background(), opts, "rev-parse", "HEAD")
+	if got != "abc123" {
+		t.Errorf("tryGitOneShot=%q, want abc123", got)
+	}
+}
+
+func TestTryGitOneShot_NonZeroExit_ReturnsEmpty(t *testing.T) {
+	t.Parallel()
+	r := &scriptedRunner{scripts: map[string]struct {
+		stdout string
+		stderr string
+		exit   int
+		err    error
+	}{}}
+	r.scripts["git rev-parse"] = struct {
+		stdout string
+		stderr string
+		exit   int
+		err    error
+	}{stdout: "should-be-ignored", exit: 1}
+	opts := &Options{Runner: r.runner(), ProjectRoot: "/tmp"}
+	if got := tryGitOneShot(context.Background(), opts, "rev-parse", "HEAD"); got != "" {
+		t.Errorf("non-zero exit should yield empty; got %q", got)
+	}
+}
+
+func TestTryGitOneShot_RunnerError_ReturnsEmpty(t *testing.T) {
+	t.Parallel()
+	r := &scriptedRunner{scripts: map[string]struct {
+		stdout string
+		stderr string
+		exit   int
+		err    error
+	}{}}
+	r.scripts["git rev-parse"] = struct {
+		stdout string
+		stderr string
+		exit   int
+		err    error
+	}{err: errors.New("spawn fail")}
+	opts := &Options{Runner: r.runner(), ProjectRoot: "/tmp"}
+	if got := tryGitOneShot(context.Background(), opts, "rev-parse", "HEAD"); got != "" {
+		t.Errorf("runner error should yield empty; got %q", got)
+	}
+}
+
+func TestWriteDryRunJournal_NoOpWhenDryRunFalse(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	r := &scriptedRunner{}
+	opts := &Options{DryRun: false, ProjectRoot: root, Runner: r.runner()}
+	res := &RunResult{}
+	writeDryRunJournal(context.Background(), opts, res, "test-reason")
+	if res.DryRunPath != "" {
+		t.Errorf("DryRunPath=%q, want empty", res.DryRunPath)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".evolve", "release-journal")); err == nil {
+		t.Errorf("journal dir created despite DryRun=false")
+	}
+}
+
+func TestWriteDryRunJournal_HappyPath_WritesJSON(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	r := &scriptedRunner{scripts: map[string]struct {
+		stdout string
+		stderr string
+		exit   int
+		err    error
+	}{}}
+	r.scripts["git rev-parse"] = struct {
+		stdout string
+		stderr string
+		exit   int
+		err    error
+	}{stdout: "abc123\n", exit: 0}
+	opts := &Options{
+		DryRun:        true,
+		ProjectRoot:   root,
+		Class:         Class("manual"),
+		CommitMessage: "test commit",
+		Runner:        r.runner(),
+	}
+	res := &RunResult{
+		Logs: []string{
+			"[ship] [DRY-RUN] would commit on main",
+			"[ship] not a dry-run line",
+			"[ship] [DRY-RUN] would push to origin",
+		},
+	}
+	writeDryRunJournal(context.Background(), opts, res, "verified-ok")
+
+	if res.DryRunPath == "" {
+		t.Fatal("DryRunPath empty after writeDryRunJournal")
+	}
+	body, err := os.ReadFile(res.DryRunPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("journal is not valid JSON: %v\n%s", err, body)
+	}
+	if got["class"] != "manual" {
+		t.Errorf("class=%v, want manual", got["class"])
+	}
+	if got["commit_msg"] != "test commit" {
+		t.Errorf("commit_msg=%v, want 'test commit'", got["commit_msg"])
+	}
+	if got["exit_reason"] != "verified-ok" {
+		t.Errorf("exit_reason=%v, want verified-ok", got["exit_reason"])
+	}
+	wouldHave, ok := got["would_have"].([]any)
+	if !ok || len(wouldHave) != 2 {
+		t.Errorf("would_have should contain 2 DRY-RUN log lines; got %v", got["would_have"])
+	}
+}
+
+func TestWriteDryRunJournal_MissingGitDefaults_PlaceholderBranchSHA(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	r := &scriptedRunner{scripts: map[string]struct {
+		stdout string
+		stderr string
+		exit   int
+		err    error
+	}{}}
+	r.scripts["git rev-parse"] = struct {
+		stdout string
+		stderr string
+		exit   int
+		err    error
+	}{stdout: "", exit: 1}
+	opts := &Options{DryRun: true, ProjectRoot: root, Class: Class("cycle"), Runner: r.runner()}
+	res := &RunResult{}
+	writeDryRunJournal(context.Background(), opts, res, "test")
+
+	body, _ := os.ReadFile(res.DryRunPath)
+	var got map[string]any
+	_ = json.Unmarshal(body, &got)
+	if got["branch"] != "unknown" {
+		t.Errorf("branch=%v, want unknown (git failed)", got["branch"])
+	}
+	if got["head_sha_at_dry_run"] != "unknown" {
+		t.Errorf("head_sha_at_dry_run=%v, want unknown", got["head_sha_at_dry_run"])
+	}
+}
+
+func TestWriteDryRunJournal_LogAppended(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	r := &scriptedRunner{}
+	opts := &Options{DryRun: true, ProjectRoot: root, Class: Class("cycle"), Runner: r.runner()}
+	res := &RunResult{}
+	writeDryRunJournal(context.Background(), opts, res, "test")
+	lastLog := res.Logs[len(res.Logs)-1]
+	if !strings.Contains(lastLog, "DRY-RUN: journal preview written to") {
+		t.Errorf("expected journal log line; got %q", lastLog)
+	}
+}
+
+func TestCaptureGitOutputAtDir_Success(t *testing.T) {
+	t.Parallel()
+	r := &scriptedRunner{scripts: map[string]struct {
+		stdout string
+		stderr string
+		exit   int
+		err    error
+	}{}}
+	r.scripts["git symbolic-ref"] = struct {
+		stdout string
+		stderr string
+		exit   int
+		err    error
+	}{stdout: "feature-branch\n", exit: 0}
+	opts := &Options{Runner: r.runner(), ProjectRoot: "/tmp"}
+	got, err := captureGitOutputAtDir(context.Background(), opts, "/tmp/wt", "symbolic-ref", "--short", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(got) != "feature-branch" {
+		t.Errorf("got %q, want feature-branch", got)
+	}
+}
+
+func TestCaptureGitOutputAtDir_ExitGreaterThan1_ReturnsError(t *testing.T) {
+	t.Parallel()
+	r := &scriptedRunner{scripts: map[string]struct {
+		stdout string
+		stderr string
+		exit   int
+		err    error
+	}{}}
+	r.scripts["git symbolic-ref"] = struct {
+		stdout string
+		stderr string
+		exit   int
+		err    error
+	}{stderr: "fatal: not a git repo", exit: 128}
+	opts := &Options{Runner: r.runner(), ProjectRoot: "/tmp"}
+	_, err := captureGitOutputAtDir(context.Background(), opts, "/tmp/wt", "symbolic-ref", "--short", "HEAD")
+	if err == nil {
+		t.Error("expected error on exit > 1")
+	}
+}
+
+func TestCaptureGitOutputAtDir_Exit1_NotError(t *testing.T) {
+	t.Parallel()
+	r := &scriptedRunner{scripts: map[string]struct {
+		stdout string
+		stderr string
+		exit   int
+		err    error
+	}{}}
+	r.scripts["git diff"] = struct {
+		stdout string
+		stderr string
+		exit   int
+		err    error
+	}{stdout: "diff output\n", exit: 1}
+	opts := &Options{Runner: r.runner(), ProjectRoot: "/tmp"}
+	out, err := captureGitOutputAtDir(context.Background(), opts, "/tmp", "diff")
+	if err != nil {
+		t.Errorf("rc=1 should not be an error: %v", err)
+	}
+	if !strings.Contains(out, "diff output") {
+		t.Errorf("stdout lost: %q", out)
+	}
+}
+
+func TestMaybeCreateRelease_NonReleaseClass_SkipsEarly(t *testing.T) {
+	t.Parallel()
+	r := &scriptedRunner{}
+	opts := &Options{Class: Class("cycle"), ProjectRoot: t.TempDir(), Runner: r.runner()}
+	res := &RunResult{}
+	if err := maybeCreateRelease(context.Background(), opts, res); err != nil {
+		t.Fatal(err)
+	}
+	for _, call := range r.calls {
+		if strings.HasPrefix(call, "gh") {
+			t.Errorf("gh should not be called for class=cycle; got %q", call)
+		}
+	}
+}
+
+func TestMaybeCreateRelease_MissingPluginJson_LogsAndContinues(t *testing.T) {
+	t.Parallel()
+	r := &scriptedRunner{}
+	root := t.TempDir()
+	opts := &Options{
+		Class:       Class("release"),
+		ProjectRoot: root,
+		PluginRoot:  root,
+		Runner:      r.runner(),
+	}
+	res := &RunResult{}
+	err := maybeCreateRelease(context.Background(), opts, res)
+	if err != nil {
+		t.Errorf("missing plugin.json should not be fatal; got %v", err)
+	}
+}
+
+func TestScriptedRunner_DefaultExitZero(t *testing.T) {
+	t.Parallel()
+	r := &scriptedRunner{}
+	var stdout bytes.Buffer
+	exit, err := r.runner()(context.Background(), "git", "", []string{"status"}, nil, nil, &stdout, nil)
+	if err != nil || exit != 0 {
+		t.Errorf("unscripted call should return (0, nil); got (%d, %v)", exit, err)
+	}
+}

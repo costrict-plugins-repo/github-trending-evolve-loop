@@ -1,0 +1,231 @@
+package panestream
+
+import (
+	"os"
+	"path/filepath"
+	"runtime"
+	"testing"
+)
+
+func testdataFrame(t *testing.T, relPath string) string {
+	t.Helper()
+	_, file, _, _ := runtime.Caller(0)
+	dir := filepath.Dir(file)
+	b, err := os.ReadFile(filepath.Join(dir, "testdata", relPath))
+	if err != nil {
+		t.Fatalf("testdataFrame(%q): %v", relPath, err)
+	}
+	return string(b)
+}
+
+func TestDefaultDetector_Converging(t *testing.T) {
+	cases := []struct{ cli, think, answer string }{
+		{"claude", "claude/thinking.txt", "claude/answer.txt"},
+		{"codex", "codex/thinking.txt", "codex/answer.txt"},
+		{"agy", "agy/thinking.txt", "agy/answer.txt"},
+		{"ollama", "ollama/thinking.txt", "ollama/answer.txt"},
+	}
+	for _, c := range cases {
+		t.Run(c.cli, func(t *testing.T) {
+			det := NewDefaultDetector(3)
+			p := Profiles[c.cli+"-repl-v1"]
+			det.Assess(testdataFrame(t, c.think), p)
+			state, _ := det.Assess(testdataFrame(t, c.answer), p)
+			if state != LivenessConverging {
+				t.Errorf("[%s] thinking→answer: got %v, want LivenessConverging", c.cli, state)
+			}
+		})
+	}
+}
+
+func TestDefaultDetector_SpinnerOnlyIsNotConverging(t *testing.T) {
+	p := Profiles["claude-repl-v1"]
+	det := NewDefaultDetector(3)
+	det.Assess("⏺ real content\n❯ \n", p)
+	spinner := "⏺ real content\n✽ Thinking… (5s · ↓ 50 tokens)\n❯ \n"
+	state, _ := det.Assess(spinner, p)
+	if state == LivenessConverging {
+		t.Errorf("spinner-only delta must NOT be Converging (got %v); growth velocity must count CONTENT lines", state)
+	}
+}
+
+func TestDefaultDetector_PrimingNotHung(t *testing.T) {
+	p := Profiles["claude-repl-v1"]
+	for _, frame := range []string{
+		"❯ \n",
+		"⏺ some content\n❯ \n",
+	} {
+		det := NewDefaultDetector(1)
+		det.Assess(frame, p)
+		state, _ := det.Assess(frame, p)
+		if state == LivenessHung {
+			t.Errorf("single stall after prime must NOT be Hung (stallThreshold=1); got %v for %q", state, frame)
+		}
+	}
+}
+
+func TestDefaultDetector_HungAfterThreshold(t *testing.T) {
+	p := Profiles["claude-repl-v1"]
+	const stall = 2
+	det := NewDefaultDetector(stall)
+	det.Assess("⏺ initial\n❯ \n", p)
+	s1, _ := det.Assess("⏺ initial\n✽ Thinking… (5s · ↓ 10 tokens)\n❯ \n", p)
+	if s1 == LivenessHung {
+		t.Fatalf("interval 1/%d: must NOT be Hung yet (got %v)", stall, s1)
+	}
+	s2, _ := det.Assess("⏺ initial\n✽ Thinking… (8s · ↓ 25 tokens)\n❯ \n", p)
+	if s2 != LivenessHung {
+		t.Errorf("interval 2/%d: got %v, want LivenessHung", stall, s2)
+	}
+}
+
+func TestDefaultDetector_IdleResetsStalls(t *testing.T) {
+	p := Profiles["claude-repl-v1"]
+	det := NewDefaultDetector(2)
+	det.Assess("⏺ content\n❯ \n", p)
+	det.Assess("⏺ content\n✽ Thinking… (3s · ↓ 5 tokens)\n❯ \n", p)
+	det.Assess("⏺ content\n❯ \n", p)
+	s, _ := det.Assess("⏺ content\n✽ Thinking… (3s · ↓ 5 tokens)\n❯ \n", p)
+	if s == LivenessHung {
+		t.Errorf("after idle reset, one more busy-stagnant interval must NOT be Hung (stallThreshold=2), got %v", s)
+	}
+}
+
+func TestClaudeDetector_IncreasingTokensConverging(t *testing.T) {
+	p := Profiles["claude-repl-v1"]
+	base := NewDefaultDetector(3)
+	det := NewClaudeDetector(3)
+	frames := []string{
+		"✽ Thinking… (5s · ↓ 50 tokens)\n❯ \n",
+		"✽ Thinking… (10s · ↓ 150 tokens)\n❯ \n",
+		"✽ Thinking… (15s · ↓ 300 tokens)\n❯ \n",
+	}
+	for _, f := range frames[:2] {
+		base.Assess(f, p)
+		det.Assess(f, p)
+	}
+	_, baseConf := base.Assess(frames[2], p)
+	claudeState, claudeConf := det.Assess(frames[2], p)
+	if claudeState != LivenessConverging {
+		t.Errorf("increasing tokens: want LivenessConverging, got %v", claudeState)
+	}
+	if claudeConf <= baseConf {
+		t.Errorf("increasing tokens: claude conf %v must be > default conf %v", claudeConf, baseConf)
+	}
+}
+
+func TestClaudeDetector_StaticTokenFallsBack(t *testing.T) {
+	p := Profiles["claude-repl-v1"]
+	base := NewDefaultDetector(3)
+	det := NewClaudeDetector(3)
+	static := "✽ Thinking… (5s · ↓ 100 tokens)\n❯ \n"
+	for range 3 {
+		base.Assess(static, p)
+		det.Assess(static, p)
+	}
+	baseState, baseConf := base.Assess(static, p)
+	detState, detConf := det.Assess(static, p)
+	if detState != baseState {
+		t.Errorf("static token: claude state %v ≠ default %v", detState, baseState)
+	}
+	if detConf > baseConf {
+		t.Errorf("static token: claude conf %v must not exceed default %v", detConf, baseConf)
+	}
+}
+
+func TestClaudeDetector_MalformedTokenNoPanic(t *testing.T) {
+	p := Profiles["claude-repl-v1"]
+	malformed := []string{
+		"✽ Thinking… (↓ tokens)\n❯ \n",
+		"✽ Thinking… (5s · ↓ k tokens)\n❯ \n",
+		"✽ Thinking…\n❯ \n",
+		"✽ ↓ not-a-number tokens\n❯ \n",
+	}
+	for _, frame := range malformed {
+		t.Run("malformed", func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("panic on malformed frame %q: %v", frame, r)
+				}
+			}()
+			base := NewDefaultDetector(3)
+			det := NewClaudeDetector(3)
+			base.Assess("⏺ content\n❯ \n", p)
+			det.Assess("⏺ content\n❯ \n", p)
+			_, baseConf := base.Assess(frame, p)
+			_, detConf := det.Assess(frame, p)
+			if detConf > baseConf {
+				t.Errorf("malformed frame %q: claude conf %v > default %v (must not elevate)", frame, detConf, baseConf)
+			}
+		})
+	}
+}
+
+func TestDetectorFor_NonClaudeIsDefault(t *testing.T) {
+	for _, cli := range []string{"codex", "agy", "ollama"} {
+		t.Run(cli, func(t *testing.T) {
+			p := Profiles[cli+"-repl-v1"]
+			probe := DetectorFor(p)
+			if probe == nil {
+				t.Fatalf("DetectorFor(%q) = nil", cli)
+			}
+			base := NewDefaultDetector(0)
+			think := testdataFrame(t, cli+"/thinking.txt")
+			answer := testdataFrame(t, cli+"/answer.txt")
+			probe.Assess(think, p)
+			base.Assess(think, p)
+			detState, detConf := probe.Assess(answer, p)
+			baseState, baseConf := base.Assess(answer, p)
+			if detState != baseState || detConf != baseConf {
+				t.Errorf("[%s] DetectorFor: (%v,%.2f) ≠ DefaultDetector: (%v,%.2f)", cli, detState, detConf, baseState, baseConf)
+			}
+		})
+	}
+}
+
+func TestDetectorFor_ClaudeIsClaudeDetector(t *testing.T) {
+	p := Profiles["claude-repl-v1"]
+	probe := DetectorFor(p)
+	base := NewDefaultDetector(0)
+	frames := []string{
+		"✽ Thinking… (5s · ↓ 50 tokens)\n❯ \n",
+		"✽ Thinking… (10s · ↓ 200 tokens)\n❯ \n",
+	}
+	probe.Assess(frames[0], p)
+	base.Assess(frames[0], p)
+	_, baseConf := base.Assess(frames[1], p)
+	_, detConf := probe.Assess(frames[1], p)
+	if detConf <= baseConf {
+		t.Errorf("claude DetectorFor: conf %v must be > default %v on increasing tokens", detConf, baseConf)
+	}
+}
+
+func TestExtractResponseTokens(t *testing.T) {
+	cases := []struct {
+		name string
+		pane string
+		want int
+	}{
+		{"k-form integer", "↓ 12k tokens", 12000},
+		{"k-form fractional", "↓ 5.2k tokens", 5200},
+		{"k-form half", "↓ 3.5k tokens", 3500},
+		{"plain-integer 50", "↓ 50 tokens", 50},
+		{"plain-integer 200", "↓ 200 tokens", 200},
+		{"multiple → peak", "↓ 1k tokens\n↓ 5k tokens\n↓ 3k tokens\n", 5000},
+		{"peak-is-last", "↓ 2k tokens\n↓ 9.9k tokens\n", 9900},
+		{"in chrome line", "✽ Thinking… (5s · ↓ 50 tokens)\n❯ \n", 50},
+		{"empty pane", "", 0},
+		{"no counter", "❯ ready\n", 0},
+		{"malformed: no digits", "↓ k tokens", 0},
+		{"malformed: missing tokens word", "↓ 5.2k", 0},
+		{"malformed: non-numeric", "↓ abck tokens", 0},
+		{"malformed: no arrow", "5.2k tokens", 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := ExtractResponseTokens(c.pane); got != c.want {
+				t.Fatalf("ExtractResponseTokens(%q) = %d, want %d", c.pane, got, c.want)
+			}
+		})
+	}
+}

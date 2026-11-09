@@ -1,0 +1,428 @@
+package guardcmd
+
+import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/evalqualitycheck"
+)
+
+func TestRunEval_ArgBranches(t *testing.T) {
+	cases := []struct {
+		name    string
+		args    []string
+		wantRC  int
+		wantErr string
+	}{
+		{"missing subcommand", nil, 10, "missing subcommand"},
+		{"unknown subcommand", []string{"bogus"}, 10, `unknown subcommand "bogus"`},
+		{"quality-check missing path", []string{"quality-check"}, 10, "missing <eval.md> path"},
+		{"quality-check bad path", []string{"quality-check", "/nonexistent/eval.md"}, 1, "eval quality-check:"},
+		{"diversity-check missing path", []string{"diversity-check"}, 10, "missing <evalsDir> path"},
+		{"verify missing args", []string{"verify", "only-one"}, 10, "missing <eval.md> <workspace>"},
+		{"verify bad path", []string{"verify", "/nonexistent/eval.md", "/nonexistent/ws"}, 1, "eval verify:"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var out, errb bytes.Buffer
+			rc := RunEval(tc.args, nil, &out, &errb)
+			if rc != tc.wantRC {
+				t.Fatalf("RunEval(%v) rc = %d, want %d\nstderr=%s", tc.args, rc, tc.wantRC, errb.String())
+			}
+			if !strings.Contains(errb.String(), tc.wantErr) {
+				t.Fatalf("RunEval(%v) stderr = %q, want to contain %q", tc.args, errb.String(), tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestRunEval_QualityCheckRealFile(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "eval.md")
+	body := "# Eval: sample\n\n## Graders\n\n- `go test ./internal/fleet/...` exits 0\n- `test -f go/internal/fleet/starvation.go`\n"
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errb bytes.Buffer
+	rc := RunEval([]string{"quality-check", p}, nil, &out, &errb)
+	if rc != 0 && rc != 1 && rc != 2 {
+		t.Fatalf("quality-check rc = %d, want 0/1/2\nstderr=%s", rc, errb.String())
+	}
+	if !strings.Contains(out.String(), "[eval quality-check]") {
+		t.Fatalf("quality-check stdout = %q, want the quality-check header", out.String())
+	}
+}
+
+func TestRunEval_QualityCheckPredicatesFlakyLint(t *testing.T) {
+	dir := t.TempDir()
+	eval := filepath.Join(dir, "eval.md")
+	if err := os.WriteFile(eval, []byte("```bash\ngo build ./go/...\n```\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("flaky predicates raise PASS to WARN", func(t *testing.T) {
+		pred := filepath.Join(dir, "predicates_test.go")
+		src := "package cycle9999\n\nimport (\n\t\"testing\"\n\t\"time\"\n)\n\n" +
+			"func TestC9999_Deadline(t *testing.T) {\n" +
+			"\tif time.Since(time.Now()) > time.Second {\n\t\tt.Fatal(\"slow\")\n\t}\n}\n"
+		if err := os.WriteFile(pred, []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		var out, errb bytes.Buffer
+		rc := RunEval([]string{"quality-check", "-predicates", pred, eval}, nil, &out, &errb)
+		if rc != 1 {
+			t.Fatalf("rc = %d, want 1 (WARN)\nstdout=%s\nstderr=%s", rc, out.String(), errb.String())
+		}
+		if !strings.Contains(out.String(), "flaky[async-wait]") {
+			t.Fatalf("stdout = %q, want a flaky[async-wait] advisory line", out.String())
+		}
+		if !strings.Contains(out.String(), "verdict: WARN") {
+			t.Fatalf("stdout = %q, want verdict: WARN", out.String())
+		}
+	})
+
+	t.Run("clean predicates stay PASS", func(t *testing.T) {
+		clean := filepath.Join(dir, "clean_predicates_test.go")
+		src := "package cycle9999\n\nimport \"testing\"\n\nfunc TestC9999_Clean(t *testing.T) { t.Log(\"ok\") }\n"
+		if err := os.WriteFile(clean, []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		var out, errb bytes.Buffer
+		rc := RunEval([]string{"quality-check", "-predicates", clean, eval}, nil, &out, &errb)
+		if rc != 0 {
+			t.Fatalf("rc = %d, want 0 (PASS)\nstdout=%s\nstderr=%s", rc, out.String(), errb.String())
+		}
+		if strings.Contains(out.String(), "flaky[") {
+			t.Fatalf("stdout = %q, want no flaky advisory lines", out.String())
+		}
+	})
+
+	t.Run("bad predicates path is a loud non-blocking skip", func(t *testing.T) {
+		var out, errb bytes.Buffer
+		rc := RunEval([]string{"quality-check", "-predicates", "/nonexistent/predicates_test.go", eval}, nil, &out, &errb)
+		if rc != 0 {
+			t.Fatalf("rc = %d, want 0 (eval clean; lint error must not block)\nstderr=%s", rc, errb.String())
+		}
+		if !strings.Contains(errb.String(), "flaky-lint") {
+			t.Fatalf("stderr = %q, want a loud flaky-lint skip notice", errb.String())
+		}
+	})
+}
+
+func TestRunEval_QualityCheckPredicatesReceiptIsUnconditional(t *testing.T) {
+	dir := t.TempDir()
+	evalPath := filepath.Join(dir, "eval.md")
+	if err := os.WriteFile(evalPath, []byte("```bash\ngo build ./go/...\n```\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	clean := filepath.Join(dir, "clean_predicates_test.go")
+	src := "package cycle9999\n\nimport \"testing\"\n\nfunc TestC9999_Clean(t *testing.T) { t.Log(\"ok\") }\n"
+	if err := os.WriteFile(clean, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errb bytes.Buffer
+	if rc := RunEval([]string{"quality-check", "-predicates", clean, evalPath}, nil, &out, &errb); rc != 0 {
+		t.Fatalf("rc = %d, want 0\nstdout=%s\nstderr=%s", rc, out.String(), errb.String())
+	}
+	if !strings.Contains(out.String(), "linted 1 file(s)") {
+		t.Errorf("a clean lint must still print its file-count receipt; stdout = %q", out.String())
+	}
+	if !strings.Contains(out.String(), "0 advisory finding(s)") {
+		t.Errorf("the receipt must state the finding count explicitly; stdout = %q", out.String())
+	}
+
+	var o3, e3 bytes.Buffer
+	if rc := RunEval([]string{"quality-check", "-predicates", "", evalPath}, nil, &o3, &e3); rc != 0 {
+		t.Fatalf("rc = %d, want 0 (eval clean; a lint stand-down must not block)", rc)
+	}
+	if !strings.Contains(e3.String(), "flaky-lint") {
+		t.Errorf("-predicates \"\" must produce a loud stand-down, not silence; stderr = %q stdout = %q", e3.String(), o3.String())
+	}
+
+	emptyDir := filepath.Join(dir, "acs", "cycle-empty")
+	if err := os.MkdirAll(emptyDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var o2, e2 bytes.Buffer
+	if rc := RunEval([]string{"quality-check", "-predicates", emptyDir, evalPath}, nil, &o2, &e2); rc != 0 {
+		t.Fatalf("rc = %d, want 0 (the eval is clean; a lint stand-down must not block)", rc)
+	}
+	if !strings.Contains(e2.String(), "not a clean result") {
+		t.Errorf("an empty predicates dir must say outright that nothing was linted; stderr = %q", e2.String())
+	}
+}
+
+const unsatisfiablePredicateSrc = "package cycle9999\n\nimport (\n\t\"os/exec\"\n\t\"testing\"\n\n\t\"example.com/acsassert\"\n)\n\n" +
+	"func TestC9999_Gone(t *testing.T) {\n" +
+	"\tif acsassert.FileContains(t, \"x.go\", \"old\") {\n\t\tt.Errorf(\"old symbol still present\")\n\t}\n}\n\n" +
+	"func TestC9999_HaltThroughGoRun(t *testing.T) {\n" +
+	"\tcmd := exec.Command(\"go\", \"run\", \"./cmd/evolve\")\n\t_ = cmd.Run()\n" +
+	"\tif cmd.ProcessState.ExitCode() != 2 {\n\t\tt.Errorf(\"want HALT\")\n\t}\n}\n"
+
+func runQualityCheck(t *testing.T, evalBody, predicates string) (string, string, int) {
+	t.Helper()
+	evalPath := filepath.Join(t.TempDir(), "eval.md")
+	if err := os.WriteFile(evalPath, []byte(evalBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errb bytes.Buffer
+	rc := RunEval([]string{"quality-check", "-predicates", predicates, evalPath}, nil, &out, &errb)
+	return out.String(), errb.String(), rc
+}
+
+func writePredicates(t *testing.T, src string) string {
+	t.Helper()
+	pred := filepath.Join(t.TempDir(), "predicates_test.go")
+	if err := os.WriteFile(pred, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return pred
+}
+
+func TestRunEval_QualityCheckPredicatesUnsatisfiableLint(t *testing.T) {
+	const cleanEval, tautologyEval = "```bash\ngo build ./go/...\n```\n", "```bash\n:\n```\n"
+	unsatisfiable := writePredicates(t, unsatisfiablePredicateSrc)
+	cases := []struct {
+		name, eval, predicates string
+		rc                     int
+		stdout                 []string
+	}{
+		{"findings raise PASS to WARN", cleanEval, unsatisfiable, 1, []string{
+			"unsatisfiable[inverted-idiom] predicates_test.go:TestC9999_Gone",
+			"unsatisfiable[go-run-exit-code] predicates_test.go:TestC9999_HaltThroughGoRun",
+			"unsatisfiable-lint: linted 1 file(s) under " + unsatisfiable + " — 2 advisory finding(s)",
+			"verdict: WARN",
+		}},
+		{"findings never lower a tautology HALT", tautologyEval, unsatisfiable, 2, []string{"unsatisfiable[inverted-idiom]", "verdict: HALT"}},
+		{"a clean package still prints the receipt", cleanEval, writePredicates(t, "package cycle9999\n"), 0, []string{"unsatisfiable-lint: linted 1 file(s)", "0 advisory finding(s)", "verdict: PASS"}},
+	}
+	for _, c := range cases {
+		out, errb, rc := runQualityCheck(t, c.eval, c.predicates)
+		if rc != c.rc {
+			t.Errorf("%s: rc = %d, want %d\nstdout=%s\nstderr=%s", c.name, rc, c.rc, out, errb)
+		}
+		for _, want := range c.stdout {
+			if !strings.Contains(out, want) {
+				t.Errorf("%s: stdout missing %q:\n%s", c.name, want, out)
+			}
+		}
+	}
+
+	out, errb, rc := runQualityCheck(t, cleanEval, "/nonexistent/predicates_test.go")
+	if rc != 0 || !strings.Contains(errb, "unsatisfiable-lint") || strings.Contains(out, "unsatisfiable-lint: linted") {
+		t.Errorf("an unreadable path must be a loud, non-blocking skip: rc=%d stdout=%q stderr=%q", rc, out, errb)
+	}
+}
+
+func TestRunEval_QualityCheckPredicateLintSkipNamesEachLintOnce(t *testing.T) {
+	_, errb, rc := runQualityCheck(t, "```bash\ngo build ./go/...\n```\n", "/nonexistent/predicates_test.go")
+	if rc != 0 {
+		t.Fatalf("rc = %d, want 0: a lint that cannot read its path must not block", rc)
+	}
+	if strings.Count(errb, "(advisory lint skipped)") != 2 {
+		t.Errorf("each of the two predicate lints must report its skip once; stderr = %q", errb)
+	}
+	for _, lint := range []string{"flaky", "unsatisfiable"} {
+		if n := strings.Count(errb, lint); n != 1 {
+			t.Errorf("the %s lint's skip names it %d times, want once; stderr = %q", lint, n, errb)
+		}
+		if !strings.Contains(errb, "evolve eval quality-check: "+lint+"-lint: ") {
+			t.Errorf("the %s lint's skip must name it as its receipt does (%s-lint); stderr = %q", lint, lint, errb)
+		}
+	}
+}
+
+func TestRunEval_QualityCheckFlakyLintNeverLowersHalt(t *testing.T) {
+	dir := t.TempDir()
+	tautEval := filepath.Join(dir, "taut.md")
+	if err := os.WriteFile(tautEval, []byte("```bash\n:\n```\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pred := filepath.Join(dir, "predicates_test.go")
+	src := "package cycle9999\n\nimport (\n\t\"os/exec\"\n\t\"testing\"\n)\n\n" +
+		"func TestC9999_Sweep(t *testing.T) {\n\tif err := exec.Command(\"go\", \"test\", \"./...\").Run(); err != nil {\n\t\tt.Fatal(err)\n\t}\n}\n"
+	if err := os.WriteFile(pred, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var base, baseErr bytes.Buffer
+	if rc := RunEval([]string{"quality-check", tautEval}, nil, &base, &baseErr); rc != 2 {
+		t.Fatalf("fixture invalid: tautological eval alone rc = %d, want 2\nstdout=%s\nstderr=%s", rc, base.String(), baseErr.String())
+	}
+
+	var out, errb bytes.Buffer
+	rc := RunEval([]string{"quality-check", "-predicates", pred, tautEval}, nil, &out, &errb)
+	if rc != 2 {
+		t.Fatalf("rc = %d, want 2 — an ADVISORY flaky finding must never lower a tautology HALT to WARN\nstdout=%s\nstderr=%s", rc, out.String(), errb.String())
+	}
+	if !strings.Contains(out.String(), "verdict: HALT") {
+		t.Errorf("verdict must stay HALT; stdout = %q", out.String())
+	}
+	if !strings.Contains(out.String(), "flaky[concurrency]") {
+		t.Errorf("the flaky advisory lines must still print under a HALT — the operator loses nothing; stdout = %q", out.String())
+	}
+}
+
+func TestMaxEvalLevel_IsMonotonic(t *testing.T) {
+	levels := []evalqualitycheck.Level{
+		evalqualitycheck.LevelPass, evalqualitycheck.LevelWarn, evalqualitycheck.LevelHalt,
+	}
+	for _, a := range levels {
+		for _, b := range levels {
+			got := maxEvalLevel(a, b)
+			if got < a || got < b {
+				t.Errorf("maxEvalLevel(%d, %d) = %d — a join must never be less severe than its inputs", a, b, got)
+			}
+			if rev := maxEvalLevel(b, a); rev != got {
+				t.Errorf("maxEvalLevel is not commutative: (%d,%d)=%d but (%d,%d)=%d", a, b, got, b, a, rev)
+			}
+		}
+	}
+}
+
+func TestRunCommitPrefixGate_ArgBranches(t *testing.T) {
+	cases := []struct {
+		name    string
+		args    []string
+		wantRC  int
+		wantErr string
+		wantOut string
+	}{
+		{"help", []string{"--help"}, 0, "", "Usage: evolve commit-prefix-gate"},
+		{"unknown arg", []string{"--bogus"}, 3, "unknown arg: --bogus", ""},
+		{"msg missing value", []string{"--msg"}, 3, "--msg missing value", ""},
+		{"repo-dir missing value", []string{"--repo-dir"}, 3, "--repo-dir missing value", ""},
+		{"diff-ref missing value", []string{"--diff-ref"}, 3, "--diff-ref missing value", ""},
+		{"manifest missing value", []string{"--manifest"}, 3, "--manifest missing value", ""},
+		{"empty msg", []string{"--repo-dir=/tmp"}, 3, "usage: --msg", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var out, errb bytes.Buffer
+			rc := RunCommitPrefixGate(tc.args, nil, &out, &errb)
+			if rc != tc.wantRC {
+				t.Fatalf("rc = %d, want %d\nstderr=%s", rc, tc.wantRC, errb.String())
+			}
+			if tc.wantErr != "" && !strings.Contains(errb.String(), tc.wantErr) {
+				t.Fatalf("stderr = %q, want %q", errb.String(), tc.wantErr)
+			}
+			if tc.wantOut != "" && !strings.Contains(out.String(), tc.wantOut) {
+				t.Fatalf("stdout = %q, want %q", out.String(), tc.wantOut)
+			}
+		})
+	}
+}
+
+func TestRunCommitPrefixGate_RealRun(t *testing.T) {
+	dir := t.TempDir()
+	var out, errb bytes.Buffer
+	rc := RunCommitPrefixGate([]string{"--msg=feat: x", "--repo-dir=" + dir, "--staged"}, nil, &out, &errb)
+	if rc < 0 || rc > 4 {
+		t.Fatalf("real run rc = %d, want a documented exit code 0..4\nstderr=%s", rc, errb.String())
+	}
+}
+
+func TestRunPreflight_Modes(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("EVOLVE_PROJECT_ROOT", root)
+	cases := []struct {
+		name   string
+		args   []string
+		wantRC int
+	}{
+		{"help", []string{"--help"}, 0},
+		{"json default", nil, 0},
+		{"json explicit", []string{"--json"}, 0},
+		{"summary", []string{"--summary"}, 0},
+		{"write", []string{"--summary", "--write"}, 0},
+		{"bad arg", []string{"--bogus"}, 10},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var out, errb bytes.Buffer
+			rc := RunPreflight(tc.args, nil, &out, &errb)
+			if rc != tc.wantRC {
+				t.Fatalf("RunPreflight(%v) rc = %d, want %d\nstderr=%s", tc.args, rc, tc.wantRC, errb.String())
+			}
+		})
+	}
+	if _, err := os.Stat(filepath.Join(root, ".evolve", "environment.json")); err != nil {
+		t.Fatalf("--write did not persist environment.json: %v", err)
+	}
+}
+
+func TestRunGuard_BuildGuardBranches(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"phase", "role", "chain", "docdelete"} {
+		var out, errb bytes.Buffer
+		rc := RunGuard([]string{"--evolve-dir", dir, name}, strings.NewReader(""), &out, &errb)
+		if rc != 0 && rc != 2 {
+			t.Fatalf("RunGuard(%s) rc = %d, want 0 (allow) or 2 (deny)\nstderr=%s", name, rc, errb.String())
+		}
+	}
+
+	type ec struct {
+		name  string
+		args  []string
+		stdin string
+		want  int
+	}
+	for _, tc := range []ec{
+		{"unknown guard", []string{"--evolve-dir", dir, "bogus-guard"}, "", 10},
+		{"no name", nil, "", 10},
+		{"unexpected trailing args", []string{"ship", "extra"}, "", 10},
+		{"bad stdin json", []string{"--evolve-dir", dir, "ship"}, "{bad json", 10},
+		{"list-audit-fails missing state", []string{"--evolve-dir", dir, "list-audit-fails"}, "", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out, errb bytes.Buffer
+			var stdin *strings.Reader
+			if tc.stdin != "" || tc.args != nil {
+				stdin = strings.NewReader(tc.stdin)
+			}
+			rc := RunGuard(tc.args, stdin, &out, &errb)
+			if rc != tc.want {
+				t.Fatalf("RunGuard(%v) rc = %d, want %d\nstderr=%s", tc.args, rc, tc.want, errb.String())
+			}
+		})
+	}
+}
+
+func TestRunCommitGate_ArgBranches(t *testing.T) {
+	var out, errb bytes.Buffer
+	rc := RunCommitGate([]string{"run", "--project-root", t.TempDir()}, nil, &out, &errb)
+	if rc != 2 {
+		t.Fatalf("RunCommitGate(non-repo) rc = %d, want 2\nstderr=%s", rc, errb.String())
+	}
+}
+
+func TestRunEval_QualityCheckPredicatesFlagAfterPositional(t *testing.T) {
+	dir := t.TempDir()
+	evalPath := filepath.Join(dir, "eval.md")
+	if err := os.WriteFile(evalPath, []byte("# Eval\n\n## Acceptance\n- thing works\n\n## Verification\n- go test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	predDir := filepath.Join(dir, "acs", "cycle9")
+	if err := os.MkdirAll(predDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	flaky := "//go:build acs\n\npackage cycle9\n\nimport (\n\t\"os/exec\"\n\t\"testing\"\n)\n\n" +
+		"func TestC9_001_X(t *testing.T) {\n\tif err := exec.Command(\"git\", \"status\").Run(); err != nil {\n\t\tt.Fatal(err)\n\t}\n}\n"
+	if err := os.WriteFile(filepath.Join(predDir, "predicates_test.go"), []byte(flaky), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, order := range [][]string{
+		{"-predicates", predDir, evalPath},
+		{evalPath, "-predicates", predDir},
+	} {
+		var out, errb bytes.Buffer
+		rc := runEvalQualityCheck(order, &out, &errb)
+		if !strings.Contains(out.String(), "flaky[") {
+			t.Errorf("args %v: the lint did not run (rc=%d) — a dropped -predicates flag reports a clean PASS on an unlinted tree:\n%s%s", order, rc, out.String(), errb.String())
+		}
+	}
+}

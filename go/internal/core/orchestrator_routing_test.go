@@ -1,0 +1,368 @@
+package core
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/config"
+	"github.com/mickeyyaya/evolve-loop/go/internal/phasespec"
+	"github.com/mickeyyaya/evolve-loop/go/internal/router"
+)
+
+func seedWorkspace(t *testing.T, projectRoot string, cycle int, files map[string]string) string {
+	t.Helper()
+	ws := filepath.Join(projectRoot, ".evolve", "runs", fmt.Sprintf("cycle-%d", cycle))
+	if err := os.MkdirAll(ws, 0o755); err != nil {
+		t.Fatalf("mkdir workspace: %v", err)
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(ws, name), []byte(body), 0o644); err != nil {
+			t.Fatalf("seed %s: %v", name, err)
+		}
+	}
+	return ws
+}
+
+func readRoutingDecisions(t *testing.T, workspace string) []router.RouterDecision {
+	t.Helper()
+	paths, _ := filepath.Glob(filepath.Join(workspace, "routing-decision-*.json"))
+	out := make([]router.RouterDecision, 0, len(paths))
+	for _, p := range paths {
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("read %s: %v", p, err)
+		}
+		var d router.RouterDecision
+		if err := json.Unmarshal(raw, &d); err != nil {
+			t.Fatalf("unmarshal %s: %v", p, err)
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
+func countLedgerKind(entries []LedgerEntry, kind string) int {
+	n := 0
+	for _, e := range entries {
+		if e.Kind == kind {
+			n++
+		}
+	}
+	return n
+}
+
+func contains(xs []string, want string) bool {
+	for _, x := range xs {
+		if x == want {
+			return true
+		}
+	}
+	return false
+}
+
+func shadowCfg(stage config.Stage) config.RoutingConfig {
+	return config.RoutingConfig{
+		Stage:         stage,
+		Mode:          config.ModeStaticPreset,
+		Mandatory:     []string{"scout", "build", "audit", "ship"},
+		Conditional:   map[string]config.CondRule{"tdd": {Field: "cycle_size", Op: "!=", Value: "trivial"}},
+		MaxInsertions: 4,
+		PhaseEnable:   map[string]config.Enable{},
+		Triggers: map[string]config.RoutingBlock{
+			"tester": {InsertWhen: []config.Condition{{Field: "build.acs_red", Op: "gt", Value: 0}}},
+		},
+	}
+}
+
+func indexOfPhase(ps []Phase, name string) int {
+	for i, p := range ps {
+		if string(p) == name {
+			return i
+		}
+	}
+	return -1
+}
+
+func TestOrchestrator_Enforce_RunsUserPhaseBetweenBuildAndAudit(t *testing.T) {
+	t.Parallel()
+	projectRoot := t.TempDir()
+	st := &fakeStorage{state: State{LastCycleNumber: 0}}
+	led := &fakeLedger{}
+	runners := buildRunners(nil)
+	scanRunner := &fakeRunner{name: "security-scan"}
+	runners[Phase("security-scan")] = scanRunner
+
+	cycle := 1
+	seedWorkspace(t, projectRoot, cycle, map[string]string{
+		"handoff-build.json": `{"verdict":"PASS","acs_result":{"green":5,"red":0},"signals":{"cves":1}}`,
+	})
+
+	cat, _ := phasespec.Catalog{}.Merge([]phasespec.PhaseSpec{
+		{Name: "security-scan", Optional: true, After: "build"},
+	})
+	if _, ok := cat.Get("security-scan"); !ok {
+		t.Fatal("setup: security-scan missing from catalog after Merge")
+	}
+	cfg := shadowCfg(config.StageEnforce)
+	cfg.Order = []string{"scout", "triage", "tdd", "build-planner", "build", "tester", "security-scan", "audit", "ship"}
+	cfg.Triggers["security-scan"] = config.RoutingBlock{
+		InsertWhen: []config.Condition{{Field: "build.cves", Op: "gt", Value: 0}},
+	}
+
+	o := NewOrchestrator(st, led, runners, WithRouting(cfg, router.StaticPreset{}), WithCatalog(cat))
+	res, err := o.RunCycle(context.Background(), CycleRequest{
+		ProjectRoot:           projectRoot,
+		GoalHash:              "g",
+		DisableWorkspaceGuard: true,
+	})
+	if err != nil {
+		t.Fatalf("RunCycle: %v", err)
+	}
+
+	if scanRunner.calls != 1 {
+		t.Errorf("security-scan runner calls = %d, want 1 (the user phase must execute)", scanRunner.calls)
+	}
+	bi := indexOfPhase(res.PhasesRun, "build")
+	si := indexOfPhase(res.PhasesRun, "security-scan")
+	ai := indexOfPhase(res.PhasesRun, "audit")
+	if si < 0 {
+		t.Fatalf("security-scan absent from PhasesRun=%v", res.PhasesRun)
+	}
+	if bi < 0 || bi >= si || si >= ai {
+		t.Errorf("ordering wrong: build@%d security-scan@%d audit@%d (PhasesRun=%v)", bi, si, ai, res.PhasesRun)
+	}
+}
+
+type capturingPlanner struct {
+	got   router.RouteInput
+	calls int
+}
+
+func (p *capturingPlanner) Plan(in router.RouteInput) (*router.PhasePlan, error) {
+	p.calls++
+	p.got = in
+	return nil, nil
+}
+
+func TestOrchestrator_ThreadsGoalTextToPlanner(t *testing.T) {
+	t.Parallel()
+	st := &fakeStorage{state: State{LastCycleNumber: 0}}
+	led := &fakeLedger{}
+	runners := buildRunners(nil)
+	cfg := shadowCfg(config.StageAdvisory)
+	cfg.Mode = config.ModeDynamicLLM
+	cp := &capturingPlanner{}
+	o := NewOrchestrator(st, led, runners, WithRouting(cfg, router.StaticPreset{}), WithPlanner(cp))
+
+	const goal = "redesign the auth subsystem with token rotation"
+	_, err := o.RunCycle(context.Background(), CycleRequest{
+		ProjectRoot:           t.TempDir(),
+		GoalHash:              "g",
+		DisableWorkspaceGuard: true,
+		Context:               map[string]string{"goal": goal},
+	})
+	if err != nil {
+		t.Fatalf("RunCycle: %v", err)
+	}
+	if cp.calls == 0 {
+		t.Fatal("planner was never consulted (Stage>=Advisory + Mode==DynamicLLM gate not opened?)")
+	}
+	if cp.got.GoalText != goal {
+		t.Errorf("advisor RouteInput.GoalText=%q, want the Context[strategy] goal %q", cp.got.GoalText, goal)
+	}
+}
+
+func TestOrchestrator_ThreadsCarryoverTodosToPlanner(t *testing.T) {
+	t.Parallel()
+	st := &fakeStorage{state: State{
+		LastCycleNumber: 3,
+		CarryoverTodos: []CarryoverTodo{
+			{
+				ID:             "cycle-3-failed-build",
+				Action:         "Fix build leak discovered by failed cycle",
+				Priority:       "P0",
+				FirstSeenCycle: 3,
+				CyclesUnpicked: 2,
+			},
+		},
+	}}
+	led := &fakeLedger{}
+	runners := buildRunners(nil)
+	cfg := shadowCfg(config.StageAdvisory)
+	cfg.Mode = config.ModeDynamicLLM
+	cp := &capturingPlanner{}
+	o := NewOrchestrator(st, led, runners, WithRouting(cfg, router.StaticPreset{}), WithPlanner(cp))
+
+	_, err := o.RunCycle(context.Background(), CycleRequest{
+		ProjectRoot:           t.TempDir(),
+		GoalHash:              "g",
+		DisableWorkspaceGuard: true,
+	})
+	if err != nil {
+		t.Fatalf("RunCycle: %v", err)
+	}
+	if cp.calls == 0 {
+		t.Fatal("planner was never consulted")
+	}
+	if len(cp.got.CarryoverTodos) != 1 {
+		t.Fatalf("planner carryover todos = %+v, want one", cp.got.CarryoverTodos)
+	}
+	got := cp.got.CarryoverTodos[0]
+	if got.ID != "cycle-3-failed-build" || got.Priority != "P0" || got.CyclesUnpicked != 2 {
+		t.Errorf("planner carryover todo = %+v, want projected state todo", got)
+	}
+}
+
+func TestOrchestrator_StageOff_EmitsNoRoutingLedgerEntries(t *testing.T) {
+	t.Parallel()
+	st := &fakeStorage{state: State{LastCycleNumber: 0}}
+	led := &fakeLedger{}
+	runners := buildRunners(nil)
+	cfg := shadowCfg(config.StageOff)
+	o := NewOrchestrator(st, led, runners, WithRouting(cfg, router.StaticPreset{}))
+
+	res, err := o.RunCycle(context.Background(), CycleRequest{ProjectRoot: t.TempDir(), GoalHash: "g"})
+	if err != nil {
+		t.Fatalf("RunCycle: %v", err)
+	}
+	if n := countLedgerKind(led.entries, "routing_decision"); n != 0 {
+		t.Errorf("routing_decision entries=%d, want 0 in Stage:Off", n)
+	}
+	if n := countLedgerKind(led.entries, "phase_skipped"); n != 0 {
+		t.Errorf("phase_skipped entries=%d, want 0 in Stage:Off", n)
+	}
+	want := []Phase{PhaseScout, PhaseTriage, PhaseTDD, PhaseBuildPlanner, PhaseBuild, PhaseAudit, PhaseShip}
+	if len(res.PhasesRun) != len(want) {
+		t.Fatalf("phases=%v, want %v", res.PhasesRun, want)
+	}
+}
+
+func TestOrchestrator_Shadow_LogsTesterInsert_StaticPathUnchanged(t *testing.T) {
+	t.Parallel()
+	projectRoot := t.TempDir()
+	st := &fakeStorage{state: State{LastCycleNumber: 0}}
+	led := &fakeLedger{}
+	runners := buildRunners(nil)
+
+	cycle := 1
+	ws := seedWorkspace(t, projectRoot, cycle, map[string]string{
+		"handoff-build.json": `{"verdict":"PASS","acs_result":{"green":3,"red":2,"total":5}}`,
+	})
+
+	o := NewOrchestrator(st, led, runners, WithRouting(shadowCfg(config.StageShadow), router.StaticPreset{}))
+	res, err := o.RunCycle(context.Background(), CycleRequest{
+		ProjectRoot:           projectRoot,
+		GoalHash:              "g",
+		DisableWorkspaceGuard: true,
+	})
+	if err != nil {
+		t.Fatalf("RunCycle: %v", err)
+	}
+
+	want := []Phase{PhaseScout, PhaseTriage, PhaseTDD, PhaseBuildPlanner, PhaseBuild, PhaseAudit, PhaseShip}
+	if len(res.PhasesRun) != len(want) {
+		t.Fatalf("phases=%v, want %v (shadow must not change transitions)", res.PhasesRun, want)
+	}
+	for i := range want {
+		if res.PhasesRun[i] != want[i] {
+			t.Errorf("phase[%d]=%s, want %s", i, res.PhasesRun[i], want[i])
+		}
+	}
+
+	if n := countLedgerKind(led.entries, "routing_decision"); n == 0 {
+		t.Errorf("expected routing_decision ledger entries in shadow, got 0")
+	}
+
+	decs := readRoutingDecisions(t, ws)
+	if len(decs) == 0 {
+		t.Fatalf("no routing-decision artifacts written")
+	}
+	foundTester := false
+	for _, d := range decs {
+		if contains(d.InsertPhases, "tester") {
+			foundTester = true
+		}
+	}
+	if !foundTester {
+		t.Errorf("no routing decision proposed inserting tester despite acs_red>0; decisions=%+v", decs)
+	}
+}
+
+func TestOrchestrator_Enforce_TrivialCycle_SkipsOptionalMiddle(t *testing.T) {
+	t.Parallel()
+	projectRoot := t.TempDir()
+	st := &fakeStorage{state: State{LastCycleNumber: 0}}
+	led := &fakeLedger{}
+	runners := buildRunners(nil)
+
+	cycle := 1
+	seedWorkspace(t, projectRoot, cycle, map[string]string{
+		"handoff-scout.json": `{"cycle_size_estimate":"trivial"}`,
+	})
+
+	o := NewOrchestrator(st, led, runners, WithRouting(shadowCfg(config.StageEnforce), router.StaticPreset{}))
+	res, err := o.RunCycle(context.Background(), CycleRequest{
+		ProjectRoot:           projectRoot,
+		GoalHash:              "g",
+		DisableWorkspaceGuard: true,
+	})
+	if err != nil {
+		t.Fatalf("RunCycle: %v", err)
+	}
+
+	want := []Phase{PhaseScout, PhaseBuild, PhaseAudit, PhaseShip}
+	if len(res.PhasesRun) != len(want) {
+		t.Fatalf("phases=%v, want %v (enforce should skip the optional middle on a trivial cycle)", res.PhasesRun, want)
+	}
+	for i := range want {
+		if res.PhasesRun[i] != want[i] {
+			t.Errorf("phase[%d]=%s, want %s", i, res.PhasesRun[i], want[i])
+		}
+	}
+	for _, p := range []Phase{PhaseTriage, PhaseTDD, PhaseBuildPlanner} {
+		if fr := runners[p].(*fakeRunner); fr.calls != 0 {
+			t.Errorf("phase %s ran %d times, want 0 (skipped on trivial enforce)", p, fr.calls)
+		}
+	}
+}
+
+func TestOrchestrator_Enforce_SpineUnsatisfied_WarnsButProceeds(t *testing.T) {
+	t.Parallel()
+	projectRoot := t.TempDir()
+	st := &fakeStorage{state: State{LastCycleNumber: 0}}
+	led := &fakeLedger{}
+	runners := buildRunners(nil)
+
+	cycle := 1
+	ws := seedWorkspace(t, projectRoot, cycle, map[string]string{
+		"handoff-scout.json": `{"cycle_size_estimate":"medium"}`,
+	})
+
+	o := NewOrchestrator(st, led, runners, WithRouting(shadowCfg(config.StageEnforce), router.StaticPreset{}))
+	res, err := o.RunCycle(context.Background(), CycleRequest{
+		ProjectRoot:           projectRoot,
+		GoalHash:              "g",
+		DisableWorkspaceGuard: true,
+	})
+	if err != nil {
+		t.Fatalf("RunCycle: %v", err)
+	}
+	if len(res.PhasesRun) == 0 || res.PhasesRun[len(res.PhasesRun)-1] != PhaseShip {
+		t.Fatalf("phases=%v, want to reach ship (fail-open, not blocked)", res.PhasesRun)
+	}
+	warned := false
+	for _, d := range readRoutingDecisions(t, ws) {
+		for _, c := range d.Clamps {
+			if c.Rule == "spine-unsatisfied-warn" {
+				warned = true
+			}
+		}
+	}
+	if !warned {
+		t.Error("expected a spine-unsatisfied-warn clamp when build/audit handoffs are absent")
+	}
+}

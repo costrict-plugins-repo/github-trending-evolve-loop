@@ -1,0 +1,53 @@
+{
+  "name": "premise-challenge",
+  "archetype": "evaluate",
+  "optional": true,
+  "agent": "evolve-premise-challenge",
+  "categories": [
+    "feature"
+  ],
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/scout-report.md",
+      ".evolve/runs/cycle-{cycle}/triage-report.md"
+    ],
+    "signals": [
+      "scout.goal_type",
+      "scout.cycle_size"
+    ]
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/premise-challenge-report.md"
+    ],
+    "signals": [
+      "premise.severity_max",
+      "premise.unfalsifiable_count"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Stated Premise",
+      "Falsification Attempts",
+      "Verdict"
+    ],
+    "verdict_from_sentinel": "shadow"
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "scout.cycle_size",
+        "op": "==",
+        "value": "large"
+      },
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "strategy-options"
+      }
+    ],
+    "skip_when": null
+  },
+  "gates": {},
+  "after": "triage"
+}

@@ -1,0 +1,50 @@
+{
+  "name": "risk-register",
+  "catalog": "on-demand",
+  "archetype": "plan",
+  "agent": "evolve-risk-register",
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/scout-report.md"
+    ],
+    "signals": []
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/risk-register-report.md"
+    ],
+    "signals": [
+      "risk.count",
+      "risk.high_count"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Risks",
+      "Scoring",
+      "Response Strategies",
+      "Owners"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "project-management"
+      },
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "business-plan"
+      },
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "partnership-deal"
+      }
+    ]
+  },
+  "after": "triage",
+  "optional": true
+}

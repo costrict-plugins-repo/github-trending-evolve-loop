@@ -1,0 +1,228 @@
+package core_test
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+)
+
+func TestApplyDefects_BlankDefectIgnored(t *testing.T) {
+	t.Parallel()
+
+	state := &core.State{}
+	record := core.FailedRecord{
+		Cycle:   3,
+		Verdict: "FAIL",
+		Defects: []string{"", "   ", "\t"},
+	}
+	core.ApplyDefectsAsCarryoverTodos(state, record)
+	if len(state.CarryoverTodos) != 0 {
+		t.Errorf("GAP: blank/whitespace defects must not produce todos (contract: 'Blank defects are ignored'); got %d",
+			len(state.CarryoverTodos))
+	}
+}
+
+func TestApplyDefects_MixedBlankAndRealDefects(t *testing.T) {
+	t.Parallel()
+
+	state := &core.State{}
+	record := core.FailedRecord{
+		Cycle:   4,
+		Verdict: "FAIL",
+		Defects: []string{"", "real defect A", "   ", "real defect B"},
+	}
+	core.ApplyDefectsAsCarryoverTodos(state, record)
+	if len(state.CarryoverTodos) != 2 {
+		t.Errorf("GAP: want 2 todos (blanks skipped), got %d", len(state.CarryoverTodos))
+	}
+	for _, defect := range []string{"real defect A", "real defect B"} {
+		found := false
+		for _, todo := range state.CarryoverTodos {
+			if strings.Contains(todo.Action, defect) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("no todo found for defect %q", defect)
+		}
+	}
+}
+
+func TestApplyDefects_Idempotent(t *testing.T) {
+	t.Parallel()
+
+	state := &core.State{}
+	record := core.FailedRecord{
+		Cycle:   5,
+		Verdict: "FAIL",
+		Defects: []string{"idempotency defect one", "idempotency defect two"},
+	}
+	core.ApplyDefectsAsCarryoverTodos(state, record)
+	firstCount := len(state.CarryoverTodos)
+	if firstCount == 0 {
+		t.Fatal("first apply produced no todos; cannot verify idempotency")
+	}
+	core.ApplyDefectsAsCarryoverTodos(state, record)
+	if len(state.CarryoverTodos) != firstCount {
+		t.Errorf("idempotency violated: count changed from %d to %d on second apply",
+			firstCount, len(state.CarryoverTodos))
+	}
+}
+
+func TestApplyDefects_DeterministicIDs(t *testing.T) {
+	t.Parallel()
+
+	record := core.FailedRecord{
+		Cycle:   6,
+		Verdict: "FAIL",
+		Defects: []string{"deterministic-defect"},
+	}
+	s1 := &core.State{}
+	core.ApplyDefectsAsCarryoverTodos(s1, record)
+	s2 := &core.State{}
+	core.ApplyDefectsAsCarryoverTodos(s2, record)
+
+	if len(s1.CarryoverTodos) == 0 || len(s2.CarryoverTodos) == 0 {
+		t.Fatal("expected todos in both states")
+	}
+	if s1.CarryoverTodos[0].ID != s2.CarryoverTodos[0].ID {
+		t.Errorf("todo ID not deterministic: first=%q second=%q",
+			s1.CarryoverTodos[0].ID, s2.CarryoverTodos[0].ID)
+	}
+}
+
+func TestApplyDefects_PriorityIsP0(t *testing.T) {
+	t.Parallel()
+
+	state := &core.State{}
+	record := core.FailedRecord{
+		Cycle:   7,
+		Verdict: "FAIL",
+		Defects: []string{"p0-priority defect"},
+	}
+	core.ApplyDefectsAsCarryoverTodos(state, record)
+	for _, todo := range state.CarryoverTodos {
+		if !strings.Contains(todo.Action, "p0-priority defect") {
+			continue
+		}
+		if todo.Priority != "P0" {
+			t.Errorf("per-defect todo Priority: got %q, want P0", todo.Priority)
+		}
+	}
+	if len(state.CarryoverTodos) == 0 {
+		t.Error("expected at least one todo")
+	}
+}
+
+func TestApplyDefects_CyclesUnpickedStartsAtZero(t *testing.T) {
+	t.Parallel()
+
+	state := &core.State{}
+	record := core.FailedRecord{
+		Cycle:   8,
+		Verdict: "FAIL",
+		Defects: []string{"fresh unpicked defect"},
+	}
+	core.ApplyDefectsAsCarryoverTodos(state, record)
+	for _, todo := range state.CarryoverTodos {
+		if !strings.Contains(todo.Action, "fresh unpicked defect") {
+			continue
+		}
+		if todo.CyclesUnpicked != 0 {
+			t.Errorf("new todo CyclesUnpicked: got %d, want 0", todo.CyclesUnpicked)
+		}
+	}
+	if len(state.CarryoverTodos) == 0 {
+		t.Error("expected at least one todo")
+	}
+}
+
+func TestApplyDefects_FirstSeenCycleMatchesRecord(t *testing.T) {
+	t.Parallel()
+
+	const cycle = 9
+	state := &core.State{}
+	record := core.FailedRecord{
+		Cycle:   cycle,
+		Verdict: "FAIL",
+		Defects: []string{"first-seen-cycle defect"},
+	}
+	core.ApplyDefectsAsCarryoverTodos(state, record)
+	for _, todo := range state.CarryoverTodos {
+		if !strings.Contains(todo.Action, "first-seen-cycle defect") {
+			continue
+		}
+		if todo.FirstSeenCycle != cycle {
+			t.Errorf("FirstSeenCycle: got %d, want %d", todo.FirstSeenCycle, cycle)
+		}
+	}
+	if len(state.CarryoverTodos) == 0 {
+		t.Error("expected at least one todo")
+	}
+}
+
+func TestApplyDefects_EachDefectGetsOwnTodo(t *testing.T) {
+	t.Parallel()
+
+	state := &core.State{}
+	defects := []string{"defect alpha", "defect beta", "defect gamma"}
+	record := core.FailedRecord{
+		Cycle:   10,
+		Verdict: "FAIL",
+		Defects: defects,
+	}
+	core.ApplyDefectsAsCarryoverTodos(state, record)
+	if len(state.CarryoverTodos) < len(defects) {
+		t.Errorf("want >= %d todos (one per defect), got %d", len(defects), len(state.CarryoverTodos))
+	}
+	ids := make(map[string]bool)
+	for _, todo := range state.CarryoverTodos {
+		if ids[todo.ID] {
+			t.Errorf("duplicate todo ID %q", todo.ID)
+		}
+		ids[todo.ID] = true
+	}
+}
+
+func TestApplyDefects_NilDefectsSlice(t *testing.T) {
+	t.Parallel()
+
+	state := &core.State{}
+	record := core.FailedRecord{
+		Cycle:   11,
+		Verdict: "FAIL",
+		Defects: nil,
+	}
+	core.ApplyDefectsAsCarryoverTodos(state, record)
+	if len(state.CarryoverTodos) != 0 {
+		t.Errorf("nil Defects: want 0 per-defect todos, got %d", len(state.CarryoverTodos))
+	}
+}
+
+func TestApplyDefects_ExistingTodosNotReplaced(t *testing.T) {
+	t.Parallel()
+
+	state := &core.State{
+		CarryoverTodos: []core.CarryoverTodo{
+			{ID: "pre-existing", Action: "existing work", Priority: "P1"},
+		},
+	}
+	record := core.FailedRecord{
+		Cycle:   12,
+		Verdict: "FAIL",
+		Defects: []string{"new defect"},
+	}
+	core.ApplyDefectsAsCarryoverTodos(state, record)
+	found := false
+	for _, todo := range state.CarryoverTodos {
+		if todo.ID == "pre-existing" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("pre-existing todos must not be removed by ApplyDefectsAsCarryoverTodos")
+	}
+}

@@ -1,0 +1,21 @@
+package bridge
+
+import "testing"
+
+func TestC654_004_EchoedExhaustionStrippedGenuineSurvives(t *testing.T) {
+	t.Parallel()
+	const pattern = `(?i)reached your usage limit`
+
+	const promptEcho = "Deliverable-Contract: If you have reached your usage limit, stop and hand off."
+	echoedPane := "thinking...\n" + promptEcho + "\nwriting report..."
+	stripped := stripPromptEchoLines(echoedPane, "Instructions.\n"+promptEcho+"\nProceed.")
+	if matchExhausted(pattern, stripped) {
+		t.Errorf("echoed prompt exhaustion text still matches after strip: %q", stripped)
+	}
+
+	const genuineBanner = "You have reached your usage limit. Resets in 4h."
+	survived := stripPromptEchoLines(genuineBanner, "Instructions: do the task and report.")
+	if !matchExhausted(pattern, survived) {
+		t.Errorf("genuine CLI exhaustion banner was wrongly stripped as a prompt echo: %q", survived)
+	}
+}

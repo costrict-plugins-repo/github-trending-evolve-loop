@@ -1,0 +1,48 @@
+{
+  "name": "perf-profile",
+  "role": "perf-profile",
+  "cli": "codex-tmux",
+  "cli_fallback": [
+    "claude-tmux"
+  ],
+  "model_tier_default": "balanced",
+  "allowed_tools": [
+    "Read",
+    "Grep",
+    "Glob",
+    "Bash",
+    "Bash(evolve phase verify:*)",
+    "Write(.evolve/ephemeral/agent-runs/*/perf-profile-report.md)"
+  ],
+  "disallowed_tools": [
+    "Edit",
+    "Edit(.evolve/state.json)",
+    "Edit(.evolve/ledger.jsonl)",
+    "Write(.evolve/state.json)",
+    "Write(.evolve/ledger.jsonl)",
+    "Bash(git push:*)",
+    "Bash(git commit:*)",
+    "Bash(git config:*)"
+  ],
+  "max_budget_usd": 0.4,
+  "max_turns": 12,
+  "output_artifact": "perf-profile-report.md",
+  "challenge_token_required": true,
+  "parallel_eligible": false,
+  "sandbox": {
+    "enabled": true,
+    "write_subpaths": [
+      ".evolve/runs/cycle-*"
+    ],
+    "read_only_repo": true,
+    "deny_subpaths": [
+      ".git",
+      ".evolve/state.json",
+      ".evolve/ledger.jsonl",
+      ".evolve/profiles",
+      ".evolve/evals"
+    ],
+    "allow_network": false
+  },
+  "generated_from": "hand-authored"
+}

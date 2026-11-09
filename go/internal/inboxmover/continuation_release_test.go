@@ -1,0 +1,234 @@
+package inboxmover
+
+import (
+	"bytes"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/continuation"
+)
+
+func releaseFixtureItem(t *testing.T, dir, id string) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("fixture dir %s: %v", dir, err)
+	}
+	path := filepath.Join(dir, "2026-08-18T00-00-00Z-"+id+".json")
+	body, err := json.MarshalIndent(map[string]any{"id": id, "kind": "bug", "title": id}, "", "  ")
+	if err != nil {
+		t.Fatalf("fixture marshal: %v", err)
+	}
+	if err := os.WriteFile(path, append(body, '\n'), 0o644); err != nil {
+		t.Fatalf("fixture write %s: %v", path, err)
+	}
+	return path
+}
+
+func releaseFixtureBind(t *testing.T, root, id string, c continuation.Continuation) {
+	t.Helper()
+	if err := continuation.WriteRegistryEntry(root, id, c); err != nil {
+		t.Fatalf("fixture bind %s: %v", id, err)
+	}
+}
+
+func hasRegistryBinding(t *testing.T, root, id string) bool {
+	t.Helper()
+	_, ok, err := continuation.ReadRegistryEntry(root, id)
+	if err != nil {
+		t.Fatalf("read registry %s: %v", id, err)
+	}
+	return ok
+}
+
+func TestReleaseContinuationBinding(t *testing.T) {
+	t.Run("preserves the pointer into the item file before deleting", func(t *testing.T) {
+		root := t.TempDir()
+		inbox := filepath.Join(root, ".evolve", "inbox")
+		itemPath := releaseFixtureItem(t, inbox, "scope-under-release")
+		releaseFixtureItem(t, inbox, "unrelated-live-scope")
+		c := continuation.Continuation{Worktree: "/tmp/wt", Branch: "cycle-1484", SnapshotSHA: "snap1484", BaseSHA: "base1484", Cycle: 1484}
+		releaseFixtureBind(t, root, "scope-under-release", c)
+		releaseFixtureBind(t, root, "unrelated-live-scope", continuation.Continuation{SnapshotSHA: "snap1490", Cycle: 1490})
+
+		var errBuf bytes.Buffer
+		got, released, err := ReleaseContinuationBinding(Options{ProjectRoot: root, Stderr: &errBuf}, "scope-under-release", "unit-test", "unit-test-authority")
+		if err != nil {
+			t.Fatalf("ReleaseContinuationBinding: %v (stderr %s)", err, errBuf.String())
+		}
+		if !released {
+			t.Fatalf("release reported released=false for a binding this cycle owns")
+		}
+		if got.SnapshotSHA != c.SnapshotSHA {
+			t.Errorf("released value lost the snapshot ref: %+v", got)
+		}
+		if hasRegistryBinding(t, root, "scope-under-release") {
+			t.Errorf("the binding survived its release")
+		}
+		if !hasRegistryBinding(t, root, "unrelated-live-scope") {
+			t.Errorf("releasing one scope also dropped the unrelated live binding")
+		}
+
+		raw, rerr := os.ReadFile(itemPath)
+		if rerr != nil {
+			t.Fatalf("read item: %v", rerr)
+		}
+		for _, want := range []string{c.SnapshotSHA, c.BaseSHA, c.Branch, "unit-test"} {
+			if !strings.Contains(string(raw), want) {
+				t.Errorf("released_continuations[] in %s does not preserve %q — pointer loss on release\n%s", itemPath, want, raw)
+			}
+		}
+		for _, want := range []string{`"released_by":"unit-test-authority"`, `"released_at":`} {
+			if !strings.Contains(string(raw), want) {
+				t.Errorf("released_continuations[] in %s carries no %s — the release record does not answer who/when\n%s", itemPath, want, raw)
+			}
+		}
+	})
+
+	t.Run("an unbound scope is a clean miss, not a failure", func(t *testing.T) {
+		root := t.TempDir()
+		var errBuf bytes.Buffer
+		_, released, err := ReleaseContinuationBinding(Options{ProjectRoot: root, Stderr: &errBuf}, "never-bound", "unit-test", "unit-test-authority")
+		if err != nil || released {
+			t.Fatalf("want (released=false, err=nil) for an unbound scope, got released=%v err=%v", released, err)
+		}
+	})
+
+	t.Run("an empty scope id is refused rather than interpreted", func(t *testing.T) {
+		var errBuf bytes.Buffer
+		if _, _, err := ReleaseContinuationBinding(Options{ProjectRoot: t.TempDir(), Stderr: &errBuf}, "  ", "unit-test", "unit-test-authority"); err == nil {
+			t.Fatalf("want an error for an empty scope id, got nil")
+		}
+	})
+}
+
+func TestFindScopeItemFile(t *testing.T) {
+	root := t.TempDir()
+	inbox := filepath.Join(root, ".evolve", "inbox")
+	opts := Options{ProjectRoot: root}
+
+	if got := FindScopeItemFile(opts, "absent-scope"); got != "" {
+		t.Errorf("want no path for a scope with no item anywhere, got %q", got)
+	}
+
+	quarantined := releaseFixtureItem(t, filepath.Join(inbox, "quarantine"), "retired-scope")
+	if got := FindScopeItemFile(opts, "retired-scope"); got != quarantined {
+		t.Errorf("retired copy: got %q, want %q", got, quarantined)
+	}
+
+	pending := releaseFixtureItem(t, inbox, "live-scope")
+	if got := FindScopeItemFile(opts, "live-scope"); got != pending {
+		t.Errorf("pending copy: got %q, want %q", got, pending)
+	}
+
+	claimed := releaseFixtureItem(t, filepath.Join(inbox, "processing", "cycle-1515"), "claimed-scope")
+	if got := FindScopeItemFile(opts, "claimed-scope"); got != claimed {
+		t.Errorf("processing claim: got %q, want %q", got, claimed)
+	}
+}
+
+func TestResolveContinuationForScopeRecency(t *testing.T) {
+	tests := []struct {
+		name         string
+		retiredDir   []string
+		bindingCycle int
+		wantResolved bool
+	}{
+		{
+			name:         "retirement older than the binding is stale evidence: adopt, do not release",
+			retiredDir:   []string{"processed", "cycle-900"},
+			bindingCycle: 1484,
+			wantResolved: true,
+		},
+		{
+			name:         "retirement newer than the binding is real evidence: refuse and release",
+			retiredDir:   []string{"processed", "cycle-1490"},
+			bindingCycle: 1484,
+			wantResolved: false,
+		},
+		{
+			name:         "unstamped quarantine copy is evidence: refuse and release",
+			retiredDir:   []string{"quarantine"},
+			bindingCycle: 1484,
+			wantResolved: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			inbox := filepath.Join(root, ".evolve", "inbox")
+			if err := os.MkdirAll(inbox, 0o755); err != nil {
+				t.Fatalf("fixture inbox: %v", err)
+			}
+			itemPath := releaseFixtureItem(t, filepath.Join(append([]string{inbox}, tc.retiredDir...)...), "ghost-scope")
+			c := continuation.Continuation{Branch: "cycle-1484", SnapshotSHA: "snapGhost", BaseSHA: "baseGhost", Cycle: tc.bindingCycle}
+			releaseFixtureBind(t, root, "ghost-scope", c)
+
+			var errBuf bytes.Buffer
+			got := ResolveContinuationForScope(Options{ProjectRoot: root, Stderr: &errBuf}, 1515, []string{"ghost-scope"})
+
+			if tc.wantResolved {
+				if got == nil {
+					t.Fatalf("binding was refused on STALE retirement evidence — live preserved work released. stderr: %s", errBuf.String())
+				}
+				if got.SnapshotSHA != c.SnapshotSHA {
+					t.Errorf("resolved the wrong binding: %+v", got)
+				}
+				if !hasRegistryBinding(t, root, "ghost-scope") {
+					t.Errorf("the guard released a binding it had decided to adopt")
+				}
+				return
+			}
+			if got != nil {
+				t.Fatalf("ghost binding was adopted (snapshot %s) — the parked scope re-dispatches forever", got.SnapshotSHA)
+			}
+			if hasRegistryBinding(t, root, "ghost-scope") {
+				t.Errorf("the ghost binding survived the refusal — it re-arms on the next wave")
+			}
+			raw, rerr := os.ReadFile(itemPath)
+			if rerr != nil {
+				t.Fatalf("read retired item: %v", rerr)
+			}
+			if !strings.Contains(string(raw), c.SnapshotSHA) {
+				t.Errorf("the read-side release did not preserve the salvage pointer into %s (H2) — it is lost, not released\n%s", itemPath, raw)
+			}
+		})
+	}
+}
+
+func TestReleaseContinuationBindingFor_ADifferentCycleIsNotReleasedNorNoted(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	inbox := filepath.Join(root, ".evolve", "inbox")
+	itemPath := releaseFixtureItem(t, inbox, "scope-a")
+	releaseFixtureBind(t, root, "scope-a", continuation.Continuation{SnapshotSHA: "snap2100", Cycle: 2100})
+	opts := Options{ProjectRoot: root, Stderr: &bytes.Buffer{}}
+
+	_, released, err := ReleaseContinuationBindingFor(opts, ReleaseRequest{ScopeID: "scope-a", Cycle: 2092, Reason: "r", By: "unit"})
+
+	if err != nil || released {
+		t.Fatalf("release = %v, %v; want a mismatch to release nothing", released, err)
+	}
+	if !hasRegistryBinding(t, root, "scope-a") {
+		t.Error("the newer binding was deleted")
+	}
+	if body, _ := os.ReadFile(itemPath); strings.Contains(string(body), "released") {
+		t.Errorf("item = %s; want no release note for a binding that stayed", body)
+	}
+}
+
+func TestReleaseContinuationBindingFor_TheNamedCycleIsReleased(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	inbox := filepath.Join(root, ".evolve", "inbox")
+	releaseFixtureItem(t, inbox, "scope-a")
+	releaseFixtureBind(t, root, "scope-a", continuation.Continuation{SnapshotSHA: "snap2092", Cycle: 2092})
+
+	c, released, err := ReleaseContinuationBindingFor(Options{ProjectRoot: root, Stderr: &bytes.Buffer{}}, ReleaseRequest{ScopeID: "scope-a", Cycle: 2092, Reason: "r", By: "unit"})
+
+	if err != nil || !released || c.Cycle != 2092 || hasRegistryBinding(t, root, "scope-a") {
+		t.Fatalf("release = %+v, %v, %v; want cycle 2092 released", c, released, err)
+	}
+}

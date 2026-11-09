@@ -1,0 +1,131 @@
+package core
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+type inPlaceRepo struct {
+	root        string
+	unformatted string
+	edit        string
+}
+
+func newInPlaceRepo(t *testing.T) inPlaceRepo {
+	t.Helper()
+	root := initDossierRepo(t)
+	r := inPlaceRepo{root: root, unformatted: "package seed\n\nfunc   Ugly( ) int {\n\treturn   1\n}\n", edit: "seed\noperator's uncommitted edit\n"}
+	for rel, content := range map[string]string{"go/go.mod": "module example.com/seed\n\ngo 1.24\n", "go/seed.go": r.unformatted, "README.md": "seed\n"} {
+		p := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gitOutput(t, root, "add", "-A")
+	gitOutput(t, root, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "seed module")
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte(r.edit), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+func (r inPlaceRepo) fingerprint(t *testing.T) string {
+	t.Helper()
+	seed, _ := os.ReadFile(filepath.Join(r.root, "go", "seed.go"))
+	readme, _ := os.ReadFile(filepath.Join(r.root, "README.md"))
+	status := gitOutput(t, r.root, "status", "--porcelain")
+	return string(seed) + "|" + string(readme) + "|" + status + "|" + gitOutput(t, r.root, "rev-list", "--all", "--count")
+}
+
+func gitOutput(t *testing.T, root string, args ...string) string {
+	t.Helper()
+	out, _, err := gitCapture(context.Background(), root, args...)
+	if err != nil {
+		t.Fatalf("git %v: %v", args, err)
+	}
+	return strings.TrimSpace(out)
+}
+
+func TestWorktreeMutators_RefuseTheProjectRoot(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		run  func(t *testing.T, r inPlaceRepo) string
+	}{
+		{"normalizeBuildWorktree (gofmt -w, reset --soft, projection regen)", func(t *testing.T, r inPlaceRepo) string {
+			var sink injectedStderr
+			o := NewOrchestrator(&fakeStorage{}, &fakeLedger{}, buildRunners(nil), WithStderr(&sink))
+			o.normalizeBuildWorktree(ctx, PhaseBuild, CycleState{ActiveWorktree: r.root, WorktreeBaseSHA: gitOutput(t, r.root, "rev-parse", "HEAD")}, r.root)
+			return sink.String()
+		}},
+		{"recoverBuildLeak (git checkout -- / add -f)", func(t *testing.T, r inPlaceRepo) string {
+			if !recoverBuildLeak(ctx, leakRecovery{projectRoot: r.root, worktree: r.root, baseline: map[string]bool{}, authority: sourceWriterAuthority}) {
+				t.Error("an in-place root has nothing to relocate — recovery reports done, never failed")
+			}
+			return "recovered"
+		}},
+		{"worktreeContentSHA (git add -u)", func(t *testing.T, r inPlaceRepo) string {
+			if sha := worktreeContentSHA(ctx, r.root, r.root, t.TempDir()); sha != "" {
+				t.Errorf("no content SHA is written from the operator's index, got %q", sha)
+			}
+			return "no sha"
+		}},
+		{"snapshotPreservedWorktree (add -A + commit)", func(t *testing.T, r inPlaceRepo) string {
+			sha, err := snapshotPreservedWorktree(ctx, r.root, r.root)
+			if err == nil || sha != "" {
+				t.Errorf("a salvage snapshot of the project root is refused, got sha=%q err=%v", sha, err)
+			}
+			if err == nil || !strings.Contains(err.Error(), "the active worktree is the project root — no salvage snapshot") {
+				t.Errorf("the refusal says why: %v", err)
+			}
+			return "refused"
+		}},
+		{"rebaseCycleBranchOntoMain", func(t *testing.T, r inPlaceRepo) string {
+			ok, conflicts := rebaseCycleBranchOntoMain(ctx, r.root, r.root)
+			if ok || len(conflicts) > 0 {
+				t.Errorf("the operator's tree is never rebased, got ok=%v conflict=%v", ok, conflicts)
+			}
+			return "refused"
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newInPlaceRepo(t)
+			before := r.fingerprint(t)
+			tc.run(t, r)
+			if after := r.fingerprint(t); after != before {
+				t.Errorf("the operator's tree changed:\nbefore %q\nafter  %q", before, after)
+			}
+		})
+	}
+}
+
+func TestRecordAuditBinding_InPlaceRootDegradesToNoTreeSHA(t *testing.T) {
+	t.Parallel()
+
+	r := newInPlaceRepo(t)
+	ws := filepath.Join(r.root, ".evolve", "runs", "cycle-7")
+	if err := os.MkdirAll(ws, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "audit-report.md"), []byte("## Verdict\n**PASS**\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	led := &fakeLedger{}
+	o := NewOrchestrator(nil, led, nil)
+	before := r.fingerprint(t)
+	o.emitPhaseBindings(context.Background(), 7, r.root, CycleState{CycleID: 7, WorkspacePath: ws, ActiveWorktree: r.root}, PhaseAudit, VerdictPASS)
+	if len(led.entries) != 1 || led.entries[0].WorktreeTreeSHA != "" {
+		t.Fatalf("binding on an in-place root carries no worktree tree SHA: %+v", led.entries)
+	}
+	if after := r.fingerprint(t); after != before {
+		t.Errorf("the binding staged the operator's index:\nbefore %q\nafter  %q", before, after)
+	}
+}

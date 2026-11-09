@@ -1,0 +1,87 @@
+package advisor
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/config"
+)
+
+func writeRubricLines(b *strings.Builder, cfg config.RoutingConfig) {
+	seen := make(map[string]struct{}, len(cfg.Triggers)+len(cfg.Conditional))
+	for p := range cfg.Conditional {
+		seen[p] = struct{}{}
+	}
+	for p := range cfg.Triggers {
+		seen[p] = struct{}{}
+	}
+	names := make([]string, 0, len(seen))
+	for p := range seen {
+		names = append(names, p)
+	}
+	sort.Strings(names)
+	for _, p := range names {
+		if rule, ok := cfg.Conditional[p]; ok {
+			for _, c := range rule.Clauses() {
+				if op, ok := negateOp(c.Op); ok {
+					fmt.Fprintf(b, "- %s %s %s → skip %s (conditional-mandatory exemption)\n", c.Field, op, c.Value, p)
+				}
+			}
+		}
+		blk := cfg.Triggers[p]
+		if len(blk.InsertWhen) > 0 {
+			fmt.Fprintf(b, "- %s → insert %s\n", joinClauses(blk.InsertWhen), p)
+		}
+		if len(blk.SkipWhen) > 0 {
+			fmt.Fprintf(b, "- %s → skip %s\n", joinClauses(blk.SkipWhen), p)
+		}
+		for _, hint := range blk.RubricHint {
+			fmt.Fprintf(b, "- %s\n", hint)
+		}
+	}
+}
+
+func joinClauses(conditions []config.Condition) string {
+	clauses := make([]string, len(conditions))
+	for i, c := range conditions {
+		clauses[i] = fmt.Sprintf("%s %s %v", c.Field, opSymbol(c.Op), c.Value)
+	}
+	return strings.Join(clauses, " OR ")
+}
+
+func opSymbol(op string) string {
+	switch op {
+	case "eq":
+		return "=="
+	case "ne":
+		return "!="
+	case "gt":
+		return ">"
+	case "gte":
+		return ">="
+	case "lt":
+		return "<"
+	case "lte":
+		return "<="
+	}
+	return op
+}
+
+func negateOp(op string) (string, bool) {
+	switch op {
+	case "==", "eq":
+		return "!=", true
+	case "!=", "ne":
+		return "==", true
+	case ">", "gt":
+		return "<=", true
+	case ">=", "gte":
+		return "<", true
+	case "<", "lt":
+		return ">=", true
+	case "<=", "lte":
+		return ">", true
+	}
+	return "", false
+}

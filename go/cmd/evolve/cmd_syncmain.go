@@ -1,0 +1,302 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/gitexec"
+	"github.com/mickeyyaya/evolve-loop/go/internal/inboxmover"
+	"github.com/mickeyyaya/evolve-loop/go/internal/inboxstamps"
+	"github.com/mickeyyaya/evolve-loop/go/internal/paths"
+	"github.com/mickeyyaya/evolve-loop/go/internal/runlease"
+	"github.com/mickeyyaya/evolve-loop/go/internal/sysexec"
+)
+
+var (
+	syncMainFetchSleep    = time.Sleep
+	syncMainGetwd         = os.Getwd
+	syncMainAbsoluteRoot  = paths.AbsoluteRoot
+	syncMainCodeIndexHost = defaultCodeIndexHost
+)
+
+func runSyncMain(args []string, _ io.Reader, stdout, stderr io.Writer) int {
+	absRoot, asJSON, rc := parseSyncMainArgs(args, stderr)
+	if rc != 0 {
+		return rc
+	}
+
+	git := func(gitArgs ...string) (string, error) {
+		cmd := sysexec.Command(context.Background(), "git", append([]string{"-C", absRoot}, gitArgs...)...)
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+
+	if lease, ok := liveRunLease(absRoot, time.Now()); ok {
+		fmt.Fprintf(stderr, "evolve sync-main: refused — a run lease is live (pid %d, heartbeat fresh); another evolve loop owns this tree.\n", lease.OwnerPID)
+		fmt.Fprintln(stderr, "evolve sync-main:   • let it finish, or `evolve loop --resume` to attach, then retry.")
+		return cliExitRefused
+	}
+
+	stamps, code := refuseDirtBeyondInboxStamps(absRoot, stderr)
+	if code != 0 {
+		return code
+	}
+
+	branch, err := git("rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		fmt.Fprintf(stderr, "evolve sync-main: cannot resolve current branch: %v\n%s", err, branch)
+		return 1
+	}
+	branch = strings.TrimSpace(branch)
+
+	if err := fetchSyncBranch(absRoot, branch, stderr); err != nil {
+		fmt.Fprintf(stderr, "evolve sync-main: %v\n", err)
+		if errors.Is(err, errSyncDetachedHead) {
+			return cliExitRefused
+		}
+		return 1
+	}
+
+	human := humanWriter(stdout, asJSON)
+	landing := stampLanding{root: absRoot, stdout: human, stderr: stderr}
+	merge := func() int { return mergeOrigin(git, branch, stderr) }
+	if code := landing.aroundMerge("origin/"+branch, stamps, merge); code != 0 {
+		return code
+	}
+	if code := finishSyncMain(absRoot, branch, human, stderr); code != 0 || !asJSON {
+		return code
+	}
+	return printVerbJSON("sync-main", syncMainResult{Root: absRoot, Branch: branch}, stdout, stderr)
+}
+
+type syncMainResult struct {
+	Root   string `json:"root"`
+	Branch string `json:"branch"`
+}
+
+var errSyncDetachedHead = errors.New("refused — detached HEAD; check out the branch to sync")
+
+func parseSyncMainArgs(args []string, stderr io.Writer) (string, bool, int) {
+	fs := flag.NewFlagSet("evolve sync-main", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var projectRoot string
+	var asJSON bool
+	fs.StringVar(&projectRoot, "project-root", "", "project root (default: $EVOLVE_PROJECT_ROOT or cwd)")
+	fs.BoolVar(&asJSON, "json", false, "print the result as JSON and no text")
+	if err := fs.Parse(args); err != nil || fs.NArg() > 0 {
+		fmt.Fprintln(stderr, "usage: evolve sync-main [--json] [--project-root P]")
+		return "", false, cliExitUsage
+	}
+	if projectRoot == "" {
+		projectRoot = os.Getenv("EVOLVE_PROJECT_ROOT")
+	}
+	if projectRoot == "" {
+		var err error
+		if projectRoot, err = syncMainGetwd(); err != nil {
+			fmt.Fprintf(stderr, "evolve sync-main: cwd: %v\n", err)
+			return "", false, cliExitIO
+		}
+	}
+	return syncMainAbsoluteRoot("--project-root", projectRoot, func(m string) {
+		fmt.Fprintf(stderr, "evolve sync-main: WARN: %s\n", m)
+	}), asJSON, 0
+}
+
+func finishSyncMain(root, branch string, stdout, stderr io.Writer) int {
+	fmt.Fprintf(stdout, "sync-main: reconciled local %s with origin/%s (merge only; nothing pushed).\n", branch, branch)
+	if branch != codeIndexMainBranch {
+		return 0
+	}
+	return syncMainCodeIndex(root, syncMainCodeIndexHost(), codeIndexRefreshTimeout, stdout, stderr)
+}
+
+func syncMainCodeIndex(root string, host codeIndexHost, timeout time.Duration, stdout, stderr io.Writer) int {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	moved, err := host.refresh(ctx, root)
+	for _, w := range moved.Warnings {
+		fmt.Fprintln(stderr, w)
+	}
+	rc, _ := codeRefreshExit(err)
+	switch rc {
+	case 0:
+		fmt.Fprintf(stdout, "sync-main: moved the code index %s to %s %s, %d commit(s) after %s\n", moved.IndexDir, codeIndexMainRef, shortSHA(moved.To), moved.Behind, shortSHA(moved.From))
+		return 0
+	case codeExitAbsent:
+		fmt.Fprintf(stdout, "sync-main: no code index to refresh: %v\n", err)
+		return 0
+	case codeExitFailed:
+		rc = 1
+	}
+	fmt.Fprintf(stderr, "evolve sync-main: the merge is done, but the code index is not refreshed: %v\n", err)
+	return rc
+}
+
+func fetchSyncBranch(root, branch string, stderr io.Writer) error {
+	if branch == "HEAD" {
+		return errSyncDetachedHead
+	}
+	retry := gitexec.FetchRetry{
+		Sleep: func(d time.Duration) { syncMainFetchSleep(d) },
+		OnRetry: func(attempt, attempts, code int, _ string) {
+			fmt.Fprintf(stderr, "evolve sync-main: retry %d/%d: git fetch origin %s after ref-lock contention rc=%d\n", attempt, attempts-1, branch, code)
+		},
+	}
+	_, gitErr, code, err := gitexec.Default(root).FetchOriginBranch(context.Background(), retry, branch)
+	if err != nil || code != 0 {
+		return fmt.Errorf("git fetch origin %s failed: rc=%d err=%v: %s", branch, code, err, strings.TrimSpace(gitErr))
+	}
+	return nil
+}
+
+func mergeOrigin(git func(...string) (string, error), branch string, stderr io.Writer) int {
+	out, err := git("merge", "--no-edit", "origin/"+branch)
+	if err == nil {
+		return 0
+	}
+	if _, inProgress := git("rev-parse", "-q", "--verify", "MERGE_HEAD"); inProgress != nil {
+		fmt.Fprintf(stderr, "evolve sync-main: refused — git would not merge origin/%s:\n%s", branch, out)
+		return 1
+	}
+	if _, aerr := git("merge", "--abort"); aerr != nil {
+		fmt.Fprintf(stderr, "evolve sync-main: merge conflicted AND abort failed: %v\n%s", aerr, out)
+		return 1
+	}
+	fmt.Fprintf(stderr, "evolve sync-main: refused — merging origin/%s conflicts with local history (aborted cleanly, tree unchanged).\n", branch)
+	fmt.Fprintln(stderr, "evolve sync-main:   • resolve manually, or re-audit the local commit on the new base.")
+	return 1
+}
+
+func liveRunLease(root string, now time.Time) (runlease.Lease, bool) {
+	if ws := liveLeaseWorkspace(root); ws != "" {
+		if lease, ok := runlease.LiveOwner(ws, now); ok {
+			return lease, true
+		}
+	}
+	if live := runlease.LiveRuns(filepath.Join(root, ".evolve", "runs"), now); len(live) > 0 {
+		return live[0].Lease, true
+	}
+	return runlease.Lease{}, false
+}
+
+func liveLeaseWorkspace(root string) string {
+	b, err := os.ReadFile(filepath.Join(root, ".evolve", "cycle-state.json"))
+	if err != nil {
+		return ""
+	}
+	var cs struct {
+		WorkspacePath string `json:"workspace_path"`
+	}
+	if json.Unmarshal(b, &cs) != nil {
+		return ""
+	}
+	return cs.WorkspacePath
+}
+
+func refuseDirtBeyondInboxStamps(root string, stderr io.Writer) ([]inboxstamps.Stamp, int) {
+	g := gitexec.Default(root)
+	partition, err := inboxstamps.Classify(context.Background(), g)
+	if err != nil {
+		fmt.Fprintf(stderr, "evolve sync-main: reading the tree's changes failed: %v\n", err)
+		return nil, 1
+	}
+	if len(partition.Other) > 0 {
+		fmt.Fprintf(stderr, "evolve sync-main: refused — tracked files have uncommitted changes beyond the loop's inbox stamps; commit or stash first:\n  %s\n", strings.Join(partition.Other, "\n  "))
+		return nil, cliExitRefused
+	}
+	if err := inboxstamps.CommitMoves(context.Background(), g, partition.Moved); err != nil {
+		fmt.Fprintf(stderr, "evolve sync-main: recording the loop's quarantine moves failed: %v\n", err)
+		return nil, 1
+	}
+	return partition.Stamps, 0
+}
+
+type stampLanding struct {
+	root           string
+	stdout, stderr io.Writer
+}
+
+func (l stampLanding) aroundMerge(remoteRef string, stamps []inboxstamps.Stamp, merge func() int) int {
+	plan, code := l.prepare(remoteRef, stamps)
+	if code != 0 {
+		return code
+	}
+	if code := merge(); code != 0 {
+		l.restore(plan)
+		return code
+	}
+	return l.replay(plan)
+}
+
+func (l stampLanding) prepare(remoteRef string, stamps []inboxstamps.Stamp) (inboxstamps.Plan, int) {
+	ctx, g := context.Background(), gitexec.Default(l.root)
+	plan, err := inboxstamps.PlanAgainst(ctx, g, stamps, remoteRef)
+	if err == nil {
+		err = plan.Prepare(ctx, g)
+	}
+	if err == nil {
+		err = plan.CommitKept(ctx, g)
+	}
+	if err != nil {
+		fmt.Fprintf(l.stderr, "evolve sync-main: landing the loop's inbox stamps failed: %v\n", err)
+		l.restore(plan)
+		return inboxstamps.Plan{}, 1
+	}
+	reportInboxStamps(l.stdout, "committed %d inbox stamp(s) the loop wrote", plan.Kept)
+	return plan, 0
+}
+
+func (l stampLanding) replay(plan inboxstamps.Plan) int {
+	reportInboxStamps(l.stdout, "dropped %d inbox stamp(s) on items origin retired", plan.Retired)
+	reportInboxStamps(l.stdout, "origin superseded %d inbox stamp(s), changing every field they set", plan.Superseded)
+	err := plan.ApplyReplay(l.root)
+	if err == nil {
+		err = plan.CommitReplay(context.Background(), gitexec.Default(l.root))
+	}
+	if err != nil {
+		fmt.Fprintf(l.stderr, "evolve sync-main: replaying the loop's inbox stamps onto origin's edits failed: %v — every stamp named above was not applied; the rest are in the tree, uncommitted\n", err)
+		return 1
+	}
+	reportInboxStamps(l.stdout, "replayed %d inbox stamp(s) onto origin's edits", plan.Replay)
+	return absorbRootCopiesAfterMerge(l.root, l.stdout, l.stderr)
+}
+
+func (l stampLanding) restore(plan inboxstamps.Plan) {
+	if err := plan.Restore(l.root); err != nil {
+		fmt.Fprintf(l.stderr, "evolve sync-main: restoring the loop's inbox stamps failed: %v\n", err)
+	}
+}
+
+func reportInboxStamps(w io.Writer, format string, stamps []inboxstamps.Stamp) {
+	if len(stamps) > 0 {
+		fmt.Fprintf(w, "sync-main: "+format+": %s\n", len(stamps), strings.Join(inboxstamps.Paths(stamps), ", "))
+	}
+}
+
+func absorbRootCopiesAfterMerge(root string, stdout, stderr io.Writer) int {
+	absorbed, err := inboxmover.AbsorbRootCopies(inboxmover.Options{ProjectRoot: root})
+	reportAbsorbed(stdout, "sync-main", absorbed)
+	if err != nil {
+		fmt.Fprintf(stderr, "evolve sync-main: the merge wrote a claimed inbox item back to the root, and the claim cannot absorb it: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func reportAbsorbed(w io.Writer, prefix string, absorbed []inboxmover.Absorbed) {
+	for _, a := range absorbed {
+		if a.Outcome == inboxmover.AbsorbParked {
+			fmt.Fprintf(w, "%s: %s differs from the claim of cycle-%d: the claim stays, and origin's copy is parked at %s\n", prefix, a.ID, a.Cycle, a.ParkedPath)
+			continue
+		}
+		fmt.Fprintf(w, "%s: removed the root copy of %s, which equals the claim of cycle-%d\n", prefix, a.ID, a.Cycle)
+	}
+}

@@ -1,0 +1,37 @@
+{
+  "name": "behavior-compare",
+  "archetype": "evaluate",
+  "agent": "evolve-behavior-compare",
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/build-report.md",
+      ".evolve/runs/cycle-{cycle}/behavior-baseline.md"
+    ],
+    "signals": []
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/behavior-compare-report.md"
+    ],
+    "signals": [
+      "behavior.preserved",
+      "behavior.delta_count"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Comparison",
+      "Verdict"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "refactor"
+      }
+    ]
+  },
+  "after": "build"
+}

@@ -1,0 +1,244 @@
+package core
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/explanationdocs"
+	"github.com/mickeyyaya/evolve-loop/go/internal/policy"
+)
+
+type walledCorrectionProbe struct {
+	*escalationProbe
+	dispatches int
+	wall       error
+}
+
+func (p *walledCorrectionProbe) Run(ctx context.Context, req PhaseRequest) (PhaseResponse, error) {
+	p.dispatches++
+	if req.CorrectionDirective != "" {
+		if p.wall != nil {
+			return PhaseResponse{}, p.wall
+		}
+		return PhaseResponse{}, wrapTransient(85)
+	}
+	return p.escalationProbe.Run(ctx, req)
+}
+
+func runWalledCorrectionCycle(t *testing.T) (root string, probe *walledCorrectionProbe, runners map[Phase]PhaseRunner, led *fakeLedger, err error) {
+	t.Helper()
+	root = t.TempDir()
+	probe = &walledCorrectionProbe{escalationProbe: &escalationProbe{phase: "build", threshold: 99}}
+	st := &fakeStorage{state: State{LastCycleNumber: 0}}
+	led = &fakeLedger{}
+	runners = buildRunners(nil)
+	runners[PhaseBuild] = probe
+	o := NewOrchestrator(st, led, runners, WithReviewer(probe))
+	_, err = o.RunCycle(context.Background(), CycleRequest{ProjectRoot: root, GoalHash: "g", DisableWorkspaceGuard: true})
+	return root, probe, runners, led, err
+}
+
+func TestRunCycle_WalledCorrectionRedispatch_DefersLikeAFirstDispatch(t *testing.T) {
+	prevHook := QuotaBoundaryCheckpointer
+	t.Cleanup(func() { QuotaBoundaryCheckpointer = prevHook })
+	hookCalls, hookPhase := 0, ""
+	QuotaBoundaryCheckpointer = func(cs CycleState, _ string, _ time.Time) error {
+		hookCalls++
+		hookPhase = cs.Phase
+		return nil
+	}
+
+	root, probe, runners, led, err := runWalledCorrectionCycle(t)
+	if !errors.Is(err, ErrAllFamiliesExhausted) {
+		t.Fatalf("err = %v, want the exhaustion sentinel the loop defers on", err)
+	}
+	if msg := err.Error(); strings.Contains(msg, "every family in the fallback chain returned exit=85") || !strings.Contains(msg, "exit=85") || !strings.Contains(msg, "the dispatch ended at a wall") {
+		t.Fatalf("the pause names the walk that ended on the wall, never claims every family walled: %s", msg)
+	}
+	if hookCalls != 1 || hookPhase != string(PhaseBuild) {
+		t.Fatalf("quota checkpoint calls=%d phase=%q, want one checkpoint at build", hookCalls, hookPhase)
+	}
+	deferred := false
+	for _, e := range led.entries {
+		if e.Kind == "all_families_exhausted" && e.Role == string(PhaseBuild) {
+			deferred = true
+		}
+	}
+	if !deferred {
+		t.Fatalf("ledger %+v lacks kind=all_families_exhausted for build", led.entries)
+	}
+	if calls := runners[PhaseRetro].(*fakeRunner).calls; calls != 0 {
+		t.Fatalf("retro ran %d time(s) on a deferral; a wall is nothing to learn from", calls)
+	}
+	digests, _ := filepath.Glob(filepath.Join(root, ".evolve", "runs", "*", "failure-digest.json"))
+	if len(digests) != 1 {
+		t.Fatalf("digests = %v, want the harness's one worktree digest and nothing from the deferral", digests)
+	}
+	if raw, _ := os.ReadFile(digests[0]); !strings.Contains(string(raw), `"fingerprint":"worktree|`) {
+		t.Fatalf("the only digest must be the harness's worktree one, not the deferral's:\n%s", raw)
+	}
+	if probe.dispatches != 2 {
+		t.Fatalf("build dispatched %d times, want the first dispatch and one walled correction (no burn past the wall)", probe.dispatches)
+	}
+}
+
+type walledGateRunner struct {
+	name  Phase
+	calls int
+}
+
+func (r *walledGateRunner) Name() string { return string(r.name) }
+func (r *walledGateRunner) Run(_ context.Context, req PhaseRequest) (PhaseResponse, error) {
+	r.calls++
+	if r.calls > 1 {
+		return PhaseResponse{}, wrapTransient(85)
+	}
+	return PhaseResponse{Phase: string(r.name), Verdict: VerdictFAIL, ArtifactsDir: req.Workspace}, nil
+}
+
+func TestRunCycle_WalledRemediationRerun_DefersLikeAFirstDispatch(t *testing.T) {
+	prevHook := QuotaBoundaryCheckpointer
+	t.Cleanup(func() { QuotaBoundaryCheckpointer = prevHook })
+	hookCalls := 0
+	QuotaBoundaryCheckpointer = func(CycleState, string, time.Time) error { hookCalls++; return nil }
+
+	wf := policy.WorkflowConfig{RemediationRounds: 1, RemediablePhases: []string{"tdd"}}
+	runners := buildRunners(nil)
+	gate := &walledGateRunner{name: PhaseTDD}
+	runners[PhaseTDD] = gate
+	runners[PhaseBuild] = &scriptedRunner{name: PhaseBuild, verdicts: []string{VerdictPASS}}
+	led := &fakeLedger{}
+	o := NewOrchestrator(&fakeStorage{}, led, runners, WithWorkflowConfig(wf))
+	_, err := o.RunCycle(context.Background(), CycleRequest{ProjectRoot: t.TempDir(), GoalHash: "g"})
+	if !errors.Is(err, ErrAllFamiliesExhausted) {
+		t.Fatalf("err = %v, want the exhaustion sentinel: a walled re-run is a deferral, not \"the original FAIL stands\"", err)
+	}
+	if !strings.Contains(err.Error(), "bridge: launch exit=85") {
+		t.Fatalf("the remediation pause carries the walled re-run's own error: %v", err)
+	}
+	if hookCalls != 1 {
+		t.Fatalf("quota checkpoint calls=%d, want 1", hookCalls)
+	}
+	deferred := false
+	for _, e := range led.entries {
+		if e.Kind == "all_families_exhausted" && e.Role == string(PhaseTDD) {
+			deferred = true
+		}
+	}
+	if !deferred {
+		t.Fatalf("ledger %+v lacks kind=all_families_exhausted for tdd", led.entries)
+	}
+	if calls := runners[PhaseRetro].(*fakeRunner).calls; calls != 0 {
+		t.Fatalf("retro ran %d time(s) on a deferral", calls)
+	}
+	if gate.calls != 2 {
+		t.Fatalf("gate dispatched %d times, want the FAIL and one walled re-run", gate.calls)
+	}
+}
+
+func TestReviewResumedDeliverable_WalledCorrection_ReturnsTheExhaustionSentinel(t *testing.T) {
+	t.Parallel()
+
+	reviewer := &rejectFirstResumedBuild{}
+	o := NewOrchestrator(&fakeStorage{}, &fakeLedger{}, buildRunners(nil))
+	o.reviewer = reviewer
+	cs := CycleState{
+		CycleID: 9, RunID: "run-9", WorkspacePath: t.TempDir(),
+		ExplanationDocumentationVersion: explanationdocs.CurrentContractVersion,
+	}
+	_, err := o.reviewResumedDeliverable(resumedDeliverable{ctx: context.Background(), projectRoot: t.TempDir(), cycle: 9, cs: cs, phase: PhaseBuild, runner: &fakeRunner{name: string(PhaseBuild), failErr: wrapTransient(85), failUntil: 99}, req: PhaseRequest{Workspace: cs.WorkspacePath}, resp: PhaseResponse{Phase: string(PhaseBuild), Verdict: VerdictPASS}, baseline: nil, count: (&cycleRun{}).countDispatch, predicates: predicateBase{}})
+	if !errors.Is(err, ErrAllFamiliesExhausted) {
+		t.Fatalf("err = %v, want the exhaustion sentinel the resume path defers on", err)
+	}
+}
+
+func TestRunCycleFromPhase_WalledResumedCorrection_Defers(t *testing.T) {
+	prevHook := QuotaBoundaryCheckpointer
+	t.Cleanup(func() { QuotaBoundaryCheckpointer = prevHook })
+	hookCalls := 0
+	QuotaBoundaryCheckpointer = func(CycleState, string, time.Time) error { hookCalls++; return nil }
+
+	workspace := t.TempDir()
+	storage := &fakeStorage{cycleState: CycleState{CycleID: 5, RunID: "run-5", WorkspacePath: workspace}}
+	probe := &walledCorrectionProbe{escalationProbe: &escalationProbe{phase: string(PhaseTDD), threshold: 99}}
+	runners := buildRunners(nil)
+	runners[PhaseTDD] = probe
+	led := &fakeLedger{}
+	o := NewOrchestrator(storage, led, runners, WithReviewer(probe))
+	_, err := o.RunCycleFromPhase(context.Background(), CycleRequest{ProjectRoot: t.TempDir()}, &ResumePoint{Phase: string(PhaseTDD), CycleID: 5})
+	if !errors.Is(err, ErrAllFamiliesExhausted) {
+		t.Fatalf("err = %v, want the exhaustion sentinel", err)
+	}
+	if msg := err.Error(); !strings.Contains(msg, "bridge: launch exit=85") || strings.Count(msg, ErrAllFamiliesExhausted.Error()) != 1 {
+		t.Fatalf("the resumed pause names the walk once and the sentinel once: %s", msg)
+	}
+	if hookCalls != 1 {
+		t.Fatalf("quota checkpoint calls=%d, want 1: the resumed cycle must stay resumable", hookCalls)
+	}
+	deferred := false
+	for _, e := range led.entries {
+		if e.Kind == "all_families_exhausted" && e.Role == string(PhaseTDD) {
+			deferred = true
+		}
+	}
+	if !deferred {
+		t.Fatalf("ledger %+v lacks kind=all_families_exhausted for tdd", led.entries)
+	}
+}
+
+func TestRunCycle_FailedCorrectionRedispatch_IsNotADeferral(t *testing.T) {
+	prevHook := QuotaBoundaryCheckpointer
+	t.Cleanup(func() { QuotaBoundaryCheckpointer = prevHook })
+	hookCalls := 0
+	QuotaBoundaryCheckpointer = func(CycleState, string, time.Time) error { hookCalls++; return nil }
+
+	probe := &walledCorrectionProbe{escalationProbe: &escalationProbe{phase: "build", threshold: 99}, wall: wrapTransient(80)}
+	runners := buildRunners(nil)
+	runners[PhaseBuild] = probe
+	led := &fakeLedger{}
+	o := NewOrchestrator(&fakeStorage{state: State{LastCycleNumber: 0}}, led, runners, WithReviewer(probe))
+	_, err := o.RunCycle(context.Background(), CycleRequest{ProjectRoot: t.TempDir(), GoalHash: "g", DisableWorkspaceGuard: true})
+	if err == nil || errors.Is(err, ErrAllFamiliesExhausted) {
+		t.Fatalf("err = %v, want a failure that is not the exhaustion sentinel", err)
+	}
+	if hookCalls != 0 {
+		t.Fatalf("a non-wall failure wrote %d quota checkpoint(s)", hookCalls)
+	}
+	for _, e := range led.entries {
+		if e.Kind == "all_families_exhausted" {
+			t.Fatalf("a non-wall failure was recorded as a deferral: %+v", e)
+		}
+	}
+}
+
+func TestRunCycleFromPhase_AWalledResumedDispatchNamesItsWalk(t *testing.T) {
+	prevHook := QuotaBoundaryCheckpointer
+	t.Cleanup(func() { QuotaBoundaryCheckpointer = prevHook })
+	QuotaBoundaryCheckpointer = func(CycleState, string, time.Time) error { return nil }
+	storage := &fakeStorage{cycleState: CycleState{CycleID: 6, RunID: "run-6", WorkspacePath: t.TempDir()}}
+	runners := buildRunners(nil)
+	runners[PhaseTDD] = &fakeRunner{name: string(PhaseTDD), failErr: wrapTransient(85), failUntil: 99}
+	o := NewOrchestrator(storage, &fakeLedger{}, runners)
+
+	_, err := o.RunCycleFromPhase(context.Background(), CycleRequest{ProjectRoot: t.TempDir()}, &ResumePoint{Phase: string(PhaseTDD), CycleID: 6})
+
+	if !errors.Is(err, ErrAllFamiliesExhausted) {
+		t.Fatalf("err = %v, want the exhaustion sentinel", err)
+	}
+	if msg := err.Error(); !strings.Contains(msg, "bridge: launch exit=85") || strings.Count(msg, ErrAllFamiliesExhausted.Error()) != 1 {
+		t.Fatalf("the resumed dispatch's pause names its walk once and the sentinel once: %s", msg)
+	}
+}
+
+func TestErrAllFamiliesExhausted_ClaimsOnlyThatTheDispatchEndedAtAWall(t *testing.T) {
+	t.Parallel()
+
+	if msg := ErrAllFamiliesExhausted.Error(); strings.Contains(msg, "all CLI families") || !strings.Contains(msg, "ended at a wall") {
+		t.Fatalf("the sentinel must not claim every family walled: %q", msg)
+	}
+}

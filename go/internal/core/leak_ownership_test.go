@@ -1,0 +1,450 @@
+package core
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/guards/treediff"
+	"github.com/mickeyyaya/evolve-loop/go/internal/runlease"
+)
+
+func laneOneEightOneOne() mainTreeOwnership {
+	return mainTreeOwnership{
+		cycle: 1811,
+		items: map[string]bool{"router-silent-errors": true, "router-digest-slug": true},
+		mints: map[string]bool{"xlane-mint": true},
+	}
+}
+
+func TestMainTreeOwnership_ForeignOwnerNamesEveryOwnerKeyedClass(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		path      string
+		foreign   bool
+		ownerHint string
+	}{
+		{"own eval by committed id", ".evolve/evals/router-silent-errors.md", false, ""},
+		{"own eval by materialized slug", ".evolve/evals/router-digest-slug.md", false, ""},
+		{"sibling eval", ".evolve/evals/phasespec-roots-silent-policy-error.md", true, "phasespec-roots-silent-policy-error"},
+		{"nested eval path is not slug-keyed", ".evolve/evals/archive/old.md", false, ""},
+		{"non-markdown eval file is not slug-keyed", ".evolve/evals/helper.sh", false, ""},
+		{"own predicate package", "go/acs/cycle1811/predicates_test.go", false, ""},
+		{"sibling predicate package", "go/acs/cycle1812/predicates_test.go", true, "cycle 1812"},
+		{"standing regression predicates are not cycle-keyed", "go/acs/regression/gate_test.go", false, ""},
+		{"own change record", "docs/explain/builds/cycle-1811-01m48p8jh4bj25x1btqs19nssw.md", false, ""},
+		{"sibling change record", "docs/explain/builds/cycle-1812-01m48p8jhdj97bg0evcbbetkyr.md", true, "cycle 1812"},
+		{"a record of this cycle number is this cycle's", "docs/explain/builds/cycle-1811-01m48p8jhdj97bg0evcbbetkyr.md", false, ""},
+		{"registered mint", ".evolve/phases/xlane-mint/phase.json", true, "mint"},
+		{"unregistered phase config", ".evolve/phases/novel/phase.json", false, ""},
+		{"own dossier", "knowledge-base/cycles/cycle-1811.json", false, ""},
+		{"another cycle's dossier", "knowledge-base/cycles/cycle-1812.md", true, "dossier of cycle 1812"},
+		{"a dossier-like name with a suffix is not cycle-keyed", "knowledge-base/cycles/cycle-1812-notes.md", false, ""},
+		{"a nested dossier path is not cycle-keyed", "knowledge-base/cycles/old/cycle-1812.md", false, ""},
+		{"source file", "go/internal/router/router.go", false, ""},
+	}
+	owner := laneOneEightOneOne()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, foreign := owner.foreignOwner(tc.path)
+			if foreign != tc.foreign {
+				t.Fatalf("foreignOwner(%q) foreign=%v, want %v (owner %q)", tc.path, foreign, tc.foreign, got)
+			}
+			if !strings.Contains(got, tc.ownerHint) || (tc.foreign && got == "") {
+				t.Fatalf("foreignOwner(%q) owner=%q, want it to name %q", tc.path, got, tc.ownerHint)
+			}
+		})
+	}
+}
+
+func TestMainTreeOwnership_UnknownIdentityClaimsLikeASingleWriter(t *testing.T) {
+	t.Parallel()
+
+	unknown := mainTreeOwnership{}
+	for _, p := range []string{
+		".evolve/evals/phasespec-roots-silent-policy-error.md",
+		"go/acs/cycle1812/predicates_test.go",
+		"docs/explain/builds/cycle-1812-01m48p8jhdj97bg0evcbbetkyr.md",
+		".evolve/phases/xlane-mint/phase.json",
+	} {
+		if owner, foreign := unknown.foreignOwner(p); foreign {
+			t.Errorf("with no lane identity %q must stay claimable; got foreign owner %q", p, owner)
+		}
+	}
+	if !unknown.ownsEval(".evolve/evals/anything.md") {
+		t.Error("with no lane identity the lane owns every eval it finds (single-writer rule)")
+	}
+}
+
+func TestMainTreeOwnership_OwnsEvalOnlyForTheLanesOwnSlugs(t *testing.T) {
+	t.Parallel()
+
+	owner := laneOneEightOneOne()
+	cases := map[string]bool{
+		".evolve/evals/router-silent-errors.md":                true,
+		".evolve/evals/router-digest-slug.md":                  true,
+		".evolve/evals/phasespec-roots-silent-policy-error.md": false,
+		"go/internal/router/router.go":                         false,
+		".evolve/evals/archive/router-silent-errors.md":        false,
+	}
+	for p, want := range cases {
+		if got := owner.ownsEval(p); got != want {
+			t.Errorf("ownsEval(%q)=%v, want %v", p, got, want)
+		}
+	}
+}
+
+func TestLaneOwnership_ItemsAreTheCommittedSetPlusMaterializedEvals(t *testing.T) {
+	t.Parallel()
+
+	workspace := t.TempDir()
+	pin, err := json.Marshal(LaneScope{TodoIDs: []string{"pinned-item"}, GoalHash: "g"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTreeFile(t, workspace, LaneScopeFile, string(pin))
+	writeTreeFile(t, workspace, "triage-decision.json", `{"top_n":[{"id":"working-sub-id"}]}`)
+	writeTreeFile(t, workspace, ".evolve/evals/decomposed-slug.md", "eval\n")
+	writeTreeFile(t, workspace, ".evolve/evals/notes.txt", "not an eval\n")
+	mints := map[string]bool{"xlane-mint": true}
+
+	got := laneOwnership(CycleState{CycleID: 1811, RunID: "01run", WorkspacePath: workspace}, mints)
+
+	want := mainTreeOwnership{
+		cycle: 1811,
+		items: map[string]bool{"pinned-item": true, "decomposed-slug": true},
+		mints: mints,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("laneOwnership = %+v, want %+v", got, want)
+	}
+}
+
+func TestLaneOwnership_TriageDecisionBindsWhenNoPinAndDeferralsAreNotOwned(t *testing.T) {
+	t.Parallel()
+
+	workspace := t.TempDir()
+	writeTreeFile(t, workspace, "triage-decision.json",
+		`{"top_n":[{"id":"committed-item"},{"id":"deferred-item"}],"deferred":[{"id":"deferred-item"}]}`)
+
+	got := laneOwnership(CycleState{CycleID: 7, WorkspacePath: workspace}, nil)
+
+	if want := map[string]bool{"committed-item": true}; !reflect.DeepEqual(got.items, want) {
+		t.Fatalf("items = %v, want %v", got.items, want)
+	}
+}
+
+func TestLaneOwnership_NoRecordedIdentityIsUnknownNotEmpty(t *testing.T) {
+	t.Parallel()
+
+	got := laneOwnership(CycleState{CycleID: 7, WorkspacePath: t.TempDir()}, nil)
+
+	if got.items != nil {
+		t.Fatalf("a lane with no pin, no decision and no materialized eval has unknown items, got %v", got.items)
+	}
+}
+
+func TestMainTreeOwnership_HeldBySiblingNeedsALiveHolder(t *testing.T) {
+	t.Parallel()
+
+	siblings := liveSiblings{
+		projectRoot: "/plane",
+		runs: map[string]bool{
+			filepath.Clean(RunWorkspacePath("/plane", 1812)): true,
+			filepath.Clean(RunWorkspacePath("/plane", 1811)): true,
+		},
+		items: map[string]bool{"phasespec-roots-silent-policy-error": true, "router-silent-errors": true},
+	}
+	cases := map[string]bool{
+		".evolve/evals/phasespec-roots-silent-policy-error.md":         true,
+		".evolve/evals/made-up-slug.md":                                false,
+		".evolve/evals/router-silent-errors.md":                        false,
+		"go/acs/cycle1811/predicates_test.go":                          false,
+		"docs/explain/builds/cycle-1811-01m48p8jh4bj25x1btqs19nssw.md": false,
+		"go/acs/cycle1812/predicates_test.go":                          true,
+		"go/acs/cycle1700/predicates_test.go":                          false,
+		"docs/explain/builds/cycle-1812-01m48p8jhdj97bg0evcbbetkyr.md": true,
+		"docs/explain/builds/cycle-1700-01m48p8jhdj97bg0evcbbetkyr.md": false,
+		"knowledge-base/cycles/cycle-1700.json":                        false,
+		"knowledge-base/cycles/cycle-1812.md":                          true,
+		"knowledge-base/cycles/cycle-1811.json":                        false,
+		".evolve/phases/xlane-mint/phase.json":                         true,
+		"go/internal/router/router.go":                                 false,
+	}
+	owner := laneOneEightOneOne()
+	for p, want := range cases {
+		if got := owner.heldBySibling(p, siblings); got != want {
+			t.Errorf("heldBySibling(%q)=%v, want %v", p, got, want)
+		}
+	}
+}
+
+func writeTreeFile(t *testing.T, root, rel, body string) {
+	t.Helper()
+	p := filepath.Join(root, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeRunLease(t *testing.T, runDir string, heartbeat time.Time) {
+	t.Helper()
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := runlease.Write(runDir, runlease.Lease{RunID: filepath.Base(runDir), OwnerPID: os.Getpid()}, heartbeat); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLiveSiblingsOf_ReadsOnlyLiveRunsOtherThanThisLane(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	now := time.Now()
+	own, live, stale, unleased := RunWorkspacePath(root, 1811), RunWorkspacePath(root, 1812), RunWorkspacePath(root, 1700), RunWorkspacePath(root, 1800)
+	for dir, slug := range map[string]string{own: "router-silent-errors", live: "phasespec-roots-silent-policy-error", stale: "stale-item", unleased: "unleased-item"} {
+		pin, err := json.Marshal(LaneScope{TodoIDs: []string{slug}, GoalHash: "g"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeTreeFile(t, dir, LaneScopeFile, string(pin))
+	}
+	writeTreeFile(t, live, ".evolve/evals/phasespec-decomposed.md", "eval\n")
+	writeRunLease(t, own, now)
+	writeRunLease(t, live, now)
+	writeRunLease(t, stale, now.Add(-time.Hour))
+
+	got := liveSiblingsOf(root, own, now)
+
+	want := liveSiblings{
+		projectRoot: root,
+		runs:        map[string]bool{filepath.Clean(live): true},
+		items:       map[string]bool{"phasespec-roots-silent-policy-error": true, "phasespec-decomposed": true},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("liveSiblingsOf = %+v, want %+v", got, want)
+	}
+}
+
+func TestEvalFilePath_IsTheWorkspaceEvalHome(t *testing.T) {
+	t.Parallel()
+
+	if got, want := EvalFilePath("/ws", "router-silent-errors"), filepath.Join("/ws", ".evolve", "evals", "router-silent-errors.md"); got != want {
+		t.Fatalf("EvalFilePath = %q, want %q", got, want)
+	}
+}
+
+func TestLaneOwnership_MaterializedEvalsAloneMakeTheIdentityKnown(t *testing.T) {
+	t.Parallel()
+
+	workspace := t.TempDir()
+	writeTreeFile(t, workspace, evalsDir+"materialized-slug.md", "eval\n")
+
+	got := laneOwnership(CycleState{CycleID: 7, WorkspacePath: workspace}, nil)
+
+	if want := map[string]bool{"materialized-slug": true}; !reflect.DeepEqual(got.items, want) {
+		t.Fatalf("items = %v, want %v", got.items, want)
+	}
+	if owner, foreign := got.foreignOwner(evalsDir + "another-slug.md"); !foreign {
+		t.Fatalf("an eval this lane never materialized must not be claimable once its identity is known; owner=%q", owner)
+	}
+}
+
+func TestCycleRun_RecoveryBaselineNeedsASnapshotOfACheckout(t *testing.T) {
+	t.Parallel()
+
+	guard := treediff.New(defaultGitDirtyPaths)
+	checkout := &cycleRun{checkout: &checkoutDecision{decided: true, checkout: true}}
+	if got, want := checkout.recoveryBaselineFor(guard, []string{"operator-notes.md"}), map[string]bool{"operator-notes.md": true}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("recoveryBaselineFor = %v, want %v", got, want)
+	}
+	if got := checkout.recoveryBaselineFor(guard, nil); got == nil || len(got) != 0 {
+		t.Fatalf("a snapshot of a clean tree is an empty baseline, not a missing one; got %v", got)
+	}
+	if got := checkout.recoveryBaselineFor(nil, nil); got != nil {
+		t.Errorf("no snapshot taken: baseline = %v, want nil (recovery must be skipped)", got)
+	}
+	noCheckout := &cycleRun{checkout: &checkoutDecision{decided: true, checkout: false}}
+	if got := noCheckout.recoveryBaselineFor(guard, []string{"operator-notes.md"}); got != nil {
+		t.Errorf("a root with no git checkout has no main tree to recover: baseline = %v, want nil", got)
+	}
+}
+
+func TestFilterRealLeaks_AnotherCyclesDossierIsNotThisLanesLeakButItsOwnIs(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	for _, cycle := range []int{1812, 1700} {
+		if err := os.MkdirAll(RunWorkspacePath(root, cycle), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exempt := laneOneEightOneOne().exemptions(root, RunWorkspacePath(root, 1811), nil)
+	leaked := []string{
+		"knowledge-base/cycles/cycle-1812.json",
+		"knowledge-base/cycles/cycle-1812.md",
+		"knowledge-base/cycles/cycle-1700.json",
+		"knowledge-base/cycles/cycle-9999.json",
+		"knowledge-base/cycles/cycle-1811.json",
+		"knowledge-base/cycles/notes.md",
+		"go/internal/router/router.go",
+	}
+	real, waived := filterRealLeaks(leaked, exempt, io.Discard)
+	want := []string{"knowledge-base/cycles/cycle-9999.json", "knowledge-base/cycles/cycle-1811.json", "knowledge-base/cycles/notes.md", "go/internal/router/router.go"}
+	if !reflect.DeepEqual(real, want) || waived != 0 {
+		t.Errorf("real leaks = %v (waived %d), want %v: a dossier of a real other cycle (live or with a run directory) belongs to that cycle; a cycle that does not exist and this cycle's own file stay leaks", real, waived, want)
+	}
+}
+
+func writeLaneClaim(t *testing.T, root string, cycle int, id string, files ...string) {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{"id": id, "files": files})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTreeFile(t, root, ".evolve/inbox/processing/cycle-"+strconv.Itoa(cycle)+"/"+id+".json", string(body))
+}
+
+func writeGoalPin(t *testing.T, root string, cycle int, goal string, ids ...string) {
+	t.Helper()
+	pin, err := json.Marshal(LaneScope{TodoIDs: ids, GoalHash: goal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTreeFile(t, RunWorkspacePath(root, cycle), LaneScopeFile, string(pin))
+}
+
+func TestFilterRealLeaks_OnlyAFileALiveSameGoalSiblingNamesIsNotThisLanesLeak(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	writeGoalPin(t, root, 1811, "g", "router-silent-errors")
+	writeLaneClaim(t, root, 1811, "router-silent-errors", "go/internal/router/", "go/internal/shared/both.go", "go/internal/router2/x.go")
+	writeGoalPin(t, root, 1812, "g", "phasespec-roots")
+	writeLaneClaim(t, root, 1812, "phasespec-roots", "go/internal/phasespec/roots.go", "go/internal/shared/both.go", "go/internal/guards/role.go", "go/internal/core", "go/internal/router2/x_test.go")
+	writeGoalPin(t, root, 1814, "other", "other-goal")
+	writeLaneClaim(t, root, 1814, "other-goal", "go/internal/other/y.go")
+	writeLaneClaim(t, root, 1700, "stale-lane", "go/internal/stale/x.go")
+	for _, cycle := range []int{1812, 1814} {
+		writeRunLease(t, RunWorkspacePath(root, cycle), time.Now())
+	}
+	writeRunLease(t, RunWorkspacePath(root, 1700), time.Now().Add(-24*time.Hour))
+	adhoc := filepath.Join(filepath.Dir(RunWorkspacePath(root, 1812)), "adhoc")
+	writeRunLease(t, adhoc, time.Now())
+	writeTreeFile(t, adhoc, LaneScopeFile, `{"goal_hash":"g"}`)
+	writeGoalPin(t, root, 1813, "g")
+	writeTreeFile(t, root, ".evolve/inbox/processing/cycle-1813", "a file where the claims dir must be")
+	writeRunLease(t, RunWorkspacePath(root, 1813), time.Now())
+	exempt := guardedLaneOneEightOneOne().exemptions(root, RunWorkspacePath(root, 1811), nil)
+	leaked := []string{
+		"go/internal/phasespec/roots.go",
+		"go/internal/core/cyclerun.go",
+		"go/internal/router/router.go",
+		"go/internal/shared/both.go",
+		"go/internal/guards/role.go",
+		"go/internal/router2/x_test.go",
+		"go/internal/other/y.go",
+		"go/internal/stale/x.go",
+		"docs/nobody.md",
+	}
+	var warn strings.Builder
+
+	real, waived := filterRealLeaks(leaked, exempt, &warn)
+
+	want := leaked[1:]
+	if !reflect.DeepEqual(real, want) || waived != 0 {
+		t.Errorf("real leaks = %v (waived %d), want %v: only an unprotected file that a live sibling of this goal names exactly, and that this lane does not hold, is the sibling's", real, waived, want)
+	}
+	if got := warn.String(); !strings.Contains(got, `"go/internal/phasespec/roots.go"`) || !strings.Contains(got, "cycle 1812") || strings.Count(got, "excused") != 1 {
+		t.Errorf("the guard must WARN once, naming the excused path and its holder; got %q", got)
+	}
+}
+
+func guardedLaneOneEightOneOne() mainTreeOwnership {
+	owner := laneOneEightOneOne()
+	owner.protected = func(p string) bool { return strings.HasPrefix(p, "go/internal/guards/") }
+	return owner
+}
+
+func TestFilterRealLeaks_ALaneWithoutAKnownScopeOrSurfaceIsChargedForEveryUnkeyedPath(t *testing.T) {
+	t.Parallel()
+	const theirs = "go/internal/phasespec/roots.go"
+	cases := map[string]struct {
+		ownClaims func(t *testing.T, root string)
+		owner     mainTreeOwnership
+	}{
+		"an unreadable own scope": {
+			ownClaims: func(t *testing.T, root string) {
+				writeTreeFile(t, root, ".evolve/inbox/processing/cycle-1811", "a file where the claims dir must be")
+			},
+			owner: guardedLaneOneEightOneOne(),
+		},
+		"an empty own scope": {
+			ownClaims: func(*testing.T, string) {},
+			owner:     guardedLaneOneEightOneOne(),
+		},
+		"no goal hash on this lane's pin": {
+			ownClaims: func(t *testing.T, root string) {
+				writeGoalPin(t, root, 1811, "", "router-silent-errors")
+				writeLaneClaim(t, root, 1811, "router-silent-errors", "go/internal/router/")
+			},
+			owner: guardedLaneOneEightOneOne(),
+		},
+		"no protected-surface rule": {
+			ownClaims: func(t *testing.T, root string) {
+				writeLaneClaim(t, root, 1811, "router-silent-errors", "go/internal/router/")
+			},
+			owner: laneOneEightOneOne(),
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			writeGoalPin(t, root, 1811, "g", "router-silent-errors")
+			tc.ownClaims(t, root)
+			writeGoalPin(t, root, 1812, "g", "phasespec-roots")
+			writeLaneClaim(t, root, 1812, "phasespec-roots", theirs)
+			writeRunLease(t, RunWorkspacePath(root, 1812), time.Now())
+			exempt := tc.owner.exemptions(root, RunWorkspacePath(root, 1811), nil)
+
+			real, _ := filterRealLeaks([]string{theirs}, exempt, io.Discard)
+
+			if !reflect.DeepEqual(real, []string{theirs}) {
+				t.Errorf("real leaks = %v: with %s the lane holds every unkeyed path, as the single-writer rule says", real, name)
+			}
+		})
+	}
+}
+
+func TestRecoverPath_LeavesAPathAnotherLaneHoldsAndNamesTheHolder(t *testing.T) {
+	t.Parallel()
+	var warn strings.Builder
+	r := leakRecovery{
+		warn:      &warn,
+		ownership: laneOneEightOneOne(),
+		exempt: leakExemptions{holder: func(p string) (string, bool) {
+			return "the declared scope of cycle 1812", p == "go/internal/phasespec/roots.go"
+		}},
+	}
+
+	stage, recovered := r.recoverPath(context.Background(), "??", "go/internal/phasespec/roots.go")
+
+	if stage || !recovered {
+		t.Errorf("recoverPath = stage %v, recovered %v; want the path left in place and the recovery clean", stage, recovered)
+	}
+	if got := warn.String(); !strings.Contains(got, "go/internal/phasespec/roots.go") || !strings.Contains(got, "cycle 1812") {
+		t.Errorf("recovery must name the path and its holder; got %q", got)
+	}
+}

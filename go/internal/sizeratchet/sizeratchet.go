@@ -1,0 +1,180 @@
+// Package sizeratchet enforces the 50-line function limit across a whole Go
+// module: a function past MaxLines fails unless it is a listed offender, and a
+// listed offender's allowance may only shrink until the entry disappears.
+package sizeratchet
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+)
+
+const MaxLines = 50
+
+type FuncSpan struct {
+	Key   string
+	Lines int
+}
+
+func Walk(root string) ([]FuncSpan, error) {
+	fset := token.NewFileSet()
+	var spans []FuncSpan
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		name := d.Name()
+		if d.IsDir() {
+			if path != root && skipDir(name) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !measured(name) {
+			return nil
+		}
+		fileSpans, err := walkFile(fset, root, path)
+		spans = append(spans, fileSpans...)
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("sizeratchet: walk %s: %w", root, err)
+	}
+	return spans, nil
+}
+
+func skipDir(name string) bool {
+	return name == "vendor" || name == "testdata" || strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_")
+}
+
+func walkFile(fset *token.FileSet, root, path string) ([]FuncSpan, error) {
+	rel, err := filepath.Rel(root, filepath.Dir(path))
+	if err != nil {
+		return nil, err
+	}
+	return parseSpans(fset, filepath.ToSlash(rel), path, nil)
+}
+
+func parseSpans(fset *token.FileSet, dir, name string, src any) ([]FuncSpan, error) {
+	file, err := parser.ParseFile(fset, name, src, parser.SkipObjectResolution)
+	if err != nil {
+		return nil, err
+	}
+	var spans []FuncSpan
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil {
+			continue
+		}
+		lines := fset.Position(fn.End()).Line - fset.Position(fn.Pos()).Line + 1
+		spans = append(spans, FuncSpan{Key: funcKey(dir, fn), Lines: lines})
+	}
+	return spans, nil
+}
+
+func funcKey(dir string, fn *ast.FuncDecl) string {
+	if fn.Recv == nil || len(fn.Recv.List) == 0 {
+		return dir + "." + fn.Name.Name
+	}
+	expr := fn.Recv.List[0].Type
+	for {
+		switch e := expr.(type) {
+		case *ast.StarExpr:
+			expr = e.X
+		case *ast.ParenExpr:
+			expr = e.X
+		case *ast.IndexExpr:
+			expr = e.X
+		case *ast.IndexListExpr:
+			expr = e.X
+		case *ast.Ident:
+			return dir + "." + e.Name + "." + fn.Name.Name
+		default:
+			return fmt.Sprintf("%s.%T.%s", dir, e, fn.Name.Name)
+		}
+	}
+}
+
+func LoadOffenders(path string) (map[string]int, error) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("sizeratchet: read offender list: %w", err)
+	}
+	return parseOffenders(body, path)
+}
+
+func parseOffenders(body []byte, name string) (map[string]int, error) {
+	var offenders map[string]int
+	if err := json.Unmarshal(body, &offenders); err != nil {
+		return nil, fmt.Errorf("sizeratchet: parse offender list %s: %w", name, err)
+	}
+	if offenders == nil {
+		return nil, fmt.Errorf("sizeratchet: offender list %s is not a JSON object", name)
+	}
+	for key, allowance := range offenders {
+		if allowance <= MaxLines {
+			return nil, fmt.Errorf("sizeratchet: offender list %s: %s allowance %d is not over %d; remove the entry", name, key, allowance, MaxLines)
+		}
+	}
+	return offenders, nil
+}
+
+func sizes(spans []FuncSpan) map[string]int {
+	out := make(map[string]int, len(spans))
+	for _, s := range spans {
+		if s.Lines > out[s.Key] {
+			out[s.Key] = s.Lines
+		}
+	}
+	return out
+}
+
+func Check(spans []FuncSpan, offenders map[string]int) error {
+	current := sizes(spans)
+	var problems []string
+	for key, n := range current {
+		if _, listed := offenders[key]; !listed && n > MaxLines {
+			problems = append(problems, fmt.Sprintf("%s is %d lines > %d: shrink it to %d or fewer", key, n, MaxLines, MaxLines))
+		}
+	}
+	for key, allowance := range offenders {
+		if problem := listedProblem(key, current[key], allowance); problem != "" {
+			problems = append(problems, problem)
+		}
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	sort.Strings(problems)
+	return errors.New("sizeratchet: function-size ratchet violated (allowances live in " + OffendersRelPath + " under the module root):\n  " +
+		strings.Join(problems, "\n  "))
+}
+
+func listedProblem(key string, n, allowance int) string {
+	if n > allowance {
+		return fmt.Sprintf("%s grew to %d lines > allowance %d: shrink it back; allowances may only shrink", key, n, allowance)
+	}
+	return ""
+}
+
+const OffendersRelPath = "internal/sizeratchet/offenders.json"
+
+func Scan(root string) error {
+	spans, err := Walk(root)
+	if err != nil {
+		return err
+	}
+	offenders, err := LoadOffenders(filepath.Join(root, filepath.FromSlash(OffendersRelPath)))
+	if err != nil {
+		return err
+	}
+	return Check(spans, offenders)
+}

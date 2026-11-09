@@ -1,0 +1,37 @@
+{
+  "name": "metric-tree",
+  "catalog": "on-demand",
+  "archetype": "evaluate",
+  "agent": "evolve-metric-tree",
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/scout-report.md"
+    ],
+    "signals": []
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/metric-tree-report.md"
+    ],
+    "signals": [
+      "metric.inputs_count"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "North Star Metric",
+      "Input Metrics",
+      "Guardrail Metrics"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "product-discovery"
+      }
+    ]
+  },
+  "after": "triage"
+}

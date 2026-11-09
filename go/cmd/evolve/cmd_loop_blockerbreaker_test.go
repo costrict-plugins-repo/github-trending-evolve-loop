@@ -1,0 +1,110 @@
+package main
+
+import (
+	"io"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+)
+
+func writeDigestFixture(t *testing.T, evolveDir string, cycle int, fingerprint, preClass string) {
+	t.Helper()
+	d := filepath.Join(evolveDir, "runs", "cycle-"+strconv.Itoa(cycle))
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"cycle":` + strconv.Itoa(cycle) + `,"fingerprint":"` + fingerprint + `","pre_class":"` + preClass + `"}`
+	if err := os.WriteFile(filepath.Join(d, "failure-digest.json"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBlockerBreakerHalt_TripsAndEscalates(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	evolveDir := filepath.Join(root, ".evolve")
+	writeDigestFixture(t, evolveDir, 11, "build|guard-abort|aaa", "guard-abort")
+	writeDigestFixture(t, evolveDir, 12, "audit|guard-abort|bbb", "guard-abort")
+
+	rc, halted := blockerBreakerHalt(evolveDir, root, 10, io.Discard, nil)
+	if !halted {
+		t.Fatal("two guard-abort digests in-batch must halt (compiled default ceiling 2)")
+	}
+	if rc == 0 {
+		t.Fatal("halt must return a non-zero loop exit code")
+	}
+	if _, err := os.Stat(filepath.Join(evolveDir, "pipeline-escalation.json")); err != nil {
+		t.Fatal("halt must write the ADR-0072 escalation dossier")
+	}
+	entries, _ := os.ReadDir(filepath.Join(evolveDir, "inbox"))
+	found := false
+	for _, e := range entries {
+		if strings.Contains(e.Name(), "pipeline-defect-pipeline-blocker") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("halt must auto-file the P0 pipeline-defect inbox item (never_stop_queue: the queue is injected even as the loop halts)")
+	}
+}
+
+func TestBlockerBreakerHalt_HistoricDigestsExcluded(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	evolveDir := filepath.Join(root, ".evolve")
+	writeDigestFixture(t, evolveDir, 11, "build|guard-abort|aaa", "guard-abort")
+	writeDigestFixture(t, evolveDir, 12, "audit|guard-abort|bbb", "guard-abort")
+
+	if _, halted := blockerBreakerHalt(evolveDir, root, 12, io.Discard, nil); halted {
+		t.Fatal("digests at or before batchStartCycle must be out of scope")
+	}
+}
+
+func TestBlockerBreakerHalt_AckedFingerprintDoesNotReHalt(t *testing.T) {
+	t.Parallel()
+	fp := "ship|unknown|76d0f4fca190"
+
+	t.Run("unacked still halts", func(t *testing.T) {
+		root := t.TempDir()
+		evolveDir := filepath.Join(root, ".evolve")
+		writeDigestFixture(t, evolveDir, 1329, fp, "gate-block")
+		writeDigestFixture(t, evolveDir, 1330, fp, "gate-block")
+		writeDigestFixture(t, evolveDir, 1331, fp, "gate-block")
+
+		if _, halted := blockerBreakerHalt(evolveDir, root, 1328, io.Discard, nil); !halted {
+			t.Fatal("3x identical-fingerprint digests with no ack must still halt (ADR-0072 floor unweakened)")
+		}
+	})
+
+	t.Run("acked fingerprint excluded", func(t *testing.T) {
+		root := t.TempDir()
+		evolveDir := filepath.Join(root, ".evolve")
+		writeDigestFixture(t, evolveDir, 1329, fp, "gate-block")
+		writeDigestFixture(t, evolveDir, 1330, fp, "gate-block")
+		writeDigestFixture(t, evolveDir, 1331, fp, "gate-block")
+		if err := core.AppendResolvedFingerprint(evolveDir, fp, "operator-reset", time.Now().UTC()); err != nil {
+			t.Fatalf("seed ack ledger: %v", err)
+		}
+
+		if _, halted := blockerBreakerHalt(evolveDir, root, 1328, io.Discard, nil); halted {
+			t.Fatal("an acked fingerprint replaying the exact incident must not re-halt the batch")
+		}
+	})
+}
+
+func TestBlockerBreakerHalt_QuietOnHealthyBatch(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	evolveDir := filepath.Join(root, ".evolve")
+	writeDigestFixture(t, evolveDir, 11, "audit|gate-block|aaa", "gate-block")
+	writeDigestFixture(t, evolveDir, 12, "audit|gate-block|bbb", "gate-block")
+
+	if _, halted := blockerBreakerHalt(evolveDir, root, 10, io.Discard, nil); halted {
+		t.Fatal("distinct honest task failures must not trip the breaker")
+	}
+}

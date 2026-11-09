@@ -1,0 +1,152 @@
+package looppreflight
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"slices"
+	"strings"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/bridge"
+)
+
+func checkBridgeBoot(o resolved, usageEvidence func(driver string) string) CheckResult {
+	if o.skipBoot {
+		return CheckResult{
+			Name:    bridgeBootCheck,
+			Level:   LevelWarn,
+			Message: "bridge boot skipped (EVOLVE_SKIP_PREFLIGHT_BOOT)",
+			Detail:  "cheap checks ran; the real REPL boot — the check that catches an ExitREPLBootTimeout — was not exercised",
+		}
+	}
+
+	var bootable []string
+	for _, d := range o.drivers() {
+		if bridge.IsTmuxDriver(d) {
+			bootable = append(bootable, d)
+		}
+	}
+
+	sandbox := sandboxWanted(o.profileLister, o.profileGetter) && o.hostProbe().Sandbox.ExpectedToWork
+
+	tally := bootTally{booted: len(bootable), sandbox: sandbox}
+	for _, driver := range bootable {
+		out := bootOne(o, driver, sandbox)
+		switch out.RC {
+		case bridge.ExitOK:
+		case bridge.ExitModelMismatch:
+			tally.mismatches = append(tally.mismatches, bootFailureDetail(driver, out, usageEvidence))
+		default:
+			tally.fails = append(tally.fails, bootFailureDetail(driver, out, usageEvidence))
+		}
+	}
+	return tally.result()
+}
+
+const bridgeBootCheck = "bridge-boot"
+
+type bootTally struct {
+	booted            int
+	sandbox           bool
+	fails, mismatches []string
+}
+
+func (b bootTally) result() CheckResult {
+	detail := strings.Join(append(slices.Clone(b.fails), b.mismatches...), "\n")
+	switch {
+	case len(b.fails) > 0:
+		return CheckResult{Name: bridgeBootCheck, Level: LevelHalt, Message: fmt.Sprintf("%d driver(s) failed to boot", len(b.fails)), Detail: detail}
+	case len(b.mismatches) > 0:
+		return CheckResult{Name: bridgeBootCheck, Level: LevelWarn, Message: fmt.Sprintf("%d driver(s) booted another model family: their seats fail over to the next CLI", len(b.mismatches)), Detail: detail}
+	}
+	return CheckResult{Name: bridgeBootCheck, Level: LevelPass, Message: fmt.Sprintf("%d driver(s) booted (sandbox=%v)", b.booted, b.sandbox)}
+}
+
+type BootOutcome struct {
+	RC         int
+	Wall       string
+	Scrollback string
+}
+
+func bootOne(o resolved, driver string, sandbox bool) BootOutcome {
+	var out BootOutcome
+	bridge.BootProbe{Driver: driver, Log: o.stderr}.Retry(context.Background(), func() (int, string) {
+		ctx, cancel := context.WithTimeout(context.Background(), o.bootBudget)
+		defer cancel()
+		out = o.bootTester(ctx, driver, sandbox)
+		return out.RC, out.Wall
+	})
+	return out
+}
+
+func bootFailureDetail(driver string, out BootOutcome, usageEvidence func(driver string) string) string {
+	detail := fmt.Sprintf("driver %q boot failed: rc=%d (%s)%s", driver, out.RC, bootRCName(out.RC), attemptsNote(driver, out))
+	if out.Wall != "" {
+		detail += "; the pane escalated " + out.Wall
+	}
+	if tail := bridge.ScrollbackTail(out.Scrollback, 12); tail != "" {
+		detail += "\n  final pane:\n" + indent(tail, "    ")
+	}
+	if usageEvidence != nil {
+		detail += "\n  usage: " + usageEvidence(driver)
+	}
+	return detail
+}
+
+func attemptsNote(driver string, out BootOutcome) string {
+	if attempts := bridge.ProbeBootAttempts(driver); out.RC == bridge.ExitREPLBootTimeout && out.Wall == "" && attempts > 1 {
+		return fmt.Sprintf(" on all %d boot attempts", attempts)
+	}
+	return ""
+}
+
+func newDefaultBootTester(projectRoot string, stderr io.Writer) func(context.Context, string, bool) BootOutcome {
+	return func(ctx context.Context, driver string, sandbox bool) BootOutcome {
+		ws, err := os.MkdirTemp("", "evolve-looppreflight-*")
+		if err != nil {
+			return BootOutcome{RC: exitWorkspaceSetupFailed, Scrollback: "could not create boot workspace: " + err.Error()}
+		}
+		defer func() { _ = os.RemoveAll(ws) }()
+		cfg := &bridge.Config{Workspace: ws, ProjectRoot: projectRoot, AllowNetwork: true}
+		if sandbox {
+			wt, werr := os.MkdirTemp("", "evolve-looppreflight-wt-*")
+			if werr == nil {
+				defer func() { _ = os.RemoveAll(wt) }()
+				cfg.Worktree = wt
+				cfg.Agent = "build"
+			}
+		}
+		rc, scrollback := bridge.BootSmokeTest(ctx, driver, cfg, bridge.Deps{Stderr: stderr})
+		return BootOutcome{RC: rc, Wall: bridge.EscalationPattern(ws), Scrollback: scrollback}
+	}
+}
+
+const exitWorkspaceSetupFailed = -1
+
+func bootRCName(rc int) string {
+	switch rc {
+	case bridge.ExitREPLBootTimeout:
+		return "ExitREPLBootTimeout — REPL never reached its prompt marker"
+	case bridge.ExitMissingBinary:
+		return "ExitMissingBinary — CLI binary not found"
+	case bridge.ExitModelMismatch:
+		return "ExitModelMismatch — the REPL booted a model outside the target's model family, or showed no readable model label"
+	case bridge.ExitBadFlags:
+		return "ExitBadFlags — unknown or non-tmux driver"
+	case bridge.ExitSeatTokenRefused:
+		return "ExitSeatTokenRefused — the seat token holder is bad, so no claude seat can start. Next: run evolve doctor seat"
+	case exitWorkspaceSetupFailed:
+		return "workspace setup failed (os.MkdirTemp)"
+	default:
+		return fmt.Sprintf("boot failure (exit=%d)", rc)
+	}
+}
+
+func indent(s, prefix string) string {
+	lines := strings.Split(s, "\n")
+	for i := range lines {
+		lines[i] = prefix + lines[i]
+	}
+	return strings.Join(lines, "\n")
+}

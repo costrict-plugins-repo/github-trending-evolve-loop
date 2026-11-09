@@ -1,0 +1,92 @@
+package rawgitratchet
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func moduleRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatal("no go.mod above the working directory")
+		}
+		dir = parent
+	}
+}
+
+func TestRatchet_NoNewRawGitFixtures(t *testing.T) {
+	note, err := Scan(moduleRoot(t))
+	if note != "" {
+		t.Log(note)
+	}
+	if err != nil {
+		t.Error(err)
+	}
+}
+
+func TestScan_BindsFilesSitesAndBaselineFromOneRoot(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel, text string) {
+		path := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("p/raw_test.go", "package p\n\nimport \"os/exec\"\n\nfunc raw() { exec.Command(\"git\", \"init\").Run() }\n")
+	write(BaselineRelPath, "{}")
+	if _, err := Scan(root); err == nil || !strings.Contains(err.Error(), "p/raw_test.go") {
+		t.Fatalf("Scan over an unlisted raw init = %v, want an error naming p/raw_test.go", err)
+	}
+	write(BaselineRelPath, `{"p/raw_test.go": 1}`)
+	if _, err := Scan(root); err != nil {
+		t.Errorf("Scan with the site baselined = %v, want nil", err)
+	}
+	if err := os.Remove(filepath.Join(root, BaselineRelPath)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Scan(root); err == nil {
+		t.Error("Scan without a baseline must fail loudly")
+	}
+}
+
+func TestScanFile_CommitMessageNamedInitIsNotARepoInit(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"commit message", `r.Git("commit", "-q", "-m", "init")`, 0},
+		{"raw init", `exec.Command("git", "init")`, 1},
+		{"both", `exec.Command("git", "init"); r.Git("commit", "-m", "init")`, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "x_test.go")
+			src := "package p\n\nfunc f() { " + tc.body + " }\n"
+			if err := os.WriteFile(p, []byte(src), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, got, err := scanFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Errorf("init sites = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}

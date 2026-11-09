@@ -1,0 +1,35 @@
+{
+  "name": "smell-scan",
+  "archetype": "evaluate",
+  "agent": "evolve-smell-scan",
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/scout-report.md"
+    ],
+    "signals": []
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/smell-scan-report.md"
+    ],
+    "signals": [
+      "smell.count",
+      "smell.blocker_count"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Findings"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "refactor"
+      }
+    ]
+  },
+  "after": "triage"
+}

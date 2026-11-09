@@ -1,0 +1,240 @@
+package looppreflight
+
+import (
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/doctor"
+	"github.com/mickeyyaya/evolve-loop/go/internal/preflight"
+	"github.com/mickeyyaya/evolve-loop/go/internal/profiles"
+)
+
+func TestRun_LLMCLIStatus_AllPresent(t *testing.T) {
+	r, err := Run(goodPipelineOptions(t))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	c := findCheck(t, r, "llm-cli-status")
+	if c.Level != LevelPass {
+		t.Fatalf("want LevelPass, got %s (%s)", c.Level, c.Detail)
+	}
+}
+
+func TestRun_LLMCLIStatus_MissingBinary_Halts(t *testing.T) {
+	opts := goodPipelineOptions(t)
+	opts.ProbeCLI = func(bin string) (doctor.Result, error) {
+		if bin == "claude" {
+			return doctor.Result{Tool: bin, Found: false, Checked: []string{
+				"exec.LookPath(claude) → not found",
+				"/usr/local/bin/claude → not present",
+			}}, nil
+		}
+		return doctor.Result{Tool: bin, Found: true, Path: "/usr/bin/" + bin}, nil
+	}
+	r, err := Run(opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !r.Halted() {
+		t.Fatalf("expected halt for missing CLI binary, got %s", r.OverallLevel)
+	}
+	c := findCheck(t, r, "llm-cli-status")
+	if c.Level != LevelHalt {
+		t.Fatalf("want LevelHalt, got %s", c.Level)
+	}
+	if !strings.Contains(c.Detail, "claude") {
+		t.Fatalf("detail should name the missing binary; got %q", c.Detail)
+	}
+	if !strings.Contains(c.Detail, "not present") {
+		t.Fatalf("detail should carry the probe trail; got %q", c.Detail)
+	}
+}
+
+func TestRun_LLMCLIStatus_DedupsBinaries(t *testing.T) {
+	opts := goodPipelineOptions(t)
+	opts.ProfileGetter = func(name string) (profiles.Profile, error) {
+		return profiles.Profile{Name: name, CLI: "claude-tmux", CLIFallback: []string{"claude-p"}}, nil
+	}
+	var probed []string
+	opts.ProbeCLI = func(bin string) (doctor.Result, error) {
+		probed = append(probed, bin)
+		return doctor.Result{Tool: bin, Found: true, Path: "/usr/bin/" + bin}, nil
+	}
+	if _, err := Run(opts); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	claudeCount := 0
+	for _, b := range probed {
+		if b == "claude" {
+			claudeCount++
+		}
+	}
+	if claudeCount != 1 {
+		t.Fatalf("expected the claude binary probed exactly once, probed=%v", probed)
+	}
+}
+
+func TestRun_HostCapabilities_AllGood(t *testing.T) {
+	r, err := Run(goodPipelineOptions(t))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	c := findCheck(t, r, "host-capabilities")
+	if c.Level != LevelPass {
+		t.Fatalf("want LevelPass, got %s (%s)", c.Level, c.Detail)
+	}
+}
+
+func TestRun_HostCapabilities_NoTmux_Halts(t *testing.T) {
+	opts := goodPipelineOptions(t)
+	opts.ProbeCLI = func(bin string) (doctor.Result, error) {
+		if bin == "tmux" {
+			return doctor.Result{Tool: bin, Found: false, Checked: []string{"exec.LookPath(tmux) → not found"}}, nil
+		}
+		return doctor.Result{Tool: bin, Found: true, Path: "/usr/bin/" + bin}, nil
+	}
+	r, err := Run(opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	c := findCheck(t, r, "host-capabilities")
+	if c.Level != LevelHalt {
+		t.Fatalf("want LevelHalt for missing tmux, got %s (%s)", c.Level, c.Detail)
+	}
+	if !strings.Contains(c.Detail, "tmux") {
+		t.Fatalf("detail should mention tmux; got %q", c.Detail)
+	}
+}
+
+func TestRun_HostCapabilities_EvolveDirUnwritable_Halts(t *testing.T) {
+	opts := goodPipelineOptions(t)
+	opts.DirWritable = func(string) bool { return false }
+	r, err := Run(opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	c := findCheck(t, r, "host-capabilities")
+	if c.Level != LevelHalt {
+		t.Fatalf("want LevelHalt for unwritable .evolve, got %s", c.Level)
+	}
+}
+
+func TestRun_HostCapabilities_SandboxWantedButUnavailable_Halts(t *testing.T) {
+	opts := goodPipelineOptions(t)
+	opts.ProfileGetter = func(name string) (profiles.Profile, error) {
+		return profiles.Profile{Name: name, CLI: "claude-tmux", Sandbox: &profiles.SandboxConfig{Enabled: true}}, nil
+	}
+	opts.HostProbe = func() preflight.Profile {
+		return preflight.Profile{Sandbox: preflight.Sandbox{ExpectedToWork: false, Reason: "sandbox binary present but sandbox_apply failed (standalone host)"}}
+	}
+	r, err := Run(opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !r.Halted() {
+		t.Fatalf("required sandbox absence must halt; got %s", r.OverallLevel)
+	}
+	c := findCheck(t, r, "host-capabilities")
+	if c.Level != LevelHalt {
+		t.Fatalf("want LevelHalt, got %s (%s)", c.Level, c.Detail)
+	}
+	if !strings.Contains(strings.ToLower(c.Detail), "sandbox") {
+		t.Fatalf("detail should mention sandbox; got %q", c.Detail)
+	}
+	if !strings.Contains(c.Detail, "required Build sandbox") {
+		t.Errorf("HALT must name the required Build sandbox; got %q", c.Detail)
+	}
+	if strings.Contains(c.Detail, "degrades gracefully") {
+		t.Errorf("WARN must drop the reassuring 'degrades gracefully' phrasing; got %q", c.Detail)
+	}
+}
+
+func TestRun_HostCapabilities_NoSandboxProfiles_Passes(t *testing.T) {
+	opts := goodPipelineOptions(t)
+	opts.ProfileGetter = func(name string) (profiles.Profile, error) {
+		return profiles.Profile{Name: name, CLI: "claude-tmux"}, nil
+	}
+	r, err := Run(opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	c := findCheck(t, r, "host-capabilities")
+	if c.Level != LevelPass || strings.Contains(strings.ToLower(c.Detail), "sandbox") {
+		t.Fatalf("profiles without sandbox should not warn, got %s (%q)", c.Level, c.Detail)
+	}
+}
+
+func TestRun_HostCapabilities_LowDisk_WarnsWhileDiskSpaceHalts(t *testing.T) {
+	opts := goodPipelineOptions(t)
+	opts.DiskFreeBytes = func(string) (uint64, error) { return 100 << 20, nil }
+	r, err := Run(opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if c := findCheck(t, r, "host-capabilities"); c.Level != LevelWarn {
+		t.Fatalf("host-capabilities: want LevelWarn, got %s (%q)", c.Level, c.Detail)
+	}
+	if c := findCheck(t, r, "disk-space"); c.Level != LevelHalt || !r.Halted() {
+		t.Fatalf("100 MiB under the default floor: disk-space=%s halted=%v, want halt", c.Level, r.Halted())
+	}
+}
+
+func TestRun_HostCapabilities_DiskProbeError_Ignored(t *testing.T) {
+	opts := goodPipelineOptions(t)
+	opts.DiskFreeBytes = func(string) (uint64, error) { return 0, errors.New("statfs boom") }
+	r, err := Run(opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	c := findCheck(t, r, "host-capabilities")
+	if c.Level != LevelPass {
+		t.Fatalf("disk-probe error should be ignored (pass), got %s (%s)", c.Level, c.Detail)
+	}
+}
+
+func TestRun_HostCapabilities_SandboxWantedNested_FailsClosed(t *testing.T) {
+	opts := goodPipelineOptions(t)
+	opts.ProfileGetter = func(name string) (profiles.Profile, error) {
+		return profiles.Profile{Name: name, CLI: "claude-tmux", Sandbox: &profiles.SandboxConfig{Enabled: true}}, nil
+	}
+	opts.HostProbe = func() preflight.Profile {
+		return preflight.Profile{
+			Sandbox:    preflight.Sandbox{ExpectedToWork: false, Reason: "Darwin nested-Claude: sandbox_apply() returns EPERM (rc=71)"},
+			ClaudeCode: preflight.ClaudeCode{Nested: true},
+		}
+	}
+	r, err := Run(opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !r.Halted() {
+		t.Fatal("unverified mandatory confinement must HALT")
+	}
+	c := findCheck(t, r, "host-capabilities")
+	if c.Level != LevelHalt || !strings.Contains(c.Detail, "UNVERIFIED") {
+		t.Fatalf("want explicit UNVERIFIED halt: %+v", c)
+	}
+}
+
+func TestRun_HostCapabilities_SandboxWantedOptOut_WarnsNotHalts(t *testing.T) {
+	opts := goodPipelineOptions(t)
+	opts.ProfileGetter = func(name string) (profiles.Profile, error) {
+		return profiles.Profile{Name: name, CLI: "claude-tmux", Sandbox: &profiles.SandboxConfig{Enabled: true}}, nil
+	}
+	opts.HostProbe = func() preflight.Profile {
+		return preflight.Profile{Sandbox: preflight.Sandbox{ExpectedToWork: false, Reason: "sandbox binary present but sandbox_apply failed"}}
+	}
+	opts.SandboxMode = func() string { return "off" }
+	r, err := Run(opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if r.Halted() {
+		t.Fatalf("explicit host opt-out must WARN loudly, not HALT (parity with the dispatch gate); got %s", r.OverallLevel)
+	}
+	c := findCheck(t, r, "host-capabilities")
+	if c.Level != LevelWarn || !strings.Contains(c.Detail, "UNCONFINED") || !strings.Contains(c.Detail, "--sandbox-off") {
+		t.Fatalf("want loud opt-out WARN, got %s (%s)", c.Level, c.Detail)
+	}
+}

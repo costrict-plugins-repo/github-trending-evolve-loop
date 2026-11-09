@@ -1,0 +1,109 @@
+package bridge
+
+import (
+	"bytes"
+	"context"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestTmuxREPL_ExhaustionWall_FailsOverFast(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t, "claude-tmux", "")
+	walled := "❯\nYou've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.\n❯"
+	tmux := &nudgeRecordingTmux{fakeTmux: &fakeTmux{paneSeq: []string{walled}}}
+	code, stderr := runTmuxNudge(t, fx, tmux)
+	if code != ExitUnknownPrompt {
+		t.Fatalf("exit = %d, want %d (ExitUnknownPrompt — exhaustion fast-fail, not %d ExitArtifactTimeout); stderr=%q",
+			code, ExitUnknownPrompt, ExitArtifactTimeout, stderr)
+	}
+	if strings.Contains(stderr, "stop-review") {
+		t.Errorf("exhaustion must fast-fail on the poll loop before any stop-review checkpoint; stderr=%q", stderr)
+	}
+	if n := tmux.deliveriesNaming(fx.artifact); n != 0 {
+		t.Errorf("a walled CLI must NOT be nudged (%d nudge deliveries) — the fast-fail preempts the nudge", n)
+	}
+}
+
+func TestTmuxREPL_ExhaustionWall_FastFailNotAtCheckpoint(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t, "claude-tmux", "")
+	walled := "❯\nYou've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.\n❯"
+	tmux := &nudgeRecordingTmux{fakeTmux: &fakeTmux{paneSeq: []string{walled}}}
+	polls := 0
+	eng := NewEngine(Deps{Tmux: tmux, Sleep: func(time.Duration) { polls++ }, LookupEnv: mapLookup(nil)})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	code := eng.LaunchArgs(ctx, fx.args("claude-tmux", "--allow-bypass"), nil, &stdout, &stderr)
+	if code != ExitUnknownPrompt {
+		t.Fatalf("exit = %d, want %d (ExitUnknownPrompt); stderr=%q", code, ExitUnknownPrompt, stderr.String())
+	}
+	if polls > 10 {
+		t.Errorf("exhaustion fast-fail took %d poll iterations — must catch the wall on the fast loop, not wait ~150 iters for the 300s checkpoint", polls)
+	}
+}
+
+func TestTmuxREPL_HealthyIdle_NotExhausted(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t, "claude-tmux", "")
+	tmux := &nudgeRecordingTmux{fakeTmux: &fakeTmux{paneSeq: []string{tmuxPromptMarkerDefault}}}
+	code, _ := runTmuxNudge(t, fx, tmux)
+	if code != ExitArtifactTimeout {
+		t.Fatalf("healthy idle exit = %d, want %d (ExitArtifactTimeout) — exhaustion must not fire without a wall", code, ExitArtifactTimeout)
+	}
+}
+
+func TestTmuxREPL_ContentWall_SuppressedByCorroborator(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t, "claude-tmux", "")
+	walled := "❯\nYou've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.\n❯"
+	tmux := &nudgeRecordingTmux{fakeTmux: &fakeTmux{paneSeq: []string{walled}}}
+	healthy := func(context.Context, string) bool { return false }
+	eng := NewEngine(Deps{Tmux: tmux, Sleep: func(time.Duration) {}, LookupEnv: mapLookup(nil), CorroborateWall: healthy})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	code := eng.LaunchArgs(ctx, fx.args("claude-tmux", "--allow-bypass"), nil, &stdout, &stderr)
+	if code == ExitUnknownPrompt {
+		t.Fatalf("corroborated-healthy pane must NOT fail over as a wall (the false all-families class); stderr=%q", stderr.String())
+	}
+	if code != ExitArtifactTimeout {
+		t.Fatalf("suppressed wall concludes via the ordinary artifact timeout, got %d; stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "EXHAUSTION-SUPPRESSED") {
+		t.Errorf("the suppression must be loud in driver stderr; stderr=%q", stderr.String())
+	}
+}
+
+func TestTmuxREPL_CheckpointExhaustionCorroboratesIndependently(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t, "claude-tmux", "")
+	walled := "❯\nYou've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.\n❯"
+	tmux := &fakeTmux{paneSeq: []string{walled}}
+	reviewer := &scriptedReviewer{verdicts: []ReviewVerdict{{Action: ReviewExtend, Reason: "first checkpoint continues"}}}
+	probes := 0
+	corroborate := func(context.Context, string) bool {
+		probes++
+		return probes == 2
+	}
+
+	code, stderr := runTmuxOnStopReview(t, fx, tmux, reviewer, nil, Deps{
+		ArtifactTimeoutS: 2,
+		CorroborateWall:  corroborate,
+	}, "--allow-bypass")
+
+	if code != ExitUnknownPrompt {
+		t.Fatalf("exit = %d, want ExitUnknownPrompt from checkpoint corroboration; stderr=%q", code, stderr)
+	}
+	if probes != 2 {
+		t.Fatalf("wall probes = %d, want 2 independent probes (fast-poll suppression, then checkpoint confirmation)", probes)
+	}
+	if len(reviewer.events) != 1 {
+		t.Fatalf("reviewer calls = %d, want 1 between the checkpoint gate's two observations", len(reviewer.events))
+	}
+	if !strings.Contains(stderr, "EXHAUSTION-SUPPRESSED") || !strings.Contains(stderr, "corroborated by live probe") {
+		t.Fatalf("stderr does not show the independent suppression and confirmation decisions: %q", stderr)
+	}
+}

@@ -1,0 +1,225 @@
+package statemap
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+)
+
+func writeJSON(t *testing.T, path string, m map[string]any) {
+	t.Helper()
+	raw, _ := json.Marshal(m)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWriteStateMap_PreservesSymlinkAndWritesThrough(t *testing.T) {
+	canonicalDir := t.TempDir()
+	worktreeDir := t.TempDir()
+	canonical := filepath.Join(canonicalDir, "state.json")
+	writeJSON(t, canonical, map[string]any{"stateRevision": float64(1)})
+	link := filepath.Join(worktreeDir, "state.json")
+	if err := os.Symlink(canonical, link); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := WriteStateMap(link, map[string]any{"stateRevision": float64(1), "k": "v"}); err != nil {
+		t.Fatalf("WriteStateMap through symlink: %v", err)
+	}
+
+	fi, err := os.Lstat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("symlink was severed: worktree path is now a regular file (the cycle-999 defect)")
+	}
+	got, err := ReadStateMap(canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["k"] != "v" {
+		t.Fatalf("write did not reach canonical target; canonical=%v", got)
+	}
+}
+
+func TestWriteStateMap_DanglingSymlinkCreatesTarget(t *testing.T) {
+	canonicalDir := t.TempDir()
+	worktreeDir := t.TempDir()
+	canonical := filepath.Join(canonicalDir, "state.json")
+	link := filepath.Join(worktreeDir, "state.json")
+	if err := os.Symlink(canonical, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteStateMap(link, map[string]any{"k": "v"}); err != nil {
+		t.Fatalf("WriteStateMap through dangling symlink: %v", err)
+	}
+	if fi, _ := os.Lstat(link); fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("dangling symlink was replaced instead of resolved")
+	}
+	if got, err := ReadStateMap(canonical); err != nil || got["k"] != "v" {
+		t.Fatalf("target not created through dangling link: %v %v", got, err)
+	}
+}
+
+func TestWriteStateMap_RefusesStaleRevision(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	writeJSON(t, path, map[string]any{"stateRevision": float64(1360), "carryoverTodos": []any{"a", "b"}})
+
+	stale := map[string]any{"stateRevision": float64(1356)}
+	err := WriteStateMap(path, stale)
+	if err == nil {
+		t.Fatal("stale write (rev 1356 over 1360) must be refused — this is the cycle-1001 lost-write")
+	}
+	if !errors.Is(err, ErrStaleRevision) {
+		t.Fatalf("want ErrStaleRevision, got: %v", err)
+	}
+	got, _ := ReadStateMap(path)
+	if got["stateRevision"] != float64(1360) {
+		t.Fatalf("on-disk state clobbered despite refusal: %v", got)
+	}
+}
+
+func TestUpdateStateMap_AutoBumpsOwnCounterAndTimestamp(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	writeJSON(t, path, map[string]any{"stateRevision": float64(7), "lastUpdated": "2026-07-14T05:01:14Z"})
+	if err := UpdateStateMap(path, func(m map[string]any) { m["k"] = "v" }); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := ReadStateMap(path)
+	if got[statemapRevisionKey] != float64(1) {
+		t.Fatalf("statemapRevision not seeded/bumped: %v", got[statemapRevisionKey])
+	}
+	if got["stateRevision"] != float64(7) {
+		t.Fatalf("stateRevision must stay UNTOUCHED (storage.UpdateState exclusive); got %v", got["stateRevision"])
+	}
+	if got["lastUpdated"] == "2026-07-14T05:01:14Z" || got["lastUpdated"] == "" || got["lastUpdated"] == nil {
+		t.Fatalf("lastUpdated not refreshed: %v", got["lastUpdated"])
+	}
+}
+
+func TestWriteStateMap_RefusesStaleStatemapRevision(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	writeJSON(t, path, map[string]any{statemapRevisionKey: float64(9)})
+	err := WriteStateMap(path, map[string]any{statemapRevisionKey: float64(4)})
+	if !errors.Is(err, ErrStaleRevision) {
+		t.Fatalf("stale statemapRevision must be refused; got: %v", err)
+	}
+}
+
+func TestUpdateStateMap_ConcurrentWritersAllLand(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	writeJSON(t, path, map[string]any{"stateRevision": float64(0)})
+	const n = 12
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_ = UpdateStateMap(path, func(m map[string]any) {
+				m[fmt.Sprintf("w%02d", i)] = true
+			})
+		}(i)
+	}
+	wg.Wait()
+	got, _ := ReadStateMap(path)
+	for i := 0; i < n; i++ {
+		if got[fmt.Sprintf("w%02d", i)] != true {
+			t.Fatalf("writer %d lost", i)
+		}
+	}
+	if got[statemapRevisionKey] != float64(n) {
+		t.Fatalf("statemapRevision=%v, want %d", got[statemapRevisionKey], n)
+	}
+	if got["stateRevision"] != float64(0) {
+		t.Fatalf("stateRevision must stay untouched; got %v", got["stateRevision"])
+	}
+}
+
+func TestUpdateStateMap_CrossTreeWritersSerializeOnCanonical(t *testing.T) {
+	canonicalDir := t.TempDir()
+	worktreeDir := t.TempDir()
+	canonical := filepath.Join(canonicalDir, "state.json")
+	writeJSON(t, canonical, map[string]any{"stateRevision": float64(0)})
+	link := filepath.Join(worktreeDir, "state.json")
+	if err := os.Symlink(canonical, link); err != nil {
+		t.Fatal(err)
+	}
+	const n = 8
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			p := canonical
+			if i%2 == 1 {
+				p = link
+			}
+			_ = UpdateStateMap(p, func(m map[string]any) { m[fmt.Sprintf("x%02d", i)] = true })
+		}(i)
+	}
+	wg.Wait()
+	got, _ := ReadStateMap(canonical)
+	for i := 0; i < n; i++ {
+		if got[fmt.Sprintf("x%02d", i)] != true {
+			t.Fatalf("cross-tree writer %d lost (locks not unified on resolved path)", i)
+		}
+	}
+	if got[statemapRevisionKey] != float64(n) {
+		t.Fatalf("statemapRevision=%v, want %d", got[statemapRevisionKey], n)
+	}
+}
+
+func TestResolveWriteTarget(t *testing.T) {
+	root := t.TempDir()
+	canonical := filepath.Join(root, "canon", "state.json")
+	writeJSON(t, canonical, map[string]any{"k": "v"})
+	link := func(target, at string) string {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(at), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, at); err != nil {
+			t.Fatal(err)
+		}
+		return at
+	}
+	relative := filepath.Join("..", "canon", "state.json")
+	mid := link(relative, filepath.Join(root, "mid", "state.json"))
+	loopA := filepath.Join(root, "loop", "a")
+	link(loopA, filepath.Join(root, "loop", "b"))
+	link(filepath.Join(root, "loop", "b"), loopA)
+
+	cases := []struct {
+		name, path, want string
+	}{
+		{"regular-file", canonical, canonical},
+		{"missing-path", filepath.Join(root, "nope.json"), filepath.Join(root, "nope.json")},
+		{"absolute-link", link(canonical, filepath.Join(root, "abs", "state.json")), canonical},
+		{"relative-link", link(relative, filepath.Join(root, "rel", "state.json")), canonical},
+		{"two-hop-chain", link(mid, filepath.Join(root, "wt", "state.json")), canonical},
+		{"dangling-tail", link(filepath.Join(root, "canon", "absent.json"), filepath.Join(root, "dang", "state.json")), filepath.Join(root, "canon", "absent.json")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ResolveWriteTarget(tc.path); filepath.Clean(got) != tc.want {
+				t.Errorf("ResolveWriteTarget(%s) = %s, want %s", tc.path, got, tc.want)
+			}
+		})
+	}
+
+	t.Run("loop-is-bounded", func(t *testing.T) {
+		got := ResolveWriteTarget(loopA)
+		if got != loopA && got != filepath.Join(root, "loop", "b") {
+			t.Errorf("ResolveWriteTarget(loop) = %s, want one of the loop's own hops", got)
+		}
+	})
+}

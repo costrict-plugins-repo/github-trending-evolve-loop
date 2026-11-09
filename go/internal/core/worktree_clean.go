@@ -1,0 +1,66 @@
+package core
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+)
+
+// minimal: the inbox item's alternative "cut a fresh worktree instead" mode is
+// deliberately not implemented — quarantine+reset satisfies every acceptance
+// criterion, and a config knob selecting between two equivalent outcomes would
+// be flag sprawl (no-feature-flags rule). Upgrade path: a policy.json
+// worktree.dirty block if a second behavior is ever genuinely needed.
+
+func quarantineDir(projectRoot string, cycle int) string {
+	return filepath.Join(projectRoot, ".evolve", "quarantine", fmt.Sprintf("cycle-%d", cycle))
+}
+
+func ensureCleanWorktree(ctx context.Context, wt, projectRoot string, cycle int) ([]string, error) {
+	dirty := porcelainDirtySet(ctx, wt)
+	if len(dirty) == 0 {
+		return nil, nil
+	}
+	paths := make([]string, 0, len(dirty))
+	for p := range dirty {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+
+	qdir := quarantineDir(projectRoot, cycle)
+	var moved []string
+	for _, p := range paths {
+		src := filepath.Join(wt, p)
+		if _, err := os.Lstat(src); err != nil {
+			continue
+		}
+		dst := uniqueQuarantinePath(filepath.Join(qdir, p))
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return moved, fmt.Errorf("worktree quarantine: mkdir for %s: %w", p, err)
+		}
+		if err := os.Rename(src, dst); err != nil {
+			return moved, fmt.Errorf("worktree quarantine: move %s -> %s: %w", src, dst, err)
+		}
+		moved = append(moved, dst)
+		fmt.Fprintf(os.Stderr, "[worktree] WARN dirty reuse (cycle %d): quarantined %s -> %s\n", cycle, p, dst)
+	}
+	if out, code, err := gitCapture(ctx, wt, "reset", "--hard", "HEAD"); err != nil || code != 0 {
+		return moved, fmt.Errorf("worktree clean-provision: git reset --hard HEAD in %s (rc=%d): %v: %s", wt, code, err, out)
+	}
+	fmt.Fprintf(os.Stderr, "[worktree] WARN reused worktree %s was DIRTY: %d path(s) quarantined under %s (preserved for salvage, never deleted); tree reset to HEAD\n", wt, len(moved), qdir)
+	return moved, nil
+}
+
+func uniqueQuarantinePath(p string) string {
+	if _, err := os.Lstat(p); err != nil {
+		return p
+	}
+	for i := 1; ; i++ {
+		c := fmt.Sprintf("%s.%d", p, i)
+		if _, err := os.Lstat(c); err != nil {
+			return c
+		}
+	}
+}

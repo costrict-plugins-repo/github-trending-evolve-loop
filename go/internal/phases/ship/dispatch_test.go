@@ -1,0 +1,34 @@
+//go:build integration
+
+package ship
+
+import (
+	"context"
+	"path/filepath"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+)
+
+func TestPhaseRun_NativeDispatch_NoAuditor_FailVerdict(t *testing.T) {
+	t.Parallel()
+	repo := makeRepo(t)
+
+	p := New(Config{Runner: execRunner})
+	resp, err := p.Run(context.Background(), core.PhaseRequest{
+		Cycle:       1,
+		ProjectRoot: repo,
+		Workspace:   filepath.Join(repo, ".evolve", "runs", "cycle-1"),
+		Context:     map[string]string{"commit_message": "feat: no auditor"},
+		Env:         map[string]string{"EVOLVE_PLUGIN_ROOT": repo},
+	})
+	if err == nil {
+		t.Fatal("want error from native dispatch with no auditor entry")
+	}
+	if resp.Verdict != core.VerdictFAIL {
+		t.Errorf("want VerdictFAIL, got %q", resp.Verdict)
+	}
+	if len(resp.Diagnostics) == 0 {
+		t.Error("want diagnostics explaining the refusal")
+	}
+}

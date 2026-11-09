@@ -1,0 +1,43 @@
+{
+  "acceptance": [
+    "`evolve ci watch --sha S` with a fake fetcher returns 0 on success and 1 on failure (red: unknown subcommand \"watch\")",
+    "`--tag vX.Y.Z` waits for both the required and the release workflows",
+    "A red PR run files no inbox item; a red main SHA files one fix-forward item"
+  ],
+  "connects_to": [
+    "inbox-filename-stamp-single-source"
+  ],
+  "consumed": {
+    "at": "2026-10-06T03:07:58Z",
+    "cycle": "",
+    "via": "ship"
+  },
+  "created_at": "2026-09-30T10:51:14Z",
+  "deps": [
+    "cli-ci-classify"
+  ],
+  "files": [
+    "go/cmd/evolve/main.go",
+    "go/internal/ciwatch"
+  ],
+  "fix": "Add `evolve ci watch (--sha S | --pr N | --tag T) [--workflow W]... [--cycle N]` over ciwatch.Watch with the gh fetcher. It waits for the named workflows to complete (default: the required workflow; a tag adds the release workflow) and prints each conclusion; on red it prints the `ci classify` result. It files the fix-forward item only when watching main or a tag (--cycle names the cycle in it), never for a PR. Exit 0 green, 1 red, 2 on gh I/O or timeout (the policy ci_watch timeout). Point the /commit and /evo:publish skills and runtime-reference.md at it.",
+  "id": "cli-ci-watch",
+  "kind": "feature",
+  "priority_class": "stability",
+  "released_continuations": [
+    {
+      "base_sha": "838158dbbb616d5f7c868efaf194b44cb78b16fb",
+      "branch": "cycle-cd3ae73e-1800",
+      "cycle": 1800,
+      "findings_path": "~/ai/claude/evolve-loop/runtime/.evolve/runs/cycle-1800/audit-fail-reason.json",
+      "reason": "ship-consume-",
+      "released_at": "2026-10-06T03:07:58Z",
+      "snapshot_sha": "212a00bfac8c15bbef1caf82b3edfbdc960d7dc6",
+      "worktree": "~/ai/claude/evolve-loop/runtime/.evolve/worktrees/cycle-cd3ae73e-1800"
+    }
+  ],
+  "source": "console, 2026-09-30, core-function CLI inventory (operator request: a CLI request for each core function)",
+  "summary": "ciwatch.Watch polls a SHA's required CI run and, on red, files a fix-forward inbox item (internal/ciwatch/ciwatch.go:92), but only ACS predicates import it. The /commit skill watches CI with `gh run watch` or `gh pr checks --watch` (skills/commit/SKILL.md:38). /evo:publish watches a tag's required.yml and release.yml with `gh run watch` (skills/publish/SKILL.md:56-57). The release pipeline itself prints 'GitHub CI is NOT verified by this pipeline' (internal/releasepipeline/release_run.go:328).",
+  "title": "Watching CI for a pushed commit, PR or release tag is `gh run watch` by hand, and ciwatch.Watch has no production caller; add `evolve ci watch`",
+  "weight": 0.6
+}

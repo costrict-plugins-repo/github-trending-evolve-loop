@@ -1,0 +1,50 @@
+package bridge
+
+import (
+	"regexp"
+	"strings"
+	"testing"
+)
+
+var agyModelName = regexp.MustCompile(`^[A-Za-z0-9.\- ]+ \((Low|Medium|High|Thinking)\)$`)
+
+func TestAgyManifestTierModelsAreNamesAgyAccepts(t *testing.T) {
+	t.Parallel()
+	m, err := LoadManifest("agy-tmux")
+	if err != nil {
+		t.Fatalf("LoadManifest(agy-tmux): %v", err)
+	}
+	if len(m.ModelTierMap) == 0 {
+		t.Fatal("agy-tmux declares no model_tier_map — this guard would be vacuous")
+	}
+	for tier, model := range m.ModelTierMap {
+		if !agyModelName.MatchString(model) {
+			t.Errorf("agy tier %q model %q is not a name agy accepts — it needs the capability/effort parenthetical, e.g. %q. agy does NOT error on a bad name; it silently serves Gemini 3.5 Flash (Medium) for the whole session.",
+				tier, model, "Gemini 3.8 Flash (Low)")
+		}
+		if strings.Contains(model, "Flash") && !strings.Contains(model, "Flash (") {
+			t.Errorf("agy tier %q model %q puts the version AFTER \"Flash\"; agy spells it \"Gemini <version> Flash (<effort>)\"", tier, model)
+		}
+	}
+}
+
+func TestAgyTierModelsPinnedToVerifiedNames(t *testing.T) {
+	prev := modelCatalogDirFn
+	empty := t.TempDir()
+	modelCatalogDirFn = func() string { return empty }
+	t.Cleanup(func() { modelCatalogDirFn = prev })
+	m, err := LoadManifest("agy-tmux")
+	if err != nil {
+		t.Fatalf("LoadManifest(agy-tmux): %v", err)
+	}
+	for tier, want := range map[string]string{
+		"fast":     "Gemini 3.8 Flash (Low)",
+		"balanced": "Gemini 3.8 Flash (High)",
+		"deep":     "Gemini 4 Argon (Medium)",
+		"top":      "Gemini 4 Argon (Medium)",
+	} {
+		if got := m.ModelTierMap[tier]; got != want {
+			t.Errorf("agy tier %q = %q, want %q (each name launched live and shown verbatim in agy's footer: 3.8 Flash on agy 1.2.17, 2026-10-05; 4 Argon Medium and High on agy 1.4.0, 2026-10-16)", tier, got, want)
+		}
+	}
+}

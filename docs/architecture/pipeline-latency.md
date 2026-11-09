@@ -1,0 +1,135 @@
+# Pipeline Latency — where a cycle's wall time goes, and how to cut it
+
+> Design: [ADR-0043](adr/0043-pipeline-latency-program.md).
+> Sibling workstream (test latency, separate): `go/docs/testing.md` §"known fast-suite poles".
+
+This is the **production**-latency companion to the test-latency pass. Test latency is what a
+developer waits for; *pipeline* latency is what every autonomous cycle pays, on every phase, on
+every run. This doc maps where that wall time goes (grounded in the dispatch code, not guesswork).
+It evaluates the three candidate levers and recommends a measured, risk-ranked sequence.
+
+## Why this matters
+
+A cycle dispatches a chain of LLM phases — `intent → scout → triage → … → build → audit → ship →
+retrospective` (15 registered phases; routing runs a subset, typically ~8–10 LLM dispatches). Each
+dispatch that goes through a tmux-REPL driver (`claude-tmux`, `codex-tmux`, … — the default path)
+pays a **cold-boot tax** before the model does any work. That tax is paid N times per cycle and is
+pure overhead.
+
+## Where the time goes (dispatch anatomy)
+
+Per-phase dispatch path (`go/internal/bridge/driver_tmux_repl.go`, ephemeral-session branch):
+
+| Step | Cost | Source |
+|---|---|---|
+| `tmux new-session` | process spawn | `driver_tmux_repl.go:162` |
+| **fixed sleep** | **1s hardcoded** | `driver_tmux_repl.go:165` (`deps.Sleep(time.Second)`) |
+| `cd <workdir>` | one SendKeys | `:166` |
+| **fixed sleep** | **1s hardcoded** | `driver_tmux_repl.go:167` |
+| launch CLI + marker poll | `bootIntervalS` × ticks-until-prompt-marker, 60s deadline | `:185-210` |
+
+So **cold boot ≈ 2s fixed + bootInterval×ticks** per phase, *before the prompt is even delivered*.
+`bootIntervalS`: claude-tmux=1, codex-tmux=2, agy-tmux=2, ollama=1 (`driver_claudetmux.go:61` et al);
+boot deadline `tmuxREPLBootTimeoutS=60` (`:63`). Optimistically 1–2 ticks to the marker →
+**~3–5s/phase**; × ~8 dispatches → **~25–40s/cycle of pure boot overhead**, independent of model
+think time. The interactive ("human cadence") path adds *more* deliberate latency
+(`human_input.go:43` `humanBootPause`, `:51` `humanPasteWithReview`).
+
+Crucially, a **warm path already exists**: when `BridgeRequest.SessionName != ""` the driver
+resolves a *named* session and **skips the entire boot block** (`driver_tmux_repl.go:161`
+`if !namedExists`). Today only the **swarm harness** sets `SessionName` (ADR-0032); ordinary serial
+phases pass it empty → ephemeral → **cold boot every single phase**. The machinery to avoid the tax
+is built; the serial pipeline just doesn't use it.
+
+## The three levers, evaluated against the code
+
+### Lever A — REPL boot reuse  ★ recommended (highest value)
+Cold boot is paid per phase and the avoidance machinery (named sessions) already exists. Two
+sub-levers, smallest-first:
+
+- **A1 — adaptive boot wait (low-risk first win).** Replace the two unconditional `Sleep(1s)` with
+  a *poll-until-ready*. Poll the pane for the shell prompt before `cd`, and for cd-return before
+  launch. Keep the current fixed sleep as the timeout fallback. This removes up to ~2s/phase with a
+  bounded blast radius (one driver function, fallback preserves today's behavior). **Gate on A0
+  measurement** (boot waits exist for real tmux/shell readiness; tune, do not delete).
+- **A2 — pre-warmed session pool (bigger win).** Keep a small pool of *already-booted* REPLs per
+  CLI; a phase grabs a warm one instead of cold-booting.
+  - **Hard constraint: this is pooling, NOT
+  cross-phase session sharing.** If a live REPL serves many phases, then `build` inherits
+  `scout`'s context. That breaks the trust-kernel's per-phase isolation (builder≠auditor,
+  cross-family floor — see CLAUDE.md).
+  - A pooled session must be **context-cleared** (`/clear` or
+  fresh process) and re-marker-confirmed before handing to the next phase. Pre-warm happens in the
+  background during the *previous* phase's think time, so the boot tax overlaps useful work.
+
+### Lever B — prompt-cache-aware ordering  ✅ already implemented
+The adapter (`go/internal/adapters/bridge/bridge.go:120-128`) already assembles prompts
+cache-first: `Correction > Rules > Policy > Contract-invariant-block > Body > volatile-path-footer`
+— stable/cacheable content as the prefix, the per-cycle artifact path in the **last line**. The
+deterministic fan-out cache-prefix (`go/internal/subagent/cacheprefix.go`) reinforces this for
+swarm workers.
+
+**The ordering work is done.** The only open question is *empirical*. Does each
+tmux-driven CLI actually realize the Anthropic prompt cache across separate REPL sessions? (The cache
+is keyed on exact prefix bytes, 5-min TTL.) That is a measurement, not a code change. It
+becomes moot under A2, because a warm pooled session keeps the CLI's own conversation cache hot anyway.
+
+### Lever C — swarm read-parallelism  (high ceiling, high cost — defer)
+The lever proposes that read-only phases (scout, audit) fan out / overlap instead of a strictly serial run. The
+swarm harness already runs workers under a bounded semaphore (`EVOLVE_SWARM_CONCURRENCY`, default 2)
+but is stage-gated **off** (`EVOLVE_SWARM_STAGE=shadow`). Real ceiling on read-heavy cycles, but it
+needs advisor+orchestrator coordination and careful gate semantics — larger and riskier than A.
+Revisit after A lands and the measurement shows residual serial read cost.
+
+## Recommended sequence (measured, risk-ranked)
+
+0. **A0 — instrument boot_ms (do first; it's the measurement gate).**
+   - Add an additive `BootMS`
+     field threaded `bridge driver → core.BridgeResponse → core.PhaseResponse → phaseTimingEntry`
+     (omitempty, backward-compatible).
+   - The boot loop (`driver_tmux_repl.go:190-210`) already knows
+     the exact boot window. Surface its duration up the in-process call chain.
+   - The bridge is
+     in-process: `engine.go` drives tmux with `exec.CommandContext`, so no cross-process channel is
+     needed. The next section has the exact seam map.
+   - A0 is behavior-neutral, so it is safe to ship alone. One real
+     measured cycle then shows the boot-vs-think split per phase.
+1. **A1 — adaptive boot wait**, behind a default-off stage flag, validated against A0 numbers.
+2. **A2 — pre-warmed pool**, behind the same flag family (`off|shadow|enforce`, centralized config —
+   no flag sprawl). Start it after A0/A1 prove the boot share is worth the pool's complexity.
+3. **C — swarm read-parallelism**, only if measurement shows meaningful residual serial read cost.
+
+## A0 instrumentation seam (as built, `12dcd18b`)
+
+Shipped behavior-neutral. `BootMS` rides the in-process chain alongside `DurationMS`:
+
+- `go/internal/core/ports.go` — `BridgeResponse.BootMS int64 \`json:"boot_ms,omitempty"\``.
+- `go/internal/bridge/driver_tmux_repl.go:196` — the driver accumulates `bootWaitMS = fixedReadinessWaits×1000
+  + bootInterval×polls`, **counting intended sleep/poll iterations rather than wall-clock** (deterministic under
+  test, ≈ wall in prod), and fires injected `deps.OnBoot(bootWaitMS)` **once** on the cold-boot marker (`:227`).
+  The warm `namedExists` path and a boot timeout never fire it → `BootMS=0` is the "no cold boot" signal.
+- `go/internal/bridge/engine.go` — `Launch` captures the value with a per-call `OnBoot` wrap (doc-noted not
+  concurrency-safe; prod builds a fresh engine per launch).
+- `go/internal/core/phase.go` — `PhaseResponse.BootMS`; `go/internal/phases/runner/runner.go` (~`:499-570`)
+  copies `bres.BootMS` onto every `PhaseResponse`.
+- `go/internal/core/orchestrator.go:977` — `phaseTimingEntry.BootMS`, copied at the construction sites; the
+  **deferred** `phase-timing.json` write (`:1529`) persists it even when the cycle errors.
+- 3 unit tests (`driver_tmux_repl_bootms_test.go`): cold=3000ms, boot-timeout=0, warm named-session=0.
+
+> **Divergence from the original design above:** the first draft proposed wall-clock `start→promptSeen`; as-built
+> counts iterations for test determinism. **Coverage gap (surfaced by the first measured cycle):** the
+> CLI-fallback and failed-phase dispatch paths do not record a timing entry. The measured boot-vs-think split
+> (boot is only ~1–3% of think-heavy phases, which *lowers* A1/A2 priority) and the gap analysis live in
+> [ADR-0043 §"A0 — as-built + first measurement"](adr/0043-pipeline-latency-program.md). The fix for the gap is
+> [ADR-0044](adr/0044-unified-phase-recovery-protocol.md) D1 (single-source verdict reconciliation).
+
+## Risks & non-goals
+
+- **Phase isolation is sacred.** No lever may let one phase's REPL context leak into another.
+  A2 pools *fresh/cleared* sessions; it never shares a live conversation across phases.
+- **Boot waits guard real readiness.** A1 tunes them adaptively with a fallback. It does not delete
+  them blindly. A too-eager launch races the shell/CLI and reintroduces the `exit 80` boot flakes
+  already documented for real-tmux tests.
+- **Measure before changing the hot loop.** A0 ships first and gates A1/A2. A blind sleep cut across
+  every phase/CLI is exactly the kind of change that breaks every cycle at once.
+- **Not in scope:** test-suite latency (separate workstream; `go/docs/testing.md`).

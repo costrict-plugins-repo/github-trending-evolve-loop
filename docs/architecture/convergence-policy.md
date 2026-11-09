@@ -1,0 +1,421 @@
+# Convergence policy: every iterative loop converges or escalates
+
+> ADR-0126 (Proposed, 2026-10-07). Plan: [convergence-policy-2026-10.md](../plans/convergence-policy-2026-10.md). The example: [incident, L2's seven review rounds](../incidents/2026-10-07-l2-seven-review-rounds.md). Research: [converging review feedback within limited rounds](../research/review-convergence-limited-rounds-2026-10.md) (CR1–CR8), [ship-rate sources](../research/ship-rate-harness-reliability-2026-09-02-sources.md) §1 item 10 and §3(6), [ADR-0096](adr/0096-repair-rounds-escalate-and-carry-findings.md).
+> Written in the Issue / Gap / Solution shape.
+>
+> **Revision 2** (2026-10-07) folds in two things:
+> - the doc review: C1, C2, H1–H5, M1, M2 and L1–L3, all applied;
+> - the research refinements CR1–CR8, and the operator's answer on headroom (top = Opus 5.5 at xhigh effort).
+>
+> **Revision 3** (2026-11-05) adds one escalation path, with a redesign rung after the retries (§3.3). No code for this revision exists yet.
+>
+> **Operator directives (2026-10-07):**
+> - *"It just retry for too many times."*
+> - *"Prioritize a convergence rule/solution using L2 with 7 rounds as the example issue that should converge earlier by escalating to top / deep model or other approaches to proceed with persuing the perfection with no output."* (verbatim)
+> - *"The latest top model is opus 5.5 with xhigh effort, not fable 5.1"*
+> - *"I would like you to research online to learn the best policy to coverage the review feedback with limited rounds"* (verbatim)
+>
+> **Terms used throughout:**
+> - **Loop:** a repeat-until-accepted process that calls the policy. These loops call it: audit repair (ADR-0092/0093/0096), the code-review↔build loop (ADR-0124, landing 2), the explanation re-author route, and the review chain of a console lane. The contract-correction ladder is a format loop and does **not** call the policy (§6).
+> - **Judgment `J_r`:** one judge pass. `J_0` is the **full** first judgment. Round *r* is fix *r* plus its judgment `J_r`.
+> - **`Decide(round = r)`** returns the rung for round *r+1*.
+> - **Finding:** one judged defect, with these fields:
+>   - `id`, stable across rounds;
+>   - `severity`: CRITICAL, HIGH, MEDIUM, LOW or INFO;
+>   - `kind`: `defect` or `capability`;
+>   - `component` (§2.1);
+>   - `location`;
+>   - `status`: OPEN, FIXED, DEFERRED, DISPUTED or FILED;
+>   - `late`: raised on code unchanged since `J_0`;
+>   - `certificate`;
+>   - `falsification`: the falsification check's result for a late CRITICAL or HIGH, `survived` or `refuted` (§4 rule 3).
+> - **Blocking bar:** the severity at or above which an OPEN finding blocks the loop's hand-off. Every finding carries an explicit `blocking` result (CR6).
+> - **Mass:** the unresolved-severity measure of the loop. The code-review loop supplies its own U(n), from design §5.3. U(n) is its finding mass (including LOW) plus its gap mass, with the baseline reset at each audit-repair re-entry. Other loops use the default: CRITICAL 8, HIGH 4, MEDIUM 2, LOW 1, INFO 0.
+> - **Progress:** the mass fell, **measured at the current bar for both rounds**, so that raising the bar never fakes progress.
+> - **Repair damage:** in round *r*, the previous FIXED findings that `J_r` reopens, plus the new findings inside fix *r*'s own hunks. **Repairs** are the findings fix *r* resolved.
+> - **Concentration `C`:** the largest share of the window's countable findings (§2.1) that falls in one component.
+> - **Headroom:** if a raise changes the (model, effort) pair (§7).
+> - **Follow-up:** an inbox item filed for a deferred finding, a split component, or a filed late finding.
+
+> **Note (2026-11-06, operator ruling):** Audit repair keeps a budget of 2 rounds until the code changes. A failed ladder goes to the redesign rung first.
+
+## Issue
+
+Loops grind instead of converging, and they end with no output.
+
+- **Audit repair.** ADR-0096 measured ship probability by audit-round count over cycles 1560–1605: **100% → 50% → 17% → 0%**.
+- **The console.** L2 needed **seven** review fix rounds on the deepest Claude model (incident). About 18 of the last 27 findings sat in one heuristic sub-feature that a review had added.
+- **The research.** Two rounds capture 76–95% of the achievable gain. A fixed budget can *lower* quality, because repair damages correct work. LLM reviewers produce different findings on every run. More revisions do not converge a review unless they reduce the reviewer's uncertainty (research F1–F4).
+
+## Gap
+
+1. **No shared rule.** Each loop has its own stop. None escalates past a tier, and the console has nothing.
+2. **The blocking bar never moves.**
+3. **No stop on marginal gain, and no keep-best.** Later rounds can be worse, and the last round lands by default (research F2).
+4. **Delta judgments hunt instead of verify.** A rerun of a nondeterministic reviewer always finds something new (research F3).
+5. **Reviews can grow the change.** A capability finding is fixed inside the lane.
+6. **Escalation has no headroom check.** No family has deep→top headroom in today's tier tables (§7).
+7. **No output-first fallback.**
+
+## Solution
+
+```
+J_0 full judgment ─▶ clean? ── yes ─▶ land
+        │ no
+        ▼
+round 1  fix 1 ─▶ J_1   (verify-only from here on: fixed scope + falsification check; audit repair: ADR-0096's tier raise stays here)
+        │ strict OPEN remains
+        ▼  marginal gain ≤ 0? ── yes ─▶ skip to round 3's strategy change (or rung 3 if already past it)
+round 2  RUNG 1 — change the feedback: effort raise to top for reasoning-class blockers (headroom permitting);
+                  fixer raised once, if not already (the once-only raise: the fixer and judge raises are one change, made on the first rung-1 round or at rung 2 when no rung-1 round ran)
+        │ strict OPEN remains
+        ▼
+round 3  RUNG 2 — change the strategy: fresh-context fixer (or re-plan); bar → HIGH; MEDIUM/LOW deferred + filed
+        │ strict OPEN remains
+        ▼
+         RUNG 3 — change the scope: split (Stop + continuation / console unstage) │ accept fail-safe residue → audit adjudicates │ stop
+         land the BEST qualifying round (keep-best); never round 4
+```
+
+### 1. Strategy (why this shape)
+
+The ladder was chosen over a bare round cap and over best-of-N (plan §2). Rounds 1–2 are local refinement. Round 3 is allowed only after a strategy change, and there is never a round 4 (research CR1, F6).
+
+### 2. One policy, one home
+
+There is a pure package, `convergence`, with no I/O:
+
+```go
+type Input struct {
+    Loop      string        // audit-repair | code-review | explanation-reauthor | console-lane
+    Round     int           // completed rounds r (J_0 alone is round 0)
+    Rounds    []Judgment    // J_0..J_r: findings (§2.1 schema), plus each fix's hunks
+    Mass      MassFunc      // loop-supplied (code-review: U(n)); nil → default weights
+    Fixer     TierEffort    // (tier, model, effort) of the last fix
+    Judge     TierEffort    // (tier, model, effort) of the last judgment
+    Headroom  HeadroomTable // per family: which raises change (model, effort) (§7)
+    Config    Config        // workflow.convergence (§8)
+}
+
+type Decision struct {
+    Rung          int        // 0..3, for round r+1
+    Action        Action     // Continue | Land | Split | AcceptWithLimits | Adjudicate | Stop
+    BlockingBar   string     // CRITICAL | HIGH | MEDIUM
+    VerifyOnly    bool       // J_{r+1} is verify-only (code-review and console judges only, §4)
+    FreshContext  bool       // fix r+1 starts from a distilled brief
+    FixerRaise    TierEffort // zero value = no raise
+    JudgeRaise    TierEffort // zero value = no raise
+    Defer         []string   // finding ids → DEFERRED with follow-ups (never CRITICAL, never audit findings)
+    File          []string   // late findings below HIGH, and capability findings below CRITICAL → FILED
+    SplitComponent string
+    LandRound     int        // keep-best: the round whose candidate lands
+    Reasons       []string   // the evidence for every rung change (CR8)
+}
+```
+
+- **The decision function** is `Decide(Input) Decision`, called at each loop's existing decision point.
+- **The console** calls `evolve convergence decide --input <rounds.json> [--json]`, whose input is the same schema. The verb decides loop `console-lane` only; the pipeline loops call `Decide` in process (V5, V6, V10–V12), with their own budget and mass.
+
+#### 2.1 Input schema and edge cases (one rule each)
+
+1. **The `rounds.json` shape** has one home: the `evolve convergence decide` entry in [runtime-reference.md](../operations/runtime-reference.md), which gives every field's values. Its field names:
+   - the input: `loop`, `round`, `rounds`, `components` (`separable`, `fail_safe_certificate`), `fixer` and `judge` (`family`, `tier`, `model`, `effort`);
+   - a round: `index`, `findings`, `fix_hunks` (`file`, `from`, `to`), `reentry`, `fingerprint`, `edge`;
+   - a finding: `id`, `severity`, `status`, `kind`, `class`, `component`, `location`, `late`, `certificate`, `falsification`.
+
+   Ids are stable across rounds: a re-raised finding keeps its id.
+2. **INFO** has weight 0. It never blocks and is never deferred.
+3. **`component`** is optional and judge-declared, naming the sub-feature: for example `bridge:model-check`, which spans 7 packages. When absent, it falls back to the location's directory:
+   - the Go package directory for `go/**`;
+   - `go/acs/<cycle>` for ACS predicates;
+   - the second path segment for `skills/<name>`, `docs/<area>`, `.evolve/<area>` and `agents/`;
+   - the file itself for top-level files.
+4. **A finding with no location** gets the component `unknown`. It counts toward mass, but not toward concentration. It never disables the policy.
+5. **Concentration** counts findings at LOW or above (not INFO) in the window. It is defined only when the window holds **at least 5** countable findings. Ties go to the lexically smallest component.
+6. **The window** is `concentration_window` rounds, default 2, ending at round *r*. The trigger needs two consecutive windows at or above the threshold (§3).
+7. **Progress across a bar raise:** compare the mass of findings at or above the **current** bar in both rounds. For code-review, U(n) at the current bar is the finding mass at or above the bar plus the gap mass.
+8. **Rung positions follow `max_fix_rounds` = *N*:**
+   - rung 1 is used for rounds 2 … *N*−1;
+   - rung 2 is the final round *N*;
+   - rung 3 follows round *N*.
+
+   With the default *N* = 3, this matches the diagram.
+9. **Nested loops.** The code-review round budget is **cycle-wide, across every audit-repair re-entry**, as in ADR-0124.
+   - `max_rounds` counts every review in the cycle.
+   - A round marked `reentry` is the first review after an audit-repair re-entry. It **skips the whole marginal-gain test**.
+   - The test compares neither its repair damage nor its progress with the round judged before the repair.
+   - So the round never triggers rung 2 by itself. It signals neither `CONVERGENCE_NO_PROGRESS` nor `CONVERGENCE_REPAIR_DAMAGE`.
+   - It still counts toward the budget. The budget is never multiplied.
+10. **Configuration decoding:** unknown keys are rejected (strict decode), and unknown enum words warn and resolve to the default.
+
+### 3. The ladder
+
+| Round | Rung | What changes | Blocking bar |
+|---|---|---|---|
+| `J_0` | — | a full judgment (probe and mutant quotas are allowed here only) | base (MEDIUM) |
+| 1 | 0 | fix 1 with findings and certificates. `J_1` is the first **verify-only** judgment for code-review and console judges (§4 rule 2). For audit repair, ADR-0096's tier raise stays at this first repair. | base |
+| 2 | 1, **change the feedback** | (a) `J_2` stays **verify-only**, like every judgment since `J_1` (§4 rule 2). (b) The judge's **effort** rises within its own family (deep high → top xhigh) **only for reasoning-class blockers** (correctness, concurrency, architecture), and only with headroom (§7). (c) The fixer is raised **once**, if it was not already: on the first rung-1 round, or at rung 2 when no rung-1 round ran. | base |
+| 3 (= *N*) | 2, **change the strategy** | (a) A **fresh-context** fixer works from a distilled brief, or it re-plans the approach. The brief holds the open strict findings, their certificates, and what each earlier fix changed. (b) The bar rises to **HIGH**. (c) Open MEDIUM and LOW findings become **DEFERRED** with filed follow-ups, for code-review and console only. | HIGH |
+| after *N* | 3, **change the scope** | the exits in §3.1. **No round *N*+1.** | HIGH; CRITICAL never deferred |
+
+**Triggers:**
+- **Marginal gain ≤ 0 (CR2).** The condition is one of two. The repair damage of round *r* is at least its repairs, or there is no progress at the current bar. When it holds, the next round goes **straight to the strategy change of rung 2**. If round *r* is already the final round, the loop goes to rung 3.
+- **Concentration (CR5).** `C` ≥ `concentration_threshold` (default 0.6) on **two consecutive** windows, each with at least 5 findings, escalates **the hot component only**.
+  - That component takes a rung-3 exit of its own: **split** if it is separable, or **accept with limits** if it is certified fail-safe.
+  - The rest of the loop continues on the ladder.
+  - If neither exit fits the component, the trigger is signalled and the ladder continues. Concentration alone never Stops a loop that is converging elsewhere.
+  - **L2 replayed.** Its 2-round shares, with INFO excluded, were 0.39, 0.636 and 0.647. This is the replay fixture as corrected in V1 fix round 1: the re-raised `fix-H2` keeps its id and round 7 carries its LOW-1. So the trigger reaches its threshold at `J_3`, after the final round.
+
+    By then the bar is HIGH and no strict finding remains, so L2 **lands at round 3 through rung 2**.
+    The trigger signals `CONVERGENCE_CONCENTRATION`, and the hot component's deferred MEDIUM/LOW findings carry a redesign follow-up. That is the structured-source item the console filed by hand.
+- **Oscillation.** An id reopened after FIXED twice (as in ADR-0124) jumps to rung 3.
+
+**Kind (C2):**
+- A **capability** finding below CRITICAL never blocks: it is FILED at once, at any rung.
+- A CRITICAL is always `kind: defect`.
+- In the audit, `kind` is recorded, never used to unblock.
+
+**Keep-best (CR3):** every round's candidate is checkpointed, and the loop lands the **best qualifying** round, never automatically the last. "Best" is ranked in this order:
+1. the fewest strict findings at the bar;
+2. then the lowest open mass at LOW and above (the default weights). So a round that also fixed more of its residue wins;
+3. then the earliest round.
+
+A split or accept exempts the findings of its component from the ranking, but **never a CRITICAL**. So a round with an open CRITICAL never outranks a round without one.
+
+#### 3.1 Rung 3 exits (deterministic order; split and accept both require **no open CRITICAL**, in the judged round and in the round that lands)
+
+1. **Split.** This exit applies when the concentrated component holds every remaining strict finding. When the concentration trigger fires earlier, split applies only to that component, and the rest continues.
+   - **Console lane:** the component is unstaged and filed as its own item. The split is allowed only when **the rest passes the floor without it**. A component wired into shared paths cannot be split; for example, L2's check is wired into `runTmuxREPL` and preflight.
+   - **Cycle:** a split is a **Stop** plus an ADR-0076 continuation whose brief unwires the component (`CONVERGENCE_SPLIT`). A cycle never ships DEFERRED HIGH rows by splitting.
+2. **Accept with limits.** This exit applies when every remaining strict finding is in a component the judge certifies as **failing safe**. The certificate is a test showing the failure direction falls back to a safer path.
+   - The findings become DEFERRED with the certificate attached.
+   - **For code-review, the audit adjudicates them, exactly as it adjudicates a DISPUTED row** (ADR-0124 §6.4). UPHOLD reopens the finding, and the cross-check then FAILs.
+   - The landing records the limits plus a redesign follow-up (`CONVERGENCE_ACCEPTED_LIMITS`).
+3. **Stop.** In every other case:
+   - the work is preserved (an ADR-0076 continuation for a cycle, or a staged lane for the console);
+   - every open finding is filed (`CONVERGENCE_STOP`);
+   - the loop's existing ship rule decides the outcome. Audit repair FAILs, and code-review hands to the audit with `REVIEW_UNRESOLVED`;
+   - past three blocks, the subject then takes the redesign rung (§3.3).
+
+#### 3.2 Adjudication (with headroom only)
+
+Before a rung-3 exit, one `Adjudicate` dispatch at the judge family's **top** (model, effort) is allowed to rule each remaining HIGH finding `CONFIRM` or `DOWNGRADE`.
+- This dispatch runs only when top differs from the judge's last (model, effort). Otherwise it is skipped, and `CONVERGENCE_NO_HEADROOM` is signalled.
+- When the two judges are the same model at different efforts, their errors are correlated (research F7). A disagreement between them is settled by **deterministic evidence** (a certificate or test), never by a third LLM opinion.
+
+#### 3.3 One escalation path: the redesign rung
+
+**Issue.** The operator gave two orders on 2026-11-05:
+- "review and update the adr related to the 3 retry on fixing the review CRITICAL and HIGH defects and trigger redesign as partner of ADR and pipeline flow."
+- "It should be part of escalation path when pipeline blocked due to continues failed/errors".
+
+**Gap.**
+- `Stop` ends a loop and files findings. The next try can repeat the same approach.
+- `Decision.Redesign` holds only a component list, and only `cmd_convergence.go` prints it.
+- The blocker breaker, the consecutive-FAIL breaker, the zero-ship halt and the task ceiling stop or quarantine. None of them starts a redesign.
+- ADR-0161 counted blocks beside this ladder, so one task had two rules.
+
+**Solution.** One path, one count.
+
+```mermaid
+flowchart TD
+    J["Judgment or failure event"] --> C{"Does it count?"}
+    C -- "quota or logout" --> E["Signal names its own step. No count."]
+    C -- "integrity" --> O["Operator, at once"]
+    C -- "hand-off finding" --> H["Console, at once (ADR-0158). No count."]
+    C -- "yes" --> B["Host adds one block"]
+    B --> L{"Blocks over three?"}
+    L -- "no" --> R["Retry on the ladder: feedback, then strategy"]
+    R --> J
+    L -- "yes" --> S{"Rung 3 scope exit fits?"}
+    S -- "split" --> P["The rest continues. The component, with its count, goes on."]
+    P --> F
+    S -- "accept" --> A["Accept with limits and a redesign follow-up"]
+    S -- "no" --> F{"First redesign of this subject?"}
+    F -- "yes" --> D["Redesign rung: leave the lane queue, new design card, architecture review, then code. Count restarts."]
+    D --> J
+    F -- "no" --> O
+```
+
+The rungs and the operator's words are above. The count, the failure classes, the restart and the limit of one redesign are console proposals (ADR-0126, Proposed).
+
+**The count.**
+- When each judgment holds a CRITICAL or HIGH defect, `J_0` is block 1 and `J_3` is block 4. So a full ladder has three retries, and its fourth block starts the redesign.
+- Only an open CRITICAL or HIGH defect makes a judgment a block. A round with only MEDIUM findings is a round, not a block, and it never starts a redesign.
+- A Stop with three blocks or fewer keeps §3.1, with no redesign.
+- A disputed row, a capability finding, a refuted late finding and a hand-off finding are not blocks (§3, §4, ADR-0158).
+- The count crosses rounds, rebuilds, cycles and resumes. The pipeline writes it on the host, and a seat cannot write it.
+- One event adds at most one block to a subject. A backward edge and a halt are not events of their own.
+
+**Failure events that count.**
+
+| Event | Subject | Count |
+|---|---|---|
+| Audit FAIL, or review block on a task | the task | one for each judgment |
+| A form or process failure with its recovery exhausted | the task | one for each exhausted recovery |
+| An exhausted ADR-0142 ladder, or its class `spec` at its limit | the task | one |
+| A failed cycle with a fingerprint | the task and the fingerprint | one on each |
+| A failure with no task | the fingerprint | one |
+| A host fault (class `infra`) | the fingerprint | one for each failed cycle, never on the task |
+| An unknown cause | the task, else the fingerprint | one, and the signal says "unknown" |
+| A zero-ship halt | the halt code | one for each halt |
+| The ADR-0142 class `halt` | none of its own | the halt row or the fingerprint row counts it |
+| A quota wall or a logout | none | none |
+| A hand-off finding | none | none: it goes to the console at once |
+| An integrity block | none | none: it goes to the operator at once |
+
+**The task ceiling** adds no block. An item at `TaskRetryCeiling` routes to the console with its count, in place of the quarantine, and later blocks add to that count.
+
+A halt keeps its ceiling and still stops the loop. The item it files carries the count and the rung. A recurrence after a merged fix adds to the same count. So a fingerprint with three failed fixes gets a redesign, not a fourth fix.
+
+**The redesign rung.**
+1. The fix rounds stop. The best round stays preserved, and every open finding is filed.
+2. The subject leaves the lane queue and routes to the console, with a digest of all findings.
+3. A top-tier seat names what the findings share, from the architecture side.
+3a. The seat starts with live research on the failure class. The card scores at least three options (ADR-0164 decision 12).
+4. The seat writes a new design card (ADR-0161). No seat and no console can waive this rung.
+5. The architecture review reads the card before any code. Strict TDD follows the review.
+6. The count restarts when the redesign starts. Card blocks and code blocks both count.
+7. A second count past three goes to the operator (`CONVERGENCE_TO_OPERATOR`).
+
+**What this does not change.** A CRITICAL still cannot land. An audit FAIL stays a FAIL. A redesign is never a route to a landing that skips a gate.
+
+### 4. Rules for judges
+
+These bind the **code-review judge and console delta checks**. The audit keeps its full verdict rules (§11).
+
+1. **`J_0` is a full judgment.** Every finding carries severity, kind, `blocking`, `component` (when the judge can name it), a certificate and a fix (CR6). Probe and mutant quotas belong to `J_0` only.
+2. **`J_1` and later are verify-only, with a fixed scope (CR4).** The scope is the previous findings plus fix *r*'s own hunks:
+   - each previous finding is FIXED (with a certificate) or not;
+   - regressions are judged only within the fix's hunks.
+3. **Late findings** are findings on code unchanged since `J_0`, and they are mostly judge noise (research F3).
+   - A late finding below HIGH is FILED and never blocks, whatever its falsification result.
+   - A **late CRITICAL or HIGH** carries the result of its falsification check (refute-or-promote, seeing only the diff) in `falsification`: `survived` or `refuted`. It is FILED **only when the result is `refuted`**. When `falsification` is absent, the check has not run, and the finding **blocks**: a loop never lands on a check it skipped (fail-safe). This tightens ADR-0124 §5.3's `late` rule with the falsification check.
+4. **Every blocking finding passes the falsification check** before it blocks (research F3).
+5. **A dispute never becomes another round.** It goes to the adjudicator. For code-review, the audit adjudicates (DISPUTED, as in ADR-0124). For console lanes, the operator adjudicates (research F5).
+
+### 5. Output first
+
+- **From rung 2, the objective changes.** It becomes "ship the best qualifying round". Every exit files follow-ups for what it did not resolve, so perfection is pursued through the inbox, after output.
+- **Metrics:**
+  - rounds-to-land per loop;
+  - the deferred-then-closed share;
+  - the falsification-check drop rate. A high rate means a noisy judge, and noise lowers the judge's trust weight (phase B).
+
+### 6. Where it applies
+
+| Loop | Calls `Decide`? | Rungs it uses | Notes |
+|---|---|---|---|
+| Audit repair (ADR-0092/0093/0096) | yes. *N* = the try budget of the envelope (default 2). So round 2 is its final round. ADR-0146 raises *N* to 3 when F2 lands. It combines the judge effort raise of rung 1 with the fresh-context fixer of rung 2(a). | rung 1 (the judge effort raise; no verify-only, since the audit keeps full rules), rung 2(a) (the fresh-context fixer), Stop | **No deferrals and no split or accept**: no deferral overrides the audit's FAIL. ADR-0096's raise stays at the first repair. The retry envelope stays the budget's home. |
+| Code-review ↔ build (ADR-0124, landing 2, Q3) | yes | all | `max_fix_rounds` 3 equals `max_rounds` 4 of ADR-0124 (4 reviews, 3 fix builds), so the **budget is unchanged**. Mass is U(n). **Amends ADR-0124 §6.2:** a code-review row that the policy DEFERRED at rung 2 (MEDIUM/LOW, with a filed follow-up) no longer counts as strict OPEN. Accept-with-limits rows go to audit adjudication. |
+| Explanation re-author | yes | as audit repair | It inherits the envelope. |
+| Console lane | yes, through the verb | all, with split = unstage | The console follows the decision from the start. |
+| Contract-correction ladder | **no** | — | It is a format loop, and its findings carry no severity or component. The existing mechanisms already play the rung roles. The second-block CLI escalation is rung 1. The exhaustion degrade is rung 3 (the code-review design §7, its recovery-rung table; landing 1). |
+
+### 6.1 The cycle pipeline as a whole (no endless back-and-forth)
+
+Operator directive (2026-10-07): *"Convergence rule should also apply to evo loop cycle pipeline to avoid infinite back and forth endless loop."*
+
+**Today's bounds are per loop, and the combination is unbounded except by a crash guard.**
+- **Backward edges.** The cycle graph (`docs/architecture/phase-registry.json` `legal_successors`) has these:
+  - audit → tdd and build;
+  - retrospective → tdd and audit;
+  - ship → audit, build, tdd, and **ship → ship**;
+  - debugger → audit, build, tdd and ship;
+  - code-review → build (ADR-0124, landing 2).
+- **Existing per-loop bounds:**
+  - audit repair: 2 attempts, from the envelope;
+  - ship recovery: `maxRecoveryDepth` 2, or fleet width + 1;
+  - the fleet-rebase replay: 100 steps;
+  - correction ladders: per phase.
+- **Everything else** is caught only by `defaultMaxPhaseIterations = 32` (`core/cyclerun.go`). That is a crash guard, not a convergence rule, so a cycle is allowed to bounce legally through 32 dispatches.
+- **Across cycles,** an inbox item is retried until `TaskRetryCeiling` (2) and then quarantined. `RepeatCeiling` (2) and the identical-fingerprint halt watch the batch. The response is binary: the same approach again, then quarantine. Nothing changes between attempts.
+
+**The policy covers three more scopes, all calling the same `Decide`:**
+
+| Scope | Loop name | Round | What the ladder changes | Final exit |
+|---|---|---|---|---|
+| **Within a cycle:** every backward edge combined | `cycle` | one round per backward edge taken (any of the edges above) | rung 1 at the 2nd backward edge: the next re-entry carries the accumulated findings and raises the effort of the fixer. Rung 2 at the 3rd: a fresh context (or a re-plan). The bar stays at the base (MEDIUM). A cycle defers nothing, so a raised bar, if used, lands past its open MEDIUM findings without a record of them. **Cross-loop oscillation:** the same failure fingerprint behind two different backward edges jumps to rung 3. | **`max_backward_edges`** (default 3) ends the cycle with a **Stop**: an ADR-0076 continuation, with the work preserved and the best round recorded. The cycle never crawls to the 32-iteration crash guard, which stays as a guard. |
+| **Across cycles:** one inbox item | `inbox-item` | one round per cycle try on the item, counted by its `failure_count` | try 2 (rung 1): the continuation brief carries the findings of the earlier try and the effort is raised. Try 3 (rung 2, the final try): a strategy change. It is a fresh plan at triage at the deep tier, a narrowed scope, or a split of the item. | after the final try, **rung 3**: split the item (file the hot part), or **route it to the console**, or quarantine it, as today. A third try is never the same approach. `TaskRetryCeiling` becomes the ladder's *N*. |
+| **Fleet ship recovery** (ship ↔ rebase ↔ re-audit) | `ship-recovery` | one round per recovery depth | it keeps its bound (`maxRecoveryDepth` or width + 1). With the carry composing (#796), a byte-identical rebase does not need a re-audit round. | a Stop, with the work preserved |
+
+- **One budget home per scope.** `max_backward_edges` is new config. The item ladder's *N* is `TaskRetryCeiling`, and ship recovery's is `maxRecoveryDepth`. The policy chooses rungs and never duplicates a budget.
+- **The fingerprint** is the existing failure fingerprint from the identical-fingerprint halt, so there is one vocabulary.
+- **The block count can come first.** An item at four blocks takes the redesign rung (§3.3) before its final try, and the rung replaces its quarantine.
+
+### 7. Escalation headroom
+
+Today's tier tables have **no** deep→top headroom in any family:
+
+| Family | deep | top | deep→top headroom |
+|---|---|---|---|
+| claude-tmux | opus (effort from `cli_routing`, else the compiled `medium`) | opus (the same) | none by default; a `cli_routing` effort can make one |
+| agy-claude | Claude Opus 5.5 (Medium) | Claude Opus 5.5 (Medium) | none by default |
+| agy (Gemini) | Gemini 3.1 Pro (High) | Gemini 3.1 Pro (High) | none |
+| codex | gpt-5.6-sol | gpt-5.6-sol | none |
+
+- **The operator's directive** (2026-10-07): top is **Opus 5.5 at xhigh effort**. The claude CLI accepts `--effort` low, medium, high, xhigh and max (model catalog `efforts`).
+- **Component V3b** gave Claude's top tier the xhigh effort through the one tier table. On 2026-10-08 the operator directive "Based on the opus 5.5, the effort should be configured starting with medium effort" set every tier at `medium`, except fast. Thus deep and top have no effort headroom by default. `evolve cli-routing set tiers.top --effort <level>` makes headroom after a measured gain.
+- **Raises stay within the judge's own family.** "One tier above" is never computed across families.
+- **The raise is compared with what actually ran.** When the input names the own model and effort of the fixer or judge, a target equal to that pair is no headroom. This holds even if the entry of the tier table for the current tier differs.
+- **What the headroom is good for (CR7).** Effort helps only **reasoning-class** failures. It does not help format, docs or hygiene findings, or a capability gap (research F7). Until V3b lands, rung 1(b) and §3.2 are **dormant** and signal `CONVERGENCE_NO_HEADROOM`. They never fake a raise.
+
+### 8. Configuration
+
+```json
+"workflow": {
+  "convergence": {
+    "stage": "shadow",
+    "max_fix_rounds": 3,
+    "base_blocking_bar": "MEDIUM",
+    "raised_blocking_bar": "HIGH",
+    "concentration_threshold": 0.6,
+    "concentration_window": 2,
+    "concentration_min_findings": 5,
+    "max_backward_edges": 3,
+    "max_blocks": 3,
+    "max_redesigns": 1
+  }
+}
+```
+
+- **`max_blocks` and `max_redesigns`** land with plan component R2. Strict decoding refuses them until then.
+- **Defaults and decoding:** compiled defaults live in `internal/policy`. Unknown keys are rejected, and unknown enum words warn and resolve to the default (§2.1 rule 10).
+- **`stage`:**
+  - `shadow`: loops compute and signal the decision.
+  - `enforce`: loops act on it.
+- **The console follows the decision from the start.** There are no flags.
+
+### 9. Signals (module `convergence`)
+
+| Signal | Severity | Fields | When |
+|---|---|---|---|
+| `CONVERGENCE_RUNG` | INFO | `loop`, `round`, `rung`, `bar`, `action`, `cause` | every decision, first. `cause` names why the reported rung was reached (`schedule`, `marginal-gain`, `oscillation`, `final-round`). A Land names the cause of its own rung, never the cause of the next rung |
+| `CONVERGENCE_NO_PROGRESS` | WARN | `loop`, `round`, `mass_prev`, `mass`, `bar` | no progress at the current bar |
+| `CONVERGENCE_REPAIR_DAMAGE` | WARN | `loop`, `round`, `damage`, `repairs` | damage ≥ repairs |
+| `CONVERGENCE_CONCENTRATION` | WARN | `loop`, `component`, `share`, `window` | `C` at or above the threshold |
+| `CONVERGENCE_DEFERRED` | INFO | `loop`, `count`, `followups` | rung 2 deferrals |
+| `CONVERGENCE_FILED` | INFO | `loop`, `late`, `capability` | late and capability findings filed |
+| `CONVERGENCE_SPLIT` | WARN | `loop`, `component`, `followup` | rung 3 split |
+| `CONVERGENCE_ACCEPTED_LIMITS` | WARN | `loop`, `component`, `certificate` | rung 3 accept |
+| `CONVERGENCE_STOP` | WARN | `loop`, `round`, `open`, `land_round` | rung 3 stop |
+| `CONVERGENCE_DISPUTED` | INFO | `loop`, `count`, `critical`, `adjudicator` | the decided round holds a DISPUTED row; `adjudicator` is `operator` for `console-lane`, else `audit`; the decision is unchanged |
+| `CONVERGENCE_NO_HEADROOM` | INFO | `loop`, `family`, `from`, `to` | a raise that changes no (model, effort) |
+| `CONVERGENCE_REDESIGN` | WARN | `subject`, `blocks`, `trigger`, `cause`, `evidence`, `next` | the subject takes the redesign rung (§3.3); `cause` can be `unknown` |
+| `CONVERGENCE_TO_OPERATOR` | ERROR | `subject`, `blocks`, `trigger`, `cause`, `evidence`, `next` | a count past three after one redesign (§3.3) |
+
+### 10. Recovery rungs (only logic blocks)
+
+- **The decision cannot be computed** (malformed rounds). The loop keeps its current behaviour, signals the cause, and never blocks. A finding with no location is *not* malformed (§2.1 rule 4).
+- **A follow-up cannot be filed.** The deferral or filing still happens, and the finding is written into the landing notes.
+
+### 11. What this does not do
+
+- **It never defers a CRITICAL, and never lets one land.**
+  - Split and accept both require no open CRITICAL in the judged round.
+  - A split or accept never exempts a CRITICAL from keep-best. Every landing (Land, Split, AcceptWithLimits) re-checks the round that it lands and stops if that round holds an open CRITICAL.
+  - A late CRITICAL or HIGH whose falsification check has not run blocks; only a `refuted` one is filed (§4 rule 3).
+  - A CRITICAL that arrives DEFERRED or FILED is malformed input and is refused.
+- **It never turns an audit FAIL into a PASS.** The audit's verdict rules and the kernel cross-checks ([ADR-0124](adr/0124-code-review-phase.md), [ADR-0125](adr/0125-audit-publishes-its-evaluation-contract.md)) are unchanged. The audit records `kind`, and verify-only does not bind it. The one changed input is which *code-review rows* the cross-check counts (§6), and accept-with-limits rows still face the audit's adjudication.
+- **It does not replace any loop's budget home.**
+- **It does not add a phase.**

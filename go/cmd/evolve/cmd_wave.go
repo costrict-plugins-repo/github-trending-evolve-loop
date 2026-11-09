@@ -1,0 +1,271 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/cli/opscmd"
+	"github.com/mickeyyaya/evolve-loop/go/internal/gitexec"
+	"github.com/mickeyyaya/evolve-loop/go/internal/looppreflight"
+	"github.com/mickeyyaya/evolve-loop/go/internal/paths"
+	"github.com/mickeyyaya/evolve-loop/go/internal/proctree"
+	"github.com/mickeyyaya/evolve-loop/go/internal/runlease"
+	"github.com/mickeyyaya/evolve-loop/go/internal/sysexec"
+	"github.com/mickeyyaya/evolve-loop/go/internal/wave"
+)
+
+const (
+	wavePrefix          = "evolve wave: "
+	waveBuildVerb       = "wave-build"
+	waveWatchPoll       = 5 * time.Second
+	waveStatusMaxCycles = 20
+	waveUsage           = `usage: evolve wave next [--max-cycles N] [--merge n,...] [--note TEXT]... [--number N] [--dry-run] [--json] [--project-root P]
+       evolve wave status [--json] [--project-root P]
+       evolve wave supply [--json] [--project-root P]
+       evolve wave latency [--wave N | --cycles A-B] [--json] [--project-root P]
+       evolve wave watch [--json] [--project-root P]
+       evolve wave note add TEXT | list [--json] | clear [--project-root P]
+       evolve wave stop [--wait D] [--json] [--project-root P]
+one cycle in the foreground: evolve cycle run --goal-text G; resume a paused cycle: evolve cycle resume; stop at the next wave boundary: evolve wave stop --wait 10m`
+)
+
+var (
+	mergedPRSubject = regexp.MustCompile(`^Merge pull request #(\d+)`)
+	squashPRSubject = regexp.MustCompile(`\(#(\d+)\)$`)
+)
+
+type waveEnv struct {
+	resolveRoot   func(projectRoot string, stderr io.Writer) (string, error)
+	executable    func() (string, error)
+	pidStarted    func(int) (time.Time, bool)
+	dispatch      boundaryDispatch
+	now           func() time.Time
+	sleep         func(time.Duration)
+	pidAlive      func(int) bool
+	saveRecord    func(wave.Store, wave.Record) error
+	mainHead      func(root string) (string, error)
+	mergedPRs     func(root, since string) ([]string, error)
+	loadGraph     graphLoader
+	refreshBinary func(loopConfig, io.Writer) bootBinaryRefreshResult
+	openEvents    func(evolveDir string) (eventSource, error)
+	diskFree      func(path string) (uint64, error)
+}
+
+type wavePlaneDirs struct {
+	root      string
+	evolveDir string
+	store     wave.Store
+}
+
+func runWave(args []string, _ io.Reader, stdout, stderr io.Writer) int {
+	return runWaveWith(defaultWaveEnv(), args, stdout, stderr)
+}
+
+func defaultWaveEnv() waveEnv {
+	return waveEnv{
+		resolveRoot: loopStopRoot, executable: os.Executable, pidStarted: processStartTime,
+		dispatch: dispatchWaveVerb(sysexec.DefaultRunner), now: time.Now, sleep: time.Sleep,
+		pidAlive: runlease.PIDAlive, saveRecord: wave.Store.Save, mainHead: gitMainHead, mergedPRs: gitMergedPRs, loadGraph: loadModuleGraph,
+		refreshBinary: bootBinaryRefresh, openEvents: openWaveEvents, diskFree: looppreflight.DiskFreeBytes,
+	}
+}
+
+func runWaveWith(env waveEnv, args []string, stdout, stderr io.Writer) int {
+	handlers := map[string]func(waveEnv, []string, io.Writer, io.Writer) int{
+		"next": runWaveNext, "status": runWaveStatus, "supply": runWaveSupply, "latency": runWaveLatency, "watch": runWaveWatch, "note": runWaveNote, "stop": runWaveStop,
+	}
+	if len(args) == 0 {
+		return waveUsageError(stderr, errors.New("a sub-verb is required"))
+	}
+	run, ok := handlers[args[0]]
+	if !ok {
+		return waveUsageError(stderr, fmt.Errorf("unknown sub-verb %q", args[0]))
+	}
+	return run(env, args[1:], stdout, stderr)
+}
+
+func waveUsageError(stderr io.Writer, err error) int {
+	fmt.Fprintf(stderr, "%s%v\n%s\n", wavePrefix, err, waveUsage)
+	return exitUsage
+}
+
+func resolveWavePlane(env waveEnv, projectRoot string, stderr io.Writer) (wavePlaneDirs, error) {
+	root, err := env.resolveRoot(projectRoot, stderr)
+	if err != nil {
+		return wavePlaneDirs{}, err
+	}
+	evolveDir := paths.EvolveDirOf(root)
+	return wavePlaneDirs{root: root, evolveDir: evolveDir, store: wave.NewStore(evolveDir)}, nil
+}
+
+func waveLiveRuns(evolveDir string, now time.Time) []runlease.LiveRun {
+	return runlease.LiveRuns(filepath.Join(evolveDir, "runs"), now)
+}
+
+func waveLoopLive(env waveEnv, evolveDir string, rec wave.Record) (bool, string) {
+	if len(waveLiveRuns(evolveDir, env.now())) > 0 {
+		return true, ""
+	}
+	return waveOwnsPID(env, rec)
+}
+
+func waveOwnsPID(env waveEnv, rec wave.Record) (bool, string) {
+	if rec.PID <= 0 || !env.pidAlive(rec.PID) {
+		return false, ""
+	}
+	if writer, err := readWriterPID(rec.LogPath); err != nil || writer != rec.PID {
+		return false, ""
+	}
+	started, known := env.pidStarted(rec.PID)
+	if !known {
+		return true, fmt.Sprintf("the start time of pid %d is unknown; the wave counts it as the loop", rec.PID)
+	}
+	return !started.After(rec.StartedAt), ""
+}
+
+func processStartTime(pid int) (time.Time, bool) {
+	at, err := proctree.StartTime(pid)
+	return at, err == nil
+}
+
+func runWaveNote(env waveEnv, args []string, stdout, stderr io.Writer) int {
+	var projectRoot string
+	var asJSON bool
+	operands, err := cliFlags{bools: map[string]*bool{"--json": &asJSON}, values: map[string]*string{"--project-root": &projectRoot}}.parse(args)
+	if err == nil && len(operands) == 0 {
+		err = errors.New("note needs add, list or clear")
+	}
+	if err != nil {
+		return waveUsageError(stderr, err)
+	}
+	plane, err := resolveWavePlane(env, projectRoot, stderr)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s%v\n", wavePrefix, err)
+		return exitIO
+	}
+	switch operands[0] {
+	case "add":
+		return addWaveNote(env, plane.store, strings.Join(operands[1:], " "), asJSON, stdout, stderr)
+	case "list":
+		return listWaveNotes(plane.store, asJSON, stdout, stderr)
+	case "clear":
+		return clearWaveNotes(plane.store, asJSON, stdout, stderr)
+	default:
+		return waveUsageError(stderr, fmt.Errorf("unknown note sub-verb %q", operands[0]))
+	}
+}
+
+type waveNoteResult struct {
+	Action string      `json:"action"`
+	Notes  []wave.Note `json:"notes"`
+}
+
+func addWaveNote(env waveEnv, store wave.Store, text string, asJSON bool, stdout, stderr io.Writer) int {
+	if strings.TrimSpace(text) == "" {
+		return waveUsageError(stderr, errors.New("note add needs a text"))
+	}
+	n, err := store.AddNote(text, env.now())
+	if err != nil {
+		fmt.Fprintf(stderr, "%s%v\n", wavePrefix, err)
+		return exitIO
+	}
+	if asJSON {
+		return writeWaveJSON(waveNoteResult{Action: "add", Notes: []wave.Note{n}}, stdout, stderr)
+	}
+	fmt.Fprintf(stdout, "wave: queued note %s for the next wave\n", n.Name)
+	return 0
+}
+
+func listWaveNotes(store wave.Store, asJSON bool, stdout, stderr io.Writer) int {
+	notes, err := store.Notes()
+	if err != nil {
+		fmt.Fprintf(stderr, "%s%v\n", wavePrefix, err)
+		return exitIO
+	}
+	if asJSON {
+		return writeWaveJSON(waveNoteResult{Action: "list", Notes: append([]wave.Note{}, notes...)}, stdout, stderr)
+	}
+	for _, n := range notes {
+		fmt.Fprintf(stdout, "%s: %s\n", n.Name, n.Text)
+	}
+	return 0
+}
+
+func clearWaveNotes(store wave.Store, asJSON bool, stdout, stderr io.Writer) int {
+	notes, err := store.Notes()
+	if err == nil {
+		err = store.RemoveNotes(notes)
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "%s%v\n", wavePrefix, err)
+		return exitIO
+	}
+	if asJSON {
+		return writeWaveJSON(waveNoteResult{Action: "clear", Notes: append([]wave.Note{}, notes...)}, stdout, stderr)
+	}
+	fmt.Fprintf(stdout, "wave: removed %d note(s)\n", len(notes))
+	return 0
+}
+
+func dispatchWaveVerb(run sysexec.RunFunc) boundaryDispatch {
+	handlers := map[string]func([]string, io.Reader, io.Writer, io.Writer) int{
+		"checkpoint": runCheckpoint, "reset-sha": runResetSHA, "doctor": opscmd.RunDoctor,
+		waveBuildVerb: func(args []string, _ io.Reader, stdout, stderr io.Writer) int {
+			return runWaveBuild(run, args, stdout, stderr)
+		},
+	}
+	return func(verb string, args []string, stdout, stderr io.Writer) int {
+		if h, ok := handlers[verb]; ok {
+			return h(args, strings.NewReader(""), stdout, stderr)
+		}
+		return dispatchBoundaryVerb(verb, args, stdout, stderr)
+	}
+}
+
+func runWaveBuild(run sysexec.RunFunc, args []string, stdout, stderr io.Writer) int {
+	var projectRoot string
+	if _, err := (cliFlags{values: map[string]*string{"--project-root": &projectRoot}}).parse(args); err != nil || projectRoot == "" {
+		fmt.Fprintf(stderr, "%s%s needs --project-root\n", wavePrefix, waveBuildVerb)
+		return exitUsage
+	}
+	rc, err := run(context.Background(), "make", "", []string{"-C", filepath.Join(projectRoot, "go"), "build"}, nil, nil, stdout, stderr)
+	if err != nil {
+		fmt.Fprintf(stderr, "%sbuild: %v\n", wavePrefix, err)
+		return exitIO
+	}
+	return rc
+}
+
+func gitMainHead(root string) (string, error) {
+	return gitexec.Default(root).HEAD(context.Background())
+}
+
+func gitMergedPRs(root, since string) ([]string, error) {
+	out, err := gitexec.Default(root).Output(context.Background(), "log", "--first-parent", "--format=%s", since+"..HEAD")
+	if err != nil {
+		return nil, fmt.Errorf("list the merges since %s: %w", since, err)
+	}
+	return parseMergedPRs(out), nil
+}
+
+func parseMergedPRs(log string) []string {
+	var prs []string
+	for _, line := range strings.Split(log, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if m := mergedPRSubject.FindStringSubmatch(trimmed); m != nil {
+			prs = append(prs, m[1])
+			continue
+		}
+		if m := squashPRSubject.FindStringSubmatch(trimmed); m != nil {
+			prs = append(prs, m[1])
+		}
+	}
+	return prs
+}

@@ -1,0 +1,223 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+	"github.com/mickeyyaya/evolve-loop/go/internal/gittest"
+	"github.com/mickeyyaya/evolve-loop/go/internal/looppreflight"
+	"github.com/mickeyyaya/evolve-loop/go/internal/runlease"
+	"github.com/mickeyyaya/evolve-loop/go/test/fixtures"
+)
+
+func brInitRepo(t *testing.T) string {
+	t.Helper()
+	return gittest.FromTemplate(t, "cmd-evolve-boot-recovery-repo", func(r *gittest.Repo) error {
+		r.Git("config", "user.email", "ci@example.com")
+		r.Git("config", "user.name", "ci")
+		r.Git("config", "commit.gpgsign", "false")
+		r.Write("README", "seed\n")
+		r.Git("add", "-A")
+		r.Git("commit", "-m", "seed")
+		return nil
+	}).Dir
+}
+
+func bootRecoveryGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
+func brPorcelain(t *testing.T, dir string) string {
+	t.Helper()
+	cmd := exec.Command("git", "status", "--porcelain")
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git status: %v\n%s", err, out)
+	}
+	return string(out)
+}
+
+func TestDefaultBootRecovery_QuarantinesDirtyTree(t *testing.T) {
+	t.Parallel()
+	repo := brInitRepo(t)
+	evolveDir := filepath.Join(repo, ".evolve")
+	if err := os.MkdirAll(evolveDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(repo, "go", "internal", "leak.go")
+	if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(src, []byte("package leak\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bootRecoveryGit(t, repo, "add", "-A")
+	bootRecoveryGit(t, repo, "commit", "-m", "add leak.go")
+	if err := os.WriteFile(src, []byte("package leak\n// leaked\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stderr bytes.Buffer
+	res := bootRecoverFn(context.Background(),
+		loopConfig{ProjectRoot: repo, EvolveDir: evolveDir}, newFakeLedger(), &stderr)
+
+	if !res.Quarantined {
+		t.Errorf("dirty tracked source must be quarantined; res=%+v stderr=%q", res, stderr.String())
+	}
+	if out := brPorcelain(t, repo); out != "" {
+		t.Errorf("boot recovery must leave the tree clean; git status --porcelain = %q", out)
+	}
+}
+
+func TestDefaultBootRecovery_DetectsShipSHAMismatch(t *testing.T) {
+	t.Parallel()
+	repo := brInitRepo(t)
+	evolveDir := filepath.Join(repo, ".evolve")
+	binPath := filepath.Join(repo, "go", "bin", "evolve")
+	if err := os.MkdirAll(filepath.Dir(binPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(binPath, []byte("\x7fELF-rebuilt-binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(evolveDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	brWriteJSON(t, filepath.Join(evolveDir, "state.json"),
+		map[string]any{"expected_ship_sha": "0000not-the-real-sha0000"})
+
+	var stderr bytes.Buffer
+	res := bootRecoverFn(context.Background(),
+		loopConfig{ProjectRoot: repo, EvolveDir: evolveDir}, newFakeLedger(), &stderr)
+
+	if !res.SHAMismatch {
+		t.Errorf("a ship binary whose SHA != expected_ship_sha must be flagged at boot; res=%+v stderr=%q", res, stderr.String())
+	}
+}
+
+func TestDefaultBootRecovery_AutosealsDeadOwnerMarker(t *testing.T) {
+	t.Parallel()
+	repo := brInitRepo(t)
+	evolveDir := filepath.Join(repo, ".evolve")
+	workspace := filepath.Join(evolveDir, "runs", "cycle-491")
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "scout-report.md"), []byte("partial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	brWriteJSON(t, filepath.Join(evolveDir, "cycle-state.json"), map[string]any{
+		"cycle_id":       491,
+		"phase":          "scout",
+		"active_agent":   "scout",
+		"workspace_path": workspace,
+	})
+	brWriteJSON(t, filepath.Join(evolveDir, "state.json"), map[string]any{
+		"lastCycleNumber": 490,
+	})
+	if err := runlease.Write(workspace, runlease.Lease{RunID: "run-491", OwnerPID: 999999}, time.Now().UTC()); err != nil {
+		t.Fatalf("seed lease: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	res := bootRecoverFn(context.Background(),
+		loopConfig{ProjectRoot: repo, EvolveDir: evolveDir}, newFakeLedger(), &stderr)
+
+	if !res.Sealed {
+		t.Errorf("a dead-owner stranded marker must be auto-sealed at boot; res=%+v stderr=%q", res, stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(evolveDir, "cycle-state.json")); !os.IsNotExist(err) {
+		t.Errorf("the stranded marker must be cleared after auto-seal (err=%v)", err)
+	}
+}
+
+func TestDefaultBootRecovery_CleanStateNoOp(t *testing.T) {
+	t.Parallel()
+	repo := brInitRepo(t)
+	evolveDir := filepath.Join(repo, ".evolve")
+	if err := os.MkdirAll(evolveDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var stderr bytes.Buffer
+	res := bootRecoverFn(context.Background(),
+		loopConfig{ProjectRoot: repo, EvolveDir: evolveDir}, newFakeLedger(), &stderr)
+
+	if res.Quarantined || res.Sealed || res.SHAMismatch {
+		t.Errorf("clean state must trigger no recovery action; got %+v", res)
+	}
+	if out := brPorcelain(t, repo); out != "" {
+		t.Errorf("clean tree must stay clean; git status --porcelain = %q", out)
+	}
+}
+
+func TestRunLoop_InvokesBootRecoveryBeforeGate(t *testing.T) {
+	projectRoot := t.TempDir()
+	evolveDir := filepath.Join(projectRoot, ".evolve")
+	if err := os.MkdirAll(evolveDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	called := false
+	capturedRoot := ""
+	prevBR := bootRecoverFn
+	defer func() { bootRecoverFn = prevBR }()
+	bootRecoverFn = func(_ context.Context, cfg loopConfig, _ core.Ledger, _ io.Writer) bootRecoveryResult {
+		called = true
+		capturedRoot = cfg.ProjectRoot
+		return bootRecoveryResult{}
+	}
+
+	prevDeps := wireOrchestratorDepsFn
+	defer func() { wireOrchestratorDepsFn = prevDeps }()
+	wireOrchestratorDepsFn = func(string, string, io.Writer, routingRun) orchDeps {
+		return orchDeps{Storage: &fixtures.FakeStorage{}, Ledger: newFakeLedger()}
+	}
+	prevPf := runLoopPreflightFn
+	defer func() { runLoopPreflightFn = prevPf }()
+	runLoopPreflightFn = func(loopConfig, io.Writer) looppreflight.Result { return forcedHalt() }
+
+	var stdout, stderr bytes.Buffer
+	rc := runLoop([]string{
+		"--project-root", projectRoot,
+		"--evolve-dir", evolveDir,
+		"--goal-text", "anything",
+		"--cycles", "1",
+		"--force-fresh",
+	}, nil, &stdout, &stderr)
+
+	if rc != 2 {
+		t.Fatalf("rc=%d want 2 (preflight halt); stderr=%q", rc, stderr.String())
+	}
+	if !called {
+		t.Fatal("runLoop must invoke bootRecoverFn during boot — a recovery function runLoop never calls is dead code (cycle 506 F1)")
+	}
+	if capturedRoot != projectRoot {
+		t.Errorf("bootRecoverFn must receive the loop's project root; got %q want %q", capturedRoot, projectRoot)
+	}
+}
+
+func brWriteJSON(t *testing.T, path string, v any) {
+	t.Helper()
+	raw, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

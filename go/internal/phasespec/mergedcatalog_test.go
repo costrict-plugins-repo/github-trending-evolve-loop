@@ -1,0 +1,131 @@
+package phasespec
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func seedProject(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	regDir := filepath.Join(root, "docs", "architecture")
+	if err := os.MkdirAll(regDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	registry := `{"phases":[{"name":"build","archetype":"build","agent":"evolve-builder",
+		"outputs":{"files":[".evolve/runs/cycle-{cycle}/build-report.md"]}}]}`
+	if err := os.WriteFile(filepath.Join(regDir, "phase-registry.json"), []byte(registry), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	userDir := filepath.Join(root, ".evolve", "phases", "widget-scan")
+	if err := os.MkdirAll(userDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	spec := `{"name":"widget-scan","archetype":"evaluate","agent":"evolve-widget-scan",
+		"outputs":{"files":[".evolve/runs/cycle-{cycle}/widget-scan-report.md"]}}`
+	if err := os.WriteFile(filepath.Join(userDir, "phase.json"), []byte(spec), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+func TestMergedCatalog_ResolvesBuiltinAndUserPhases(t *testing.T) {
+	root := seedProject(t)
+
+	cat, sources, warns, err := MergedCatalog(root)
+	if err != nil {
+		t.Fatalf("MergedCatalog: %v", err)
+	}
+	if len(warns) != 0 {
+		t.Errorf("warns = %v, want none", warns)
+	}
+	if _, ok := cat.Get("build"); !ok {
+		t.Error("built-in phase 'build' must resolve")
+	}
+	if _, ok := cat.Get("widget-scan"); !ok {
+		t.Error("user phase 'widget-scan' must resolve through the merged catalog")
+	}
+	if !cat.IsUser("widget-scan") {
+		t.Error("widget-scan must be flagged as a user phase")
+	}
+	if src := sources["widget-scan"]; src == "" {
+		t.Errorf("sources[widget-scan] = %q, want its discovery root", src)
+	}
+}
+
+func TestMergedCatalog_MissingRegistryErrors(t *testing.T) {
+	if _, _, _, err := MergedCatalog(t.TempDir()); err == nil {
+		t.Error("MergedCatalog(no registry) = nil error, want error")
+	}
+}
+
+func writePolicy(t *testing.T, root, body string) {
+	t.Helper()
+	dir := filepath.Join(root, ".evolve")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "policy.json"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRootsWithWarnings(t *testing.T) {
+	cases := []struct {
+		name     string
+		policy   *string
+		wantRoot string
+		wantWarn bool
+	}{
+		{name: "missing policy.json", wantRoot: defaultRoot},
+		{name: "valid policy.json", policy: ptr(`{"paths":{"phase_roots":"custom"}}`), wantRoot: "custom"},
+		{name: "malformed policy.json", policy: ptr(`{"paths":{"phase_roots":"custom"},`), wantRoot: defaultRoot, wantWarn: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			if tc.policy != nil {
+				writePolicy(t, root, *tc.policy)
+			}
+
+			roots, warns := RootsWithWarnings(root)
+
+			if want := filepath.Join(root, tc.wantRoot); len(roots) != 1 || roots[0] != want {
+				t.Errorf("roots = %v, want [%s]", roots, want)
+			}
+			if strings.Join(Roots(root), ":") != strings.Join(roots, ":") {
+				t.Errorf("Roots = %v, want the same roots as RootsWithWarnings %v", Roots(root), roots)
+			}
+			if !tc.wantWarn {
+				if len(warns) != 0 {
+					t.Errorf("warns = %v, want none", warns)
+				}
+				return
+			}
+			if len(warns) != 1 || !strings.HasPrefix(warns[0], "PHASE_ROOTS_POLICY_UNREADABLE: ") || !strings.Contains(warns[0], filepath.Join(root, ".evolve", "policy.json")) {
+				t.Errorf("warns = %v, want one PHASE_ROOTS_POLICY_UNREADABLE warning naming the policy.json path", warns)
+			}
+		})
+	}
+}
+
+func TestMergedCatalog_MalformedPolicyWarnsAndKeepsDefaultRoot(t *testing.T) {
+	root := seedProject(t)
+	writePolicy(t, root, `{`)
+
+	cat, _, warns, err := MergedCatalog(root)
+
+	if err != nil {
+		t.Fatalf("MergedCatalog: %v, want the catalog with a warning", err)
+	}
+	if _, ok := cat.Get("widget-scan"); !ok {
+		t.Error("the default-root user phase must still resolve when policy.json is malformed")
+	}
+	if len(warns) != 1 || !strings.HasPrefix(warns[0], "PHASE_ROOTS_POLICY_UNREADABLE: ") {
+		t.Errorf("warns = %v, want exactly the PHASE_ROOTS_POLICY_UNREADABLE warning", warns)
+	}
+}
+
+func ptr(s string) *string { return &s }

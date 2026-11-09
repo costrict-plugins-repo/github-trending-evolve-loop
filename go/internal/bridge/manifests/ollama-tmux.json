@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "cli": "ollama-tmux",
+  "binary": "ollama",
+  "probe_unsandboxed_reason": "A version or model probe of ollama talks to the local ollama server and reads its model store under $HOME. The phase sandbox grants neither, so the probe runs outside it.",
+  "env_passthrough": ["OLLAMA_HOST", "OLLAMA_API_KEY", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "no_proxy", "all_proxy"],
+  "model_family": "local",
+  "parsers": {"pane": "ollama-repl-v1"},
+  "capabilities": [],
+  "home_reads": ["~/.ollama"],
+  "binary_min_version": "0.1.0",
+  "transport": "tmux",
+  "default_tier": "hybrid",
+  "tier_dependencies": {
+    "full": [
+      "ollama",
+      "tmux"
+    ],
+    "hybrid": [
+      "ollama",
+      "tmux"
+    ],
+    "degraded": [
+      "ollama"
+    ]
+  },
+  "prompt_marker": ">>> ",
+  "transient_regex": "(?i)(\\b5\\d{2}\\b\\s*internal server error|runner process has terminated|connection refused)",
+  "default_model": "llama3.1:8b",
+  "default_args": ["--experimental-yolo"],
+  "params": {
+    "model_tier": {
+      "channel": "noop"
+    },
+    "effort": {
+      "channel": "noop"
+    },
+    "permission": {
+      "channel": "noop"
+    },
+    "settings_scope": {
+      "channel": "noop"
+    },
+    "session_mode": {
+      "channel": "controller"
+    }
+  },
+  "controls": {
+    "status":    { "send": "/show info", "await": "prompt_marker" },
+    "clean_ctx": { "send": "/clear" },
+    "model":     { "send": "/load" },
+    "help":      { "send": "/help" },
+    "exit":      { "send": "/bye" }
+  },
+  "interactive_prompts": [
+    {
+      "name": "auth_required",
+      "regex": "ollama signin|sign in to ollama|authentication required|unauthorized",
+      "response_keys": null,
+      "tail_lines": 12,
+      "policy": "escalate",
+      "note": "Cloud :cloud-suffixed models require OLLAMA_API_KEY or a prior `ollama signin`; local tags need no auth"
+    },
+    {
+      "name": "model_not_found",
+      "regex": "model.*not found|pull the model first|no such file or directory.*model",
+      "response_keys": null,
+      "policy": "escalate",
+      "note": "Operator must `ollama pull <model>` (local) or check the cloud model tag spelling"
+    },
+    {
+      "name": "context_exceeded",
+      "regex": "context.*exceed|context window|max.*tokens.*reached",
+      "response_keys": null,
+      "policy": "escalate"
+    },
+    {
+      "name": "rate_limit",
+      "regex": "(usage|rate)[ -]limit (reached|exceeded|hit)|too many requests|429",
+      "response_keys": null,
+      "policy": "escalate"
+    }
+  ],
+  "stub": false,
+  "model_tier_map": {
+    "fast": "qwen3:7b",
+    "balanced": "qwen3:30b",
+    "deep": "qwen3-coder:30b",
+    "top": "qwen3-coder:30b"
+  },
+  "note": "Local-or-cloud ollama via tmux REPL. Cloud routing is by MODEL TAG: `gpt-oss:120b-cloud` transparently hits ollama.com (needs OLLAMA_API_KEY / `ollama signin`); bare tags (`qwen3:30b`, `gemma4:26b`, ...) run on local hardware via the same daemon. OLLAMA_HOST selects WHICH `ollama serve` instance the CLI talks to (default 127.0.0.1:11434) — NOT cloud routing. Reasoning/review phases only — plain `ollama run` has no agentic tool-use (no Bash/Edit/Write), so source-writing phase assignment is rejected at Launch. model_tier_map defaults to the qwen3 family per the May 2026 ollama coding-agent rankings (fast→qwen3:7b for quick tasks, balanced→qwen3:30b for general work, deep→qwen3-coder:30b RL-trained on SWE-Bench); operators override via the per-phase EVOLVE_<AGENT>_MODEL or by `ollama pull`ing a different default. Cloud cannot do `format: {schema}` structured output — pin local tags for schema-bound phases. See knowledge-base/research/ollama-control-surface-2026.md + cycle-124 followup research dossier."
+}

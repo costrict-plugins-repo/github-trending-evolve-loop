@@ -1,0 +1,242 @@
+package build
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"testing/fstest"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+	"github.com/mickeyyaya/evolve-loop/go/internal/phases/runner/runnertest"
+	"github.com/mickeyyaya/evolve-loop/go/internal/prompts"
+	"github.com/mickeyyaya/evolve-loop/go/test/fixtures"
+)
+
+type fakeBridge struct {
+	resp          core.BridgeResponse
+	err           error
+	writeArtifact string
+	gotReq        core.BridgeRequest
+}
+
+func (f *fakeBridge) Launch(ctx context.Context, req core.BridgeRequest) (core.BridgeResponse, error) {
+	f.gotReq = req
+	if f.writeArtifact != "" && req.ArtifactPath != "" {
+		_ = os.MkdirAll(filepath.Dir(req.ArtifactPath), 0o755)
+		_ = os.WriteFile(req.ArtifactPath, []byte(f.writeArtifact), 0o644)
+		f.resp.Stdout = f.writeArtifact
+	}
+	return f.resp, f.err
+}
+
+func (f *fakeBridge) Probe(ctx context.Context) (core.BridgeProbe, error) {
+	return core.BridgeProbe{}, nil
+}
+
+func fakePromptsFS(body string) *prompts.Loader {
+	return prompts.NewFromFS(fstest.MapFS{
+		"agents/evolve-builder.md": &fstest.MapFile{
+			Data: []byte("---\nname: evolve-builder\n---\n" + body),
+		},
+	})
+}
+
+func TestRun_HappyPath_PASSWithFilesModified(t *testing.T) {
+	ws := t.TempDir()
+	body := `# Build Report
+
+## Files Modified
+- pkg/login/rate_limit.go (NEW, 42 lines)
+- pkg/login/handler.go (modified)
+
+## Verdict
+**GREEN** — all RED tests now PASS.
+
+## Cost
+- USD: 0.85
+`
+	fb := &fakeBridge{
+		writeArtifact: body,
+		resp:          core.BridgeResponse{CostUSD: 0.85},
+	}
+	clock := fixtures.FixedClock(time.Unix(1_700_000_000, 0), 200*time.Millisecond)
+	phase := New(Config{
+		Bridge:  fb,
+		Prompts: fakePromptsFS("# Builder body"),
+		NowFn:   clock,
+	})
+
+	resp, err := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle:       10,
+		ProjectRoot: "/tmp/proj",
+		Workspace:   ws,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if resp.Verdict != core.VerdictPASS {
+		t.Errorf("Verdict=%q, want PASS", resp.Verdict)
+	}
+	if resp.NextPhase != "audit" {
+		t.Errorf("NextPhase=%q, want audit", resp.NextPhase)
+	}
+	if resp.CostUSD != 0.85 {
+		t.Errorf("CostUSD=%v, want 0.85", resp.CostUSD)
+	}
+	if resp.DurationMS != 200 {
+		t.Errorf("DurationMS=%d, want 200", resp.DurationMS)
+	}
+	wantArtifact := filepath.Join(ws, "build-report.md")
+	if fb.gotReq.ArtifactPath != wantArtifact {
+		t.Errorf("ArtifactPath=%q, want %q", fb.gotReq.ArtifactPath, wantArtifact)
+	}
+}
+
+func TestRun_NoFilesModified_FAIL(t *testing.T) {
+	body := "# Build Report\n\n## Verdict\nGREEN — no work needed.\n"
+	fb := &fakeBridge{writeArtifact: body}
+	phase := New(Config{Bridge: fb, Prompts: fakePromptsFS("body")})
+	resp, _ := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle: 1, ProjectRoot: "/p", Workspace: t.TempDir(),
+	})
+	if resp.Verdict != core.VerdictFAIL {
+		t.Errorf("Verdict=%q, want FAIL", resp.Verdict)
+	}
+}
+
+func TestClassifyArtifact_HeadingVariants(t *testing.T) {
+	for _, h := range []string{"## Changes", "## Files Changed", "## Files Modified"} {
+		body := "# Build Report\n\n" + h + "\n- foo.go\n"
+		if got := classifyArtifact(body); got != core.VerdictPASS {
+			t.Errorf("heading %q: classifyArtifact=%q, want PASS", h, got)
+		}
+	}
+	if got := classifyArtifact("# Build Report\n\n## Verdict\nGREEN\n"); got != core.VerdictFAIL {
+		t.Errorf("report with no changed-files section: got %q, want FAIL", got)
+	}
+	if got := classifyArtifact("   "); got != core.VerdictFAIL {
+		t.Errorf("empty: got %q, want FAIL", got)
+	}
+}
+
+func TestRun_EmptyArtifact_FAIL(t *testing.T) {
+	fb := &fakeBridge{writeArtifact: ""}
+	phase := New(Config{Bridge: fb, Prompts: fakePromptsFS("body"), SleepFn: runnertest.FreeSleep, ContractVerifier: runnertest.EmptyArtifactVerifier})
+	resp, _ := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle: 1, ProjectRoot: "/p", Workspace: t.TempDir(),
+	})
+	if resp.Verdict != core.VerdictFAIL {
+		t.Errorf("Verdict=%q, want FAIL", resp.Verdict)
+	}
+}
+
+func TestRun_EmptyArtifact_BuildSettleLadderKeepsProductionBounds(t *testing.T) {
+	ws := t.TempDir()
+	var rec runnertest.SleepRecorder
+	phase := New(Config{Bridge: &fakeBridge{writeArtifact: ""}, Prompts: fakePromptsFS("body"), ContractVerifier: runnertest.EmptyArtifactVerifier, SleepFn: rec.Sleep})
+	resp, _ := phase.Run(context.Background(), core.PhaseRequest{Cycle: 1, ProjectRoot: "/p", Workspace: ws})
+	if resp.Verdict != core.VerdictFAIL {
+		t.Errorf("Verdict=%q, want FAIL", resp.Verdict)
+	}
+	rec.AssertProductionLadder(t)
+}
+
+func TestRun_BridgeError_FAIL(t *testing.T) {
+	bridgeErr := errors.New("bridge fail")
+	fb := &fakeBridge{err: bridgeErr}
+	phase := New(Config{Bridge: fb, Prompts: fakePromptsFS("body")})
+	resp, err := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle: 1, ProjectRoot: "/p", Workspace: t.TempDir(),
+	})
+	if !errors.Is(err, bridgeErr) {
+		t.Errorf("err=%v", err)
+	}
+	if resp.Verdict != core.VerdictFAIL {
+		t.Errorf("Verdict=%q, want FAIL", resp.Verdict)
+	}
+}
+
+func writeProfile(t *testing.T, contents string) string {
+	t.Helper()
+	root := t.TempDir()
+	dir := filepath.Join(root, ".evolve", "profiles")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir profiles: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "builder.json"), []byte(contents), 0o644); err != nil {
+		t.Fatalf("write profile: %v", err)
+	}
+	return root
+}
+
+func TestRun_NoProfile_EmptyExtraFlags(t *testing.T) {
+	body := "# Build Report\n## Files Modified\n- a.go\n"
+	fb := &fakeBridge{writeArtifact: body}
+	phase := New(Config{Bridge: fb, Prompts: fakePromptsFS("body")})
+	_, err := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle: 1, ProjectRoot: t.TempDir(), Workspace: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(fb.gotReq.ExtraFlags) != 0 {
+		t.Errorf("ExtraFlags should be empty when no profile + no env; got %v", fb.gotReq.ExtraFlags)
+	}
+}
+
+func TestRun_NoProfile_TheRequestPermissionModeStillWires(t *testing.T) {
+	body := "# Build Report\n## Files Modified\n- a.go\n"
+	fb := &fakeBridge{writeArtifact: body}
+	phase := New(Config{Bridge: fb, Prompts: fakePromptsFS("body")})
+	_, err := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle: 1, ProjectRoot: t.TempDir(), Workspace: t.TempDir(), PermissionMode: "plan",
+		Env: map[string]string{"EVOLVE_BUILDER_PERMISSION_MODE": "acceptEdits"},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if fb.gotReq.PermissionMode != "plan" {
+		t.Errorf("the request permission mode was not propagated; got %q", fb.gotReq.PermissionMode)
+	}
+}
+
+func TestRun_MissingBridge_ReturnsError(t *testing.T) {
+	phase := New(Config{Prompts: fakePromptsFS("body")})
+	_, err := phase.Run(context.Background(), core.PhaseRequest{Cycle: 1})
+	if err == nil || !strings.Contains(err.Error(), "bridge required") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestRun_MissingPrompts_ReturnsError(t *testing.T) {
+	phase := New(Config{Bridge: &fakeBridge{}})
+	_, err := phase.Run(context.Background(), core.PhaseRequest{Cycle: 1})
+	if err == nil || !strings.Contains(err.Error(), "prompts loader required") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestRun_AgentLoadFails_ReturnsError(t *testing.T) {
+	phase := New(Config{Bridge: &fakeBridge{}, Prompts: prompts.NewFromFS(fstest.MapFS{})})
+	_, err := phase.Run(context.Background(), core.PhaseRequest{Cycle: 1})
+	if err == nil {
+		t.Fatal("err=nil")
+	}
+}
+
+func TestName(t *testing.T) {
+	p := New(Config{})
+	if p.Name() != "build" {
+		t.Errorf("Name=%q, want build", p.Name())
+	}
+}
+
+func TestProfileName_IsTheProfileTheBuildAgentRunsUnder(t *testing.T) {
+	if got := (hooks{}).AgentPromptName(); got != "evolve-"+ProfileName {
+		t.Fatalf("AgentPromptName = %q, want %q: the runner resolves the profile by trimming evolve-", got, "evolve-"+ProfileName)
+	}
+}

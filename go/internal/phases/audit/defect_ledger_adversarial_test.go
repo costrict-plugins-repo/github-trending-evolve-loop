@@ -1,0 +1,157 @@
+package audit
+
+import (
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/continuation"
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+)
+
+func passingReport() string {
+	return "# Audit Report\n\n## Verdict\n**PASS**\n\n" +
+		`<!-- evolve-verdict: {"phase":"audit","verdict":"PASS","schema_version":1} -->` + "\n"
+}
+
+func TestAdversarial_PrePlantedWorkspaceLedgerCannotDisposition(t *testing.T) {
+	t.Parallel()
+	ws, req := continuationFixture(t, 1255, 1270, laundered)
+	planted := []any{}
+	for i := range laundered {
+		planted = append(planted, map[string]any{
+			"id": "d" + strconv.Itoa(i+1), "text": "nothing to see", "status": "FIXED",
+			"evidence": evidenceFile(t, req.ProjectRoot, "go/internal/core/fleet.go"),
+		})
+	}
+	writeJSON(t, filepath.Join(ws, ledgerFile), map[string]any{"origin_cycle": 1255, "entries": planted})
+
+	verdict, diags, _ := hooks{}.Classify(passingReport(), req, core.BridgeResponse{})
+	if verdict == core.VerdictPASS {
+		t.Errorf("a pre-planted workspace ledger closed %d inherited defects with no %s — the graded agent authored the gate's own trusted input.\ndiagnostics:\n%s",
+			len(laundered), dispositionFile, diagsText(diags))
+	}
+	doc := readLedger(t, ws)
+	for _, want := range laundered {
+		found := false
+		for _, e := range doc.Entries {
+			if e.Text == want {
+				found = true
+				if e.Status != "OPEN" {
+					t.Errorf("inherited defect %s is recorded %s on a planted row; want OPEN", e.ID, e.Status)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("inherited defect text %q was erased from the written-back ledger by the planted row", want)
+		}
+	}
+}
+
+func TestAdversarial_UnrelatedExistingFileDoesNotCloseADefect(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		evidence string
+		plant    bool
+	}{
+		{"absolute path outside the repo", "/etc/hosts", false},
+		{"the claim's own disposition file", dispositionFile + ":1", false},
+		{"the continuation manifest", "continuation-manifest.json", false},
+		{"the ledger the gate itself writes", ledgerFile, false},
+		{"traversal out of the roots", "../../../../../../etc/hosts", false},
+		{"a planted continuation manifest in the tree", "docs/" + continuation.ManifestName, true},
+		{"a planted disposition file in the tree", "docs/" + dispositionFile + ":3", true},
+		{"a planted ledger in the tree", "docs/" + ledgerFile, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ws, req := continuationFixture(t, 1255, 1270, laundered)
+			if tc.plant {
+				evidenceFile(t, req.ProjectRoot, strings.TrimSuffix(tc.evidence, ":3"))
+			}
+			var claims []any
+			for i := range laundered {
+				claims = append(claims, map[string]any{
+					"id": "d" + strconv.Itoa(i+1), "status": "FIXED", "evidence": tc.evidence,
+				})
+			}
+			writeJSON(t, filepath.Join(ws, dispositionFile), map[string]any{"dispositions": claims})
+
+			verdict, diags, _ := hooks{}.Classify(passingReport(), req, core.BridgeResponse{})
+			if verdict == core.VerdictPASS {
+				t.Errorf("evidence %q closed every inherited CRITICAL; a citation must name an in-repo file related to the fix.\ndiagnostics:\n%s", tc.evidence, diagsText(diags))
+			}
+		})
+	}
+}
+
+func TestAdversarial_ShadowedIDIsLoudAndBlocking(t *testing.T) {
+	t.Parallel()
+	ws, req := continuationFixture(t, 1255, 1270, laundered)
+	writeJSON(t, filepath.Join(ws, ledgerFile), map[string]any{
+		"origin_cycle": 1255,
+		"entries":      []any{map[string]any{"id": "d1", "text": "typo in a comment", "status": "OPEN"}},
+	})
+	var claims []any
+	for i := range laundered {
+		claims = append(claims, map[string]any{"id": "d" + strconv.Itoa(i+1), "status": "DEFERRED", "reason": "cosmetic"})
+	}
+	writeJSON(t, filepath.Join(ws, dispositionFile), map[string]any{"dispositions": claims})
+
+	verdict, diags, _ := hooks{}.Classify(passingReport(), req, core.BridgeResponse{})
+	if verdict == core.VerdictPASS {
+		t.Errorf("a row shadowing an inherited id passed; got PASS.\ndiagnostics:\n%s", diagsText(diags))
+	}
+	if !strings.Contains(diagsText(diags), "shadow") {
+		t.Errorf("the shadowing must be NAMED so the operator can tell it from an ordinary unaccounted defect; got:\n%s", diagsText(diags))
+	}
+	for _, e := range readLedger(t, ws).Entries {
+		if e.ID == "d1" && e.Text != laundered[0] {
+			t.Errorf("inherited row d1 now reads %q — the ancestor's text is the record", e.Text)
+		}
+	}
+}
+
+func TestDefectID_IsWideEnoughToResistASecondPreimage(t *testing.T) {
+	t.Parallel()
+	id := defectID("some defect text")
+	if len(id) != 33 {
+		t.Errorf("defectID() = %q (%d chars); want a 16-byte hex id — a 32-bit id is aimable", id, len(id))
+	}
+	if defectID("a") == defectID("b") {
+		t.Error("distinct texts share an id")
+	}
+}
+
+func TestEmitDefectLedger_CapsUnboundedDefects(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	defects := make([]string, defectLedgerMaxEntries+20)
+	for i := range defects {
+		defects[i] = "defect " + strconv.Itoa(i) + " " + strings.Repeat("x", defectTextMaxRunes+500)
+	}
+	if diags := emitDefectLedger(failingReportWithDefects(defects...), core.PhaseRequest{Cycle: 1285, Workspace: ws}); len(diags) != 0 {
+		t.Fatalf("emitDefectLedger: %v", diags)
+	}
+	doc := readLedger(t, ws)
+	if len(doc.Entries) > defectLedgerMaxEntries+1 {
+		t.Errorf("ledger holds %d entries; want at most the cap (%d) plus one overflow marker", len(doc.Entries), defectLedgerMaxEntries)
+	}
+	overflow := false
+	for _, e := range doc.Entries {
+		if len([]rune(e.Text)) > defectTextMaxRunes+len("…[truncated]") {
+			t.Errorf("entry %s is %d runes; want bounded at %d", e.ID, len([]rune(e.Text)), defectTextMaxRunes)
+		}
+		if strings.Contains(e.Text, "were not recorded") {
+			overflow = true
+			if e.Status != "OPEN" {
+				t.Errorf("the overflow marker is %s; it must be OPEN so a continuation inherits it", e.Status)
+			}
+		}
+	}
+	if !overflow {
+		t.Error("defects beyond the cap were dropped with no marker — a silent cap is a laundering channel")
+	}
+}

@@ -1,0 +1,224 @@
+package tdd
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"testing/fstest"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+	"github.com/mickeyyaya/evolve-loop/go/internal/phases/runner/runnertest"
+	"github.com/mickeyyaya/evolve-loop/go/internal/prompts"
+	"github.com/mickeyyaya/evolve-loop/go/test/fixtures"
+)
+
+type fakeBridge struct {
+	resp          core.BridgeResponse
+	err           error
+	writeArtifact string
+	gotReq        core.BridgeRequest
+}
+
+func (f *fakeBridge) Launch(ctx context.Context, req core.BridgeRequest) (core.BridgeResponse, error) {
+	f.gotReq = req
+	if f.writeArtifact != "" && req.ArtifactPath != "" {
+		_ = os.MkdirAll(filepath.Dir(req.ArtifactPath), 0o755)
+		_ = os.WriteFile(req.ArtifactPath, []byte(f.writeArtifact), 0o644)
+		f.resp.Stdout = f.writeArtifact
+	}
+	return f.resp, f.err
+}
+
+func (f *fakeBridge) Probe(ctx context.Context) (core.BridgeProbe, error) {
+	return core.BridgeProbe{}, nil
+}
+
+func fakePromptsFS(body string) *prompts.Loader {
+	return prompts.NewFromFS(fstest.MapFS{
+		"agents/evolve-tdd-engineer.md": &fstest.MapFile{
+			Data: []byte("---\nname: evolve-tdd-engineer\n---\n" + body),
+		},
+	})
+}
+
+func TestRun_HappyPath_PASSWithContract(t *testing.T) {
+	ws := t.TempDir()
+	contract := `# Team Context (RED Contract)
+
+## Goal
+Add rate limiter to /login
+
+## Acceptance
+- Returns 429 after 5 attempts in 60s
+- Resets on success
+
+## RED Tests
+- test/rate_limiter_test.go
+- test/login_integration_test.go
+
+## Interfaces
+- rate.Limiter (token bucket; 5 req / 60s)
+`
+	fb := &fakeBridge{writeArtifact: contract, resp: core.BridgeResponse{CostUSD: 0.20}}
+	clock := fixtures.FixedClock(time.Unix(1_700_000_000, 0), 100*time.Millisecond)
+	phase := New(Config{
+		Bridge:  fb,
+		Prompts: fakePromptsFS("# TDD body"),
+		NowFn:   clock,
+	})
+
+	resp, err := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle:       9,
+		ProjectRoot: "/tmp/proj",
+		Workspace:   ws,
+		Worktree:    "/tmp/proj/wt",
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if resp.Verdict != core.VerdictPASS {
+		t.Errorf("Verdict=%q, want PASS", resp.Verdict)
+	}
+	if resp.NextPhase != "build" {
+		t.Errorf("NextPhase=%q, want build", resp.NextPhase)
+	}
+	if resp.DurationMS != 100 {
+		t.Errorf("DurationMS=%d, want 100", resp.DurationMS)
+	}
+	if fb.gotReq.ArtifactPath != filepath.Join(ws, "test-report.md") {
+		t.Errorf("ArtifactPath=%q", fb.gotReq.ArtifactPath)
+	}
+	if fb.gotReq.Worktree != "/tmp/proj/wt" {
+		t.Errorf("Worktree=%q, want /tmp/proj/wt", fb.gotReq.Worktree)
+	}
+	wantProfile := filepath.Join("/tmp/proj", ".evolve", "profiles", "tdd-engineer.json")
+	if fb.gotReq.Profile != wantProfile {
+		t.Errorf("Profile=%q, want %q", fb.gotReq.Profile, wantProfile)
+	}
+}
+
+func TestRun_NoAcceptance_FAIL(t *testing.T) {
+	body := "# Team Context\n\n## Goal\nx\n\n## RED Tests\n- a_test.go\n"
+	fb := &fakeBridge{writeArtifact: body}
+	phase := New(Config{Bridge: fb, Prompts: fakePromptsFS("body")})
+	resp, _ := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle: 1, ProjectRoot: "/p", Workspace: t.TempDir(),
+	})
+	if resp.Verdict != core.VerdictFAIL {
+		t.Errorf("Verdict=%q, want FAIL", resp.Verdict)
+	}
+}
+
+func TestRun_NoREDTests_FAIL(t *testing.T) {
+	body := "# Team Context\n\n## Goal\nx\n\n## Acceptance\n- y\n"
+	fb := &fakeBridge{writeArtifact: body}
+	phase := New(Config{Bridge: fb, Prompts: fakePromptsFS("body")})
+	resp, _ := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle: 1, ProjectRoot: "/p", Workspace: t.TempDir(),
+	})
+	if resp.Verdict != core.VerdictFAIL {
+		t.Errorf("Verdict=%q, want FAIL", resp.Verdict)
+	}
+}
+
+func TestRun_EmptyArtifact_FAIL(t *testing.T) {
+	fb := &fakeBridge{writeArtifact: ""}
+	phase := New(Config{Bridge: fb, Prompts: fakePromptsFS("body"), SleepFn: runnertest.FreeSleep, ContractVerifier: runnertest.EmptyArtifactVerifier})
+	resp, _ := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle: 1, ProjectRoot: "/p", Workspace: t.TempDir(),
+	})
+	if resp.Verdict != core.VerdictFAIL {
+		t.Errorf("Verdict=%q, want FAIL", resp.Verdict)
+	}
+}
+
+func TestRun_EmptyArtifact_TddSettleLadderKeepsProductionBounds(t *testing.T) {
+	ws := t.TempDir()
+	var rec runnertest.SleepRecorder
+	phase := New(Config{Bridge: &fakeBridge{writeArtifact: ""}, Prompts: fakePromptsFS("body"), ContractVerifier: runnertest.EmptyArtifactVerifier, SleepFn: rec.Sleep})
+	resp, _ := phase.Run(context.Background(), core.PhaseRequest{Cycle: 1, ProjectRoot: "/p", Workspace: ws})
+	if resp.Verdict != core.VerdictFAIL {
+		t.Errorf("Verdict=%q, want FAIL", resp.Verdict)
+	}
+	rec.AssertProductionLadder(t)
+}
+
+func TestRun_BridgeError_FAIL(t *testing.T) {
+	bridgeErr := errors.New("bridge fail")
+	fb := &fakeBridge{err: bridgeErr}
+	phase := New(Config{Bridge: fb, Prompts: fakePromptsFS("body")})
+	resp, err := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle: 1, ProjectRoot: "/p", Workspace: t.TempDir(),
+	})
+	if !errors.Is(err, bridgeErr) {
+		t.Errorf("err=%v", err)
+	}
+	if resp.Verdict != core.VerdictFAIL {
+		t.Errorf("Verdict=%q, want FAIL", resp.Verdict)
+	}
+}
+
+func TestRun_MissingBridge_ReturnsError(t *testing.T) {
+	phase := New(Config{Prompts: fakePromptsFS("body")})
+	_, err := phase.Run(context.Background(), core.PhaseRequest{Cycle: 1})
+	if err == nil || !strings.Contains(err.Error(), "bridge required") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestRun_MissingPrompts_ReturnsError(t *testing.T) {
+	phase := New(Config{Bridge: &fakeBridge{}})
+	_, err := phase.Run(context.Background(), core.PhaseRequest{Cycle: 1})
+	if err == nil || !strings.Contains(err.Error(), "prompts loader required") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestRun_AgentLoadFails_ReturnsError(t *testing.T) {
+	phase := New(Config{Bridge: &fakeBridge{}, Prompts: prompts.NewFromFS(fstest.MapFS{})})
+	_, err := phase.Run(context.Background(), core.PhaseRequest{Cycle: 1})
+	if err == nil {
+		t.Fatal("err=nil")
+	}
+}
+
+func TestName(t *testing.T) {
+	p := New(Config{})
+	if p.Name() != "tdd" {
+		t.Errorf("Name=%q, want tdd", p.Name())
+	}
+}
+
+func TestClassify_HeadingVariants(t *testing.T) {
+	current := "# TDD Report\n\n## Test Files Written\n- x_test.go\n\n## RED Run Output\nfail\n\n## Coverage Map\n..\n"
+	if got := classify(current); got != core.VerdictPASS {
+		t.Errorf("current TDD headings: classify=%q, want PASS", got)
+	}
+	legacy := "# TDD Report\n\n## Acceptance\n- a\n\n## RED Tests\n- t\n"
+	if got := classify(legacy); got != core.VerdictPASS {
+		t.Errorf("legacy headings: classify=%q, want PASS", got)
+	}
+	if got := classify("# TDD Report\n\n## RED Run Output\nfail\n"); got != core.VerdictFAIL {
+		t.Errorf("RED present but no acceptance section: classify=%q, want FAIL", got)
+	}
+	if got := classify("# TDD Report\n\n## Coverage Map\n..\n"); got != core.VerdictFAIL {
+		t.Errorf("acceptance present but no RED section: classify=%q, want FAIL", got)
+	}
+}
+
+func writeTddProfile(t *testing.T, contents string) string {
+	t.Helper()
+	root := t.TempDir()
+	dir := filepath.Join(root, ".evolve", "profiles")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir profiles: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "tdd-engineer.json"), []byte(contents), 0o644); err != nil {
+		t.Fatalf("write profile: %v", err)
+	}
+	return root
+}

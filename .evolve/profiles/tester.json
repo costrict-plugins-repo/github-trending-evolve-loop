@@ -1,0 +1,121 @@
+{
+  "name": "tester",
+  "role": "builder",
+  "cli": "codex-tmux",
+  "model_tier_default": "balanced",
+  "_model_tier_overrides_note": "cycle-974: removed inert 's_complex_with_cache'=fast (zero production consumers; below floor). widened envelope max balanced->deep so complex/adversarial test-authoring strategies (ultrathink/m_complex/audit_retry=deep) sit within bounds, matching sibling profiles builder+tdd-engineer (max=deep, identical override intent).",
+  "model_tier_overrides": {
+    "ultrathink_strategy": "deep",
+    "m_complex_5plus_files": "deep",
+    "audit_retry_2plus": "deep"
+  },
+  "allowed_tools": [
+    "Read",
+    "Grep",
+    "Glob",
+    "Edit",
+    "Write",
+    "MultiEdit",
+    "NotebookEdit",
+    "Bash",
+    "Skill(code-review-simplify)",
+    "Skill(security-review-scored)",
+    "Bash(validate-predicate.sh:*)",
+    "Bash(run-acs-suite.sh:*)",
+    "Bash(evolve phase verify:*)"
+  ],
+  "disallowed_tools": [
+    "Edit(.evolve/state.json)",
+    "Edit(.evolve/ledger.jsonl)",
+    "Write(.evolve/state.json)",
+    "Write(.evolve/ledger.jsonl)",
+    "Bash(git push:*)",
+    "Bash(git config:*)",
+    "Bash(jq -i:*)",
+    "Bash(jq --in-place:*)",
+    "Bash(perl:*)",
+    "Bash(perl -e:*)",
+    "Bash(ruby:*)",
+    "Bash(ruby -e:*)",
+    "Bash(python3 -c:*)",
+    "Bash(python -c:*)",
+    "Bash(node -e:*)",
+    "Bash(osascript:*)",
+    "Bash(osascript -e:*)",
+    "Bash(sh -c:*)",
+    "Bash(bash -c:*)",
+    "Bash(zsh -c:*)",
+    "Bash(env:*)",
+    "Bash(exec:*)",
+    "Bash(eval:*)",
+    "Bash(awk:*)",
+    "Bash(unlink:*)",
+    "Bash(ln:*)",
+    "Edit(scripts/dispatch/**)",
+    "Edit(scripts/lifecycle/**)",
+    "Edit(scripts/guards/**)",
+    "Edit(scripts/cli_adapters/**)",
+    "Edit(scripts/verification/**)",
+    "Edit(scripts/utility/**)",
+    "Write(scripts/dispatch/**)",
+    "Write(scripts/lifecycle/**)",
+    "Write(scripts/guards/**)",
+    "Edit(agents/**)",
+    "Write(agents/**)",
+    "Edit(.evolve/profiles/**)",
+    "Write(.evolve/profiles/**)"
+  ],
+  "add_dir": [
+    "{worktree_path}"
+  ],
+  "max_budget_usd": 0.5,
+  "max_turns": 25,
+  "output_artifact": ".evolve/runs/cycle-{cycle}/tester-report.md",
+  "challenge_token_required": true,
+  "isolation": "worktree",
+  "settings_scope": "project",
+  "extra_flags_by_cli": {
+    "claude-tmux": [
+      "--exclude-dynamic-system-prompt-sections",
+      "--disable-slash-commands",
+      "--plugin-dir",
+      ".evolve/plugin"
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "write_subpaths": [
+      "{worktree_path}",
+      ".evolve/runs/cycle-*"
+    ],
+    "read_only_repo": false,
+    "deny_subpaths": [
+      ".git",
+      ".claude-plugin",
+      ".evolve/state.json",
+      ".evolve/ledger.jsonl",
+      ".evolve/profiles",
+      ".evolve/evals"
+    ],
+    "allow_network": true
+  },
+  "parallel_eligible": false,
+  "context_clear_trigger_tokens": 30000,
+  "model_tier_envelope": {
+    "min": "balanced",
+    "default": "balanced",
+    "max": "deep"
+  },
+  "allowed_clis": [
+    "agy",
+    "agy-claude",
+    "claude",
+    "codex"
+  ],
+  "_note": "Mirrors the builder's ceiling, for the builder's safety reasoning.",
+  "stream_output": true,
+  "generated_from": "hand-authored",
+  "cli_fallback": [
+    "claude-tmux"
+  ]
+}

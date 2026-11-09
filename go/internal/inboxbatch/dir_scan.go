@@ -1,0 +1,95 @@
+package inboxbatch
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+)
+
+type LoadWarning struct {
+	Text       string
+	Unreadable bool
+	file       string
+}
+
+type DirScan struct {
+	Items    []Item
+	Warnings []LoadWarning
+}
+
+func (s DirScan) HasUnreadable() bool {
+	for _, w := range s.Warnings {
+		if w.Unreadable {
+			return true
+		}
+	}
+	return false
+}
+
+func ScanDir(dir string) (DirScan, error) {
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return DirScan{}, nil
+	}
+	if err != nil {
+		return DirScan{}, fmt.Errorf("inboxbatch: read dir: %w", err)
+	}
+	var scan DirScan
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
+			scan = scan.withFile(dir, e.Name())
+		}
+	}
+	scan = scan.withoutResurrected(ConsumedRecords(dir))
+	sort.SliceStable(scan.Items, func(i, j int) bool { return scan.Items[i].ID < scan.Items[j].ID })
+	scan.Warnings = append(scan.Warnings, duplicateIDWarnings(scan.Items)...)
+	return scan, nil
+}
+
+func (s DirScan) withoutResurrected(consumed map[string][]ConsumedRecord) DirScan {
+	if len(consumed) == 0 {
+		return s
+	}
+	var kept []Item
+	for _, it := range s.Items {
+		if rec, ok := CopyOf(consumed[it.ID], it.CreatedAt, it.Path); ok {
+			s.Warnings = append(s.Warnings, resurrectedWarning(it.Path, rec))
+			continue
+		}
+		kept = append(kept, it)
+	}
+	s.Items = kept
+	return s
+}
+
+func (s DirScan) withFile(dir, name string) DirScan {
+	it, notices, err := LoadFile(filepath.Join(dir, name))
+	if err != nil {
+		s.Warnings = append(s.Warnings, LoadWarning{Text: name + ": " + err.Error(), Unreadable: true, file: name})
+		return s
+	}
+	for _, n := range notices {
+		s.Warnings = append(s.Warnings, LoadWarning{Text: n, file: name})
+	}
+	s.Items = append(s.Items, it)
+	return s
+}
+
+func duplicateIDWarnings(sorted []Item) []LoadWarning {
+	var out []LoadWarning
+	for i := 1; i < len(sorted); i++ {
+		if sorted[i].ID == sorted[i-1].ID {
+			out = append(out, LoadWarning{Text: sorted[i].Path + ": duplicate id " + sorted[i].ID + " (also " + sorted[i-1].Path + ") — dep/connects/routing references resolve to the earliest-filed record", file: sorted[i].Path})
+		}
+	}
+	return out
+}
+
+func (w LoadWarning) String() string {
+	if w.Unreadable {
+		return "WARN skipped " + w.Text
+	}
+	return "WARN " + w.Text
+}

@@ -1,0 +1,39 @@
+{
+  "name": "post-ship-monitor",
+  "archetype": "control",
+  "agent": "evolve-post-ship-monitor",
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/build-report.md"
+    ],
+    "signals": [
+      "ship.class"
+    ]
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/post-ship-monitor-report.md"
+    ],
+    "signals": [
+      "post_ship.health"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Health Probes",
+      "Results",
+      "Verdict"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "ship.class",
+        "op": "==",
+        "value": "cycle"
+      }
+    ]
+  },
+  "after": "ship",
+  "optional": true
+}

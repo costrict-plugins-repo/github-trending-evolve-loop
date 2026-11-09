@@ -1,0 +1,112 @@
+package audit
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+)
+
+func TestRun_CIParityGate_Offenders_FAILsAudit(t *testing.T) {
+	t.Parallel()
+	offenders := func(core.PhaseRequest) ([]string, error) { return []string{"boom"}, nil }
+	cases := []struct {
+		name string
+		cfg  Config
+		diag string
+	}{
+		{"go vet", Config{CheckGoVet: offenders}, "go vet"},
+		{"acs-durable", Config{CheckACSDurable: offenders}, "acs-durable"},
+		{"apicover-enforce", Config{CheckApicoverEnforce: offenders}, "apicover"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ws := t.TempDir()
+			writeACSVerdict(t, ws, 0)
+			cfg := tc.cfg
+			cfg.Bridge = &fakeBridge{writeArtifact: "# Audit Report\n\n## Verdict\n**PASS**\n"}
+			cfg.Prompts = fakePromptsFS("body")
+			phase := New(cfg)
+			resp, err := phase.Run(context.Background(), core.PhaseRequest{Cycle: 1, ProjectRoot: "/p", Workspace: ws})
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if resp.Verdict != core.VerdictFAIL {
+				t.Fatalf("Verdict=%q, want FAIL (%s gate reported offenders)", resp.Verdict, tc.name)
+			}
+			if !hasDiagContaining(resp.Diagnostics, tc.diag) {
+				t.Errorf("want a diagnostic mentioning %q; got %+v", tc.diag, resp.Diagnostics)
+			}
+		})
+	}
+}
+
+func TestRun_CIParityGate_Error_FailsOpenWithWarning(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	writeACSVerdict(t, ws, 0)
+	phase := New(Config{
+		Bridge:     &fakeBridge{writeArtifact: "# Audit Report\n\n## Verdict\n**PASS**\n"},
+		Prompts:    fakePromptsFS("body"),
+		CheckGoVet: func(core.PhaseRequest) ([]string, error) { return nil, errors.New("executable file not found") },
+	})
+	resp, _ := phase.Run(context.Background(), core.PhaseRequest{Cycle: 1, ProjectRoot: "/p", Workspace: ws})
+	if resp.Verdict != core.VerdictPASS {
+		t.Fatalf("Verdict=%q, want PASS (CI-parity gate infra error fails open)", resp.Verdict)
+	}
+	if !hasDiagContaining(resp.Diagnostics, "go vet gate") {
+		t.Errorf("want a warning diagnostic about the go vet gate; got %+v", resp.Diagnostics)
+	}
+}
+
+func TestNewDefault_WiresCIParityGates(t *testing.T) {
+	t.Parallel()
+	if testing.Short() {
+		t.Skip("skips real go vet subprocess under -short; full `go test` + CI still run it")
+	}
+	root := t.TempDir()
+	goDir := filepath.Join(root, "go")
+	if err := os.MkdirAll(goDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(goDir, "go.mod"), []byte("module ciparitytest\n\ngo 1.23\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(goDir, "bad.go"),
+		[]byte("package p\n\nimport \"fmt\"\n\nfunc F() { fmt.Printf(\"%d\", \"not-an-int\") }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	evolveDir := t.TempDir()
+	ws := filepath.Join(evolveDir, "runs", "cycle-7")
+	if err := os.MkdirAll(ws, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeACSVerdict(t, ws, 0)
+	buildRun := filepath.Join(root, ".evolve", "runs", "cycle-7")
+	if err := os.MkdirAll(buildRun, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(buildRun, "handoff-build.json"),
+		[]byte(`{"thrusts":[{"files_modified":["go/internal/p/x.go"]}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fb := &fakeBridge{writeArtifact: "# Audit Report\n\n## Verdict\n**PASS**\n"}
+	phase := NewDefault(fb, fakePromptsFS("body"))
+	resp, err := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle: 7, ProjectRoot: root, Worktree: root, Workspace: ws,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if resp.Verdict != core.VerdictFAIL {
+		t.Fatalf("Verdict=%q, want FAIL (NewDefault must wire the real go vet gate; go/bad.go has a vet defect)", resp.Verdict)
+	}
+	if !hasDiagContaining(resp.Diagnostics, "go vet") {
+		t.Errorf("want a go vet diagnostic; got %+v", resp.Diagnostics)
+	}
+}

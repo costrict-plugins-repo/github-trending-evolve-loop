@@ -1,0 +1,51 @@
+# internal/committedset
+
+> Related: [internal-cyclestate.md](internal-cyclestate.md) (the cycle vocabulary). This page keeps the package-level detail that the code cannot say.
+
+## Purpose
+
+`internal/committedset` owns the one answer to "which tasks did this cycle commit to?". It also owns the on-disk shapes that the answer is read from: the lane pin and triage's decision.
+
+## Design
+
+- **The protected-route artifact.** `tdd-protected-route.json` holds the cycle and the item. `tdd-protected-predicates/` holds the kept predicate files. The artifact names no path: the closeout scans the kept files again. `WriteProtectedRoute` and `ReadProtectedRoute` are the one reader and writer.
+- **The hand-off record.** `no-work-handoff.json` holds the cycle and the ids that a planned no-work closeout routed to the console. `WriteHandoff` is its one writer (the closeout), and `HandedOff` is its one reader (the loop's hand-off alarm). A record with no routed id is not a hand-off. Pinned by `TestHandoff_RecordsOnlyARealHandOffAndReadsItBack`.
+- **One reader, not four.** Four independent readers disagreed on live cycles. The readers were `core.ContractTaskIDs` (lane pin, else decision `top_n`, minus deferred) and `core.BoundTaskIDs` (`top_n` only). `inboxmover.CommittedIDs` read `top_n` plus `skip_shipped`. The cycle dossier read `top_n` only, for a short time. A record that reports a commitment it did not read is worse than a record that reports none.
+- **The lane pin is the dominant shape.** On runtime cycle 1621 the lane pin named two members while `top_n` named one. 17 of the last 20 runtime cycles carried a pin. A reader of `top_n` only under-reports the commitment on the usual shape. The tests use the shapes that real cycles leave on disk.
+- **The host record is the trust root of the pin.** `Record` (`lanerecord.go`) is `.evolve/lineage/cycle-N.json`, which the host writes before the first cell. `LanePin`, `LaneDoc` and `ReadLaneDoc` derive the project root and the cycle number from a workspace of the form `<root>/.evolve/runs/cycle-N`, and they read the record first. A record with no item id means no pin. With no record, they read `lane-scope.json` as before. `inputindex` calls this package ([ADR-0160](../adr/0160-the-host-lineage-record-is-the-one-trust-root-for-what-a-cycle-may-do-to-the-queue.md)).
+- **Only this package reads the pin file.** `TestPinFileRefs_OnlyTheListedPlacesOutsideCommittedsetNameThePinFile` reads the code outside this package. It fails on each use of `LanePinFile` or `LaneScopeFile`, and on each string literal that holds `lane-scope.json`. A place on an explicit list of files and functions passes, and a stale entry fails. A literal split with `+` is joined first. The check is static, so it cannot see a name that is built at run time.
+- **`LaneDrift` compares the file with the record.** It returns both lists and the file path when they differ. The reader never emits a signal. The host emits the signal at the seam that follows a cell (`cycleRun.reportLanePinDrift` in `internal/core`).
+- **A leaf with `atomicwrite` and stdlib imports only.** `internal/core` owns the orchestrator, and `internal/dossier` cannot import `core`. A leaf lets every consumer project from it. The package parses. The only policy it owns is the precedence in `Committed` and the rule for what counts as triage answering for an id (`DispositionsFrom`).
+- **`LanePinDoc` lives here.** `core` aliases it (`type LaneScope = committedset.LanePinDoc`), so exactly one non-test file declares `json:"todo_ids"`. `cycleoutcome`'s `TestLaneScopeProjection_SingleWireShapeDeclaration` enforces this. An alias carries no struct tag, so the composite literals in `core` keep compiling. The fields must round-trip exactly as the lane provisioner writes them (`TestLanePinDoc_IsTheOneWireShape`).
+
+## Invariants
+
+- **Precedence.** The lane pin comes first. If it is present and not empty, its ids are the commitment, also when a resumed triage re-labels its working ids. Otherwise the decision's `top_n` is the commitment. In both cases every id that the decision deferred is removed. Pinned by `TestCommitted_Precedence`.
+- **A fleet lane never falls through to `top_n`.** The fall-through to the decision is for a sequential cycle only. In a fleet lane, triage refuses to run without a non-empty pin (`TRIAGE_LANE_PIN_MISSING`, see [internal-phases-triage.md](internal-phases-triage.md)), so the agent's `top_n` never becomes a lane's commitment.
+- **Unknown is not empty.** `ok` is false only when neither artifact yields a binding. A present decision that committed to nothing returns an empty non-nil slice and true, because an explicit empty commitment is a finding. A corrupt artifact must never read as "committed to nothing". Pinned by `TestCommitted_MalformedIsUnknownNotEmpty`.
+- **The source travels with the set.** `CommittedWithSource` returns the ids and a `Source`: `SourcePin`, `SourceDecision` or `SourceUnknown`. `Committed` calls it, so its callers see no change. A text that explains a missing console route names the source. An unknown source is not an empty set, and the text for each case differs. Pinned by `TestCommittedWithSource_NamesTheFileTheSetCameFrom`.
+- **No phantom members.** An absent, malformed or empty pin returns nil, so the caller falls through to the decision and never gets a silent empty commitment. A blank id in a pin or a decision is dropped. Pinned by `TestLanePinAndDecision_BlankIDsDropped`.
+- **No phantom members.** An absent, malformed or empty pin returns nil. A record with no item id also returns nil, so the caller falls through to the decision and never gets a silent empty commitment. A blank id in a pin or a decision is dropped. Pinned by `TestLanePinAndDecision_BlankIDsDropped`.
+- **Only a deferral or a host route removes a task** from its acceptance contract. The host records each route in `RoutedIDs` of the lineage record, which a cell cannot write. An `escalate_block` line of an agent releases nothing. An absent or unreadable decision defers nothing. `RecordWorkspaceRoutes` is the one writer of a route, and it finds the record by the workspace, as the readers do. `UnroutedPin` gives the pin less the recorded routes.
+- **This package never fabricates.** Absent, unreadable and malformed artifacts all report false and answer for nothing (`readJSON`).
+- **Which buckets answer for an id.** Triage answers for an id it did not commit through four buckets: `escalate_block`, `skip_rejected`, `skip_shipped` and `dropped`. Triage can drop the one item of a lane and give a reason. Then the lane did its job, and it ends as planned no-work, not as a claim failure. Pinned by `TestDispositions_OnlyAnsweringBucketsAnswer`.
+- **A deferral never answers.** A deferred id is still owed work. On cycle 1623 a triage narrated a claim failure as a deferral, so deferral stays claimable. Pinned by the same test and by `empty_commitment_claimable_test.go`.
+- **Every answer carries evidence.** An escalation carries its reason, else its `fail_count`, else the text "escalated without a stated reason". A rejection carries triage's report of the rejected-dir match. A skip carries its sha, and a drop carries its reason. A skip without a sha, or a drop without a reason, answers for nothing.
+- **The most severe bucket wins.** An id in two buckets is reported once, in the order `escalate_block`, `skip_rejected`, `skip_shipped`, `dropped`. A drop's "already-shipped" reason never masks an integrity escalation. Pinned by `TestDispositions_TheMostSevereBucketWinsAndNothingIsFabricated`.
+- **Body-level reader.** `DispositionsFrom` gives the same answers as the workspace reader `Dispositions`, for packages that already hold a decision body (`inboxmover`). Pinned by `TestDispositionsFrom_ReadsTheDecisionBody`.
+
+## Findings
+
+- **F30, cycle 1682**: a lane scoped to one dropped item ended as a claim failure. The dispositions reader gave triage's answer a typed form, so the closeout can end such a lane as planned no-work.
+- **Cycle 1621**: the lane pin named two members while `top_n` named one. That showed the four readers disagreed, and led to this package.
+
+## One declaration of the decision document (2026-10-21)
+
+The inbox item `decision-document-single-declaration` (F30 architecture review M2) found three readers of `dropped[]` and two of `skip_shipped[]`, each with its own struct. The import cycle that once justified the copies is gone, because `committedset` imports only the standard library.
+
+- `committedset` declares the wire tags once: `Dropped`, `SkipShipped`, `DroppedBucket`, `SkipShippedBucket` and `DecisionBuckets`. `DecisionBuckets` embeds the two buckets beside `escalate_block` and `skip_rejected`.
+- The readers embed `DecisionBuckets`: `DispositionsFrom`, `inboxmover.CommittedIDs`, `inboxmover.ClosedDroppedIDs` and `carryover.triageDroppedIDs`. Each keeps its own policy byte for byte, and their existing tests pass unchanged.
+- The writer `triagedecision` embeds only `DroppedBucket`, so its output keeps its keys and their order.
+- `TestDecisionBuckets_TheOneDeclarationOfTheDroppedAndSkipShippedWireTags` fails when another non-test file declares `json:"dropped"` or `json:"skip_shipped"`.
+- Not done: the item proposes a new name for `inboxmover.CommittedIDs`. The acceptance does not ask for it, and the rename changes an exported name with its callers, so it is left for its own change.
+

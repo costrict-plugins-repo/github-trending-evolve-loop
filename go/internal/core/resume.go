@@ -1,0 +1,588 @@
+package core
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/gitexec"
+	"github.com/mickeyyaya/evolve-loop/go/internal/interaction"
+	"github.com/mickeyyaya/evolve-loop/go/internal/ipcenv"
+	"github.com/mickeyyaya/evolve-loop/go/internal/paths"
+	"github.com/mickeyyaya/evolve-loop/go/internal/runlease"
+)
+
+type ResumePoint struct {
+	CycleID         int
+	Phase           string
+	WorktreePath    string
+	GitHead         string
+	CompletedPhases []string
+	CostAtPause     float64
+	Reason          string
+	SavedAt         string
+	AutoAttempts    int
+	AutoMaxAttempts int
+	QuotaResetAt    string
+	StatePath       string
+}
+
+type ResumeOptions struct {
+	AllowHeadMoved bool
+	MainAhead      func(projectRoot, base string) (int, error)
+	MaxAge         time.Duration
+	Now            func() time.Time
+	PathExists     func(path string) bool
+	Log            io.Writer
+}
+
+var ErrNoCheckpoint = errors.New("resume: no live checkpoint")
+
+var ErrStaleCheckpoint = errors.New("resume: checkpoint stale")
+
+func LoadResumeState(_ context.Context, projectRoot, evolveDir string, opts ResumeOptions) (*ResumePoint, error) {
+	opts = opts.withDefaults().withMaxAge(evolveDir)
+
+	statePath := ResolveCycleStatePath(evolveDir)
+	if statePath != paths.CycleStateFileFor(evolveDir, "") {
+		fmt.Fprintf(opts.Log, "[resume] WARN: %s names the state file %s, so the age check is waived\n", ipcenv.CycleStateFileKey, statePath)
+		opts.AllowHeadMoved = true
+	}
+	rp, err := loadResumeStateFrom(statePath, projectRoot, opts)
+	if err == nil {
+		return rp, nil
+	}
+	if !errors.Is(err, ErrNoCheckpoint) || statePath != paths.CycleStateFileFor(evolveDir, "") {
+		return nil, err
+	}
+	rp, derr := discoverPerRunResumeState(evolveDir, projectRoot, opts)
+	if derr != nil {
+		if errors.Is(derr, errNoPerRunCandidates) {
+			detail := ""
+			if none := (noPerRunCandidates{}); errors.As(derr, &none) {
+				detail = none.summary()
+			}
+			return nil, fmt.Errorf("%w (also scanned %s for fleet per-run checkpoints: none live%s)", err, filepath.Join(evolveDir, "runs"), detail)
+		}
+		return nil, derr
+	}
+	return rp, nil
+}
+
+var errNoPerRunCandidates = errors.New("resume: no per-run checkpoint candidates")
+
+type noPerRunCandidates struct{ refused []string }
+
+func (e noPerRunCandidates) Error() string { return errNoPerRunCandidates.Error() + e.summary() }
+
+func (e noPerRunCandidates) Is(target error) bool { return target == errNoPerRunCandidates }
+
+func (e noPerRunCandidates) summary() string {
+	if len(e.refused) == 0 {
+		return ""
+	}
+	return "; considered: " + strings.Join(e.refused, "; ")
+}
+
+var resumableReasons = map[string]bool{
+	laneQuotaReason:      true,
+	"batch-cap-near":     true,
+	"operator-requested": true,
+	"stall-inactivity":   true,
+}
+
+const resetArchiveMarker = ".reset-"
+
+type perRunState struct {
+	path      string
+	cycle     int
+	goalHash  string
+	savedAt   string
+	reason    string
+	enabled   bool
+	leased    bool
+	phase     string
+	startedAt string
+}
+
+func discoverPerRunResumeState(evolveDir, projectRoot string, opts ResumeOptions) (*ResumePoint, error) {
+	states, rerr := readPerRunStates(evolveDir)
+	if rerr != nil || len(states) == 0 {
+		return nil, errNoPerRunCandidates
+	}
+	log := opts.Log
+	ships, err := landedShips(evolveDir)
+	if err != nil {
+		fmt.Fprintf(log, "[resume] WARN: the ledger scan stopped early (%v); a later ship can be missed\n", err)
+	}
+	var cands []perRunState
+	var refusals refusalList
+	for _, st := range states {
+		if _, shipped := ships[st.cycle]; shipped || IsTerminalPhase(st.phase) {
+			continue
+		}
+		verdict := perRunVerdict(st, states, ships, opts)
+		if verdict == "" {
+			fmt.Fprintf(log, "[resume] considered %s (cycle %d): %s\n", st.path, st.cycle, candidateText(st))
+			cands = append(cands, st)
+			continue
+		}
+		refusals.add(log, st, verdict)
+	}
+	refusals.logSummary(log)
+	if len(cands) == 0 {
+		return nil, noPerRunCandidates{refused: refusals.lines()}
+	}
+	opts.AllowHeadMoved = true
+	return firstLoadable(newestFirst(cands), projectRoot, opts, log)
+}
+
+func candidateText(st perRunState) string {
+	if !rfc3339(st.savedAt) {
+		return fmt.Sprintf("resumable; the stale rule did not apply, because savedAt %q is not RFC3339", st.savedAt)
+	}
+	return "resumable"
+}
+
+func rfc3339(s string) bool {
+	_, err := time.Parse(time.RFC3339, s)
+	return err == nil
+}
+
+func readPerRunStates(evolveDir string) ([]perRunState, error) {
+	entries, err := os.ReadDir(filepath.Join(evolveDir, "runs"))
+	if err != nil {
+		return nil, err
+	}
+	var states []perRunState
+	for _, e := range entries {
+		if !e.IsDir() || strings.Contains(e.Name(), resetArchiveMarker) {
+			continue
+		}
+		dir := filepath.Join(evolveDir, "runs", e.Name())
+		if st, ok := readPerRunState(dir); ok {
+			states = append(states, st)
+		}
+	}
+	return states, nil
+}
+
+func readPerRunState(dir string) (perRunState, bool) {
+	path := filepath.Join(dir, CycleStateFile)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return perRunState{}, false
+	}
+	var blob map[string]any
+	if json.Unmarshal(raw, &blob) != nil {
+		return perRunState{}, false
+	}
+	st := perRunState{path: path, cycle: intFromAny(blob["cycle_id"]), goalHash: strFromAny(blob["goal_hash"]), phase: strFromAny(blob["phase"]), startedAt: strFromAny(blob["started_at"])}
+	if cp, ok := blob["checkpoint"].(map[string]any); ok {
+		st.enabled, _ = cp["enabled"].(bool)
+		st.reason, st.savedAt = strFromAny(cp["reason"]), strFromAny(cp["savedAt"])
+	}
+	if l, ok, _ := runlease.Read(dir); ok && runlease.Fresh(l, time.Now(), 0) {
+		st.leased = true
+	}
+	return st, true
+}
+
+func perRunVerdict(st perRunState, all []perRunState, ships map[int]time.Time, opts ResumeOptions) string {
+	switch {
+	case st.leased:
+		return "a live run holds it"
+	case !st.enabled:
+		return "no resumable checkpoint (the cycle stopped without one)"
+	case !resumableReasons[st.reason]:
+		return fmt.Sprintf("checkpoint reason %q is not resumable", st.reason)
+	}
+	if later, at, ok := shippedAfter(st, all, ships); ok {
+		return fmt.Sprintf("%s: cycle %d of another launch shipped at %s, after this checkpoint (%s); %s",
+			staleVerdict, later, at.UTC().Format(time.RFC3339), st.savedAt, staleHint(st.path))
+	}
+	if later, at, ok := startedAfter(st, all); ok {
+		return fmt.Sprintf("%s: cycle %d of another launch started at %s, after this checkpoint (%s); %s",
+			staleVerdict, later, at.UTC().Format(time.RFC3339), st.savedAt, staleHint(st.path))
+	}
+	if why := tooOld(st.savedAt, opts); why != "" {
+		return fmt.Sprintf("%s: %s; %s", staleVerdict, why, staleHint(st.path))
+	}
+	return ""
+}
+
+const staleVerdict = "stale"
+
+func shippedAfter(st perRunState, all []perRunState, ships map[int]time.Time) (int, time.Time, bool) {
+	return laterLaunch(st, all, func(o perRunState) (time.Time, bool) {
+		at, landed := ships[o.cycle]
+		return at, landed
+	})
+}
+
+func newestFirst(cands []perRunState) []perRunState {
+	sort.Slice(cands, func(i, j int) bool {
+		if cands[i].savedAt != cands[j].savedAt {
+			return cands[i].savedAt > cands[j].savedAt
+		}
+		return cands[i].cycle > cands[j].cycle
+	})
+	return cands
+}
+
+func firstLoadable(cands []perRunState, projectRoot string, opts ResumeOptions, log io.Writer) (*ResumePoint, error) {
+	var firstErr error
+	for _, c := range cands {
+		rp, err := loadResumeStateFrom(c.path, projectRoot, opts)
+		if err == nil {
+			return rp, nil
+		}
+		fmt.Fprintf(log, "[resume] skipping %s: %v\n", c.path, err)
+		if firstErr == nil {
+			firstErr = fmt.Errorf("per-run checkpoint %s: %w", c.path, err)
+		}
+	}
+	return nil, firstErr
+}
+
+func loadResumeStateFrom(statePath, projectRoot string, opts ResumeOptions) (*ResumePoint, error) {
+	raw, err := os.ReadFile(statePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("%w: %s not found", ErrNoCheckpoint, statePath)
+		}
+		return nil, fmt.Errorf("resume: read state: %w", err)
+	}
+
+	var blob map[string]any
+	if err := json.Unmarshal(raw, &blob); err != nil {
+		return nil, fmt.Errorf("resume: parse state: %w", err)
+	}
+
+	if strFromAny(blob["phase"]) == string(PhaseEnd) {
+		return nil, fmt.Errorf("%w: cycle already completed", ErrNoCheckpoint)
+	}
+	cp, ok := blob["checkpoint"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("%w: cycle-state.json has no checkpoint block", ErrNoCheckpoint)
+	}
+	if enabled, _ := cp["enabled"].(bool); !enabled {
+		return nil, fmt.Errorf("%w: checkpoint.enabled != true", ErrNoCheckpoint)
+	}
+
+	rp := &ResumePoint{
+		StatePath:       statePath,
+		CycleID:         intFromAny(blob["cycle_id"]),
+		Phase:           strFromAny(cp["resumeFromPhase"]),
+		WorktreePath:    strFromAny(cp["worktreePath"]),
+		GitHead:         strFromAny(cp["gitHead"]),
+		CompletedPhases: stringsFromAny(cp["completedPhases"]),
+		CostAtPause:     floatFromAny(cp["costAtCheckpoint"]),
+		Reason:          strFromAny(cp["reason"]),
+		SavedAt:         strFromAny(cp["savedAt"]),
+		AutoAttempts:    intFromAny(cp["autoResumeAttempts"]),
+		AutoMaxAttempts: intFromAny(cp["autoResumeMaxAttempts"]),
+		QuotaResetAt:    strFromAny(cp["quotaResetAt"]),
+	}
+	if rp.Phase == "" {
+		return nil, fmt.Errorf("%w: checkpoint.resumeFromPhase missing", ErrStaleCheckpoint)
+	}
+
+	if why := tooOld(rp.SavedAt, opts); why != "" && !opts.AllowHeadMoved {
+		return nil, fmt.Errorf("%w: %s; %s", ErrStaleCheckpoint, why, staleHint(statePath))
+	}
+	warnMainMoved(projectRoot, checkpointBase(rp.GitHead, blob), opts)
+
+	if rp.WorktreePath != "" && !opts.PathExists(rp.WorktreePath) {
+		return nil, fmt.Errorf("%w: worktree %s no longer exists",
+			ErrStaleCheckpoint, rp.WorktreePath)
+	}
+
+	return rp, nil
+}
+
+func ActivateResumeStatePath(rp *ResumePoint, evolveDir string) func() {
+	if rp == nil || rp.StatePath == "" || rp.StatePath == ResolveCycleStatePath(evolveDir) {
+		return func() {}
+	}
+	prev, had := os.LookupEnv(ipcenv.CycleStateFileKey)
+	_ = os.Setenv(ipcenv.CycleStateFileKey, rp.StatePath)
+	return func() {
+		if had {
+			_ = os.Setenv(ipcenv.CycleStateFileKey, prev)
+		} else {
+			_ = os.Unsetenv(ipcenv.CycleStateFileKey)
+		}
+	}
+}
+
+func (o *Orchestrator) RunCycleFromPhase(ctx context.Context, req CycleRequest, resumePoint *ResumePoint) (result CycleResult, retErr error) {
+	if err := o.ensureSafeConfig(); err != nil {
+		return CycleResult{}, err
+	}
+	if resumePoint == nil {
+		return CycleResult{}, fmt.Errorf("RunCycleFromPhase: resumePoint required")
+	}
+	startPhase := Phase(resumePoint.Phase)
+	_, inRunners := o.runners[startPhase]
+	if (!startPhase.IsValid() && !inRunners) || startPhase == PhaseEnd || startPhase == PhaseStart {
+		return CycleResult{}, fmt.Errorf("RunCycleFromPhase: invalid resume phase %q", resumePoint.Phase)
+	}
+
+	release, err := o.acquireCycleLock(ctx, req.Env)
+	if err != nil {
+		return CycleResult{}, fmt.Errorf("acquire lock: %w", err)
+	}
+	defer func() { _ = release() }()
+
+	boot, err := o.loadResumeBootstrap(ctx, req, resumePoint, startPhase)
+	if err != nil {
+		return CycleResult{}, err
+	}
+	req = boot.request
+	state := boot.state
+	cs := boot.cycleState
+	startPhase = boot.startPhase
+	cycle := boot.cycle
+
+	o.currentRunID.Store(cs.RunID)
+	defer o.currentRunID.Store("")
+
+	var execution resumeExecution
+	defer func() {
+		var preserve, completedNormally bool
+		if c := execution.closeout; c != nil {
+			preserve, completedNormally = c.preserveWorktree, c.cycleCompletedNormally
+		}
+		o.teardownCycleWorktree(req.ProjectRoot, execution.cycleState.ActiveWorktree, preserve, completedNormally)
+	}()
+
+	stopLease := startRunLease(cs.WorkspacePath, cs.RunID, o.now, leaseRefreshInterval())
+	defer stopLease()
+
+	inputs := o.snapshotResumeInputs(&boot)
+	cs = boot.cycleState
+	envSnap := inputs.env
+	ctxSnap := inputs.context
+	result = inputs.result
+	preResumeHEAD := inputs.preResumeHEAD
+
+	execution = resumeExecution{
+		orchestrator:    o,
+		ctx:             ctx,
+		request:         req,
+		resumePoint:     resumePoint,
+		state:           state,
+		cycleState:      cs,
+		cycle:           cycle,
+		startPhase:      startPhase,
+		envSnapshot:     envSnap,
+		contextSnapshot: ctxSnap,
+		initialResult:   result,
+		preResumeHEAD:   preResumeHEAD,
+	}
+	return execution.run()
+
+}
+
+type resumedDeliverable struct {
+	ctx         context.Context
+	projectRoot string
+	cycle       int
+	cs          CycleState
+	phase       Phase
+	runner      PhaseRunner
+	req         PhaseRequest
+	resp        PhaseResponse
+	baseline    map[string]bool
+	count       func(Phase, PhaseRequest) PhaseRequest
+	predicates  predicateBase
+}
+
+func (o *Orchestrator) reviewResumedDeliverable(in resumedDeliverable) (PhaseResponse, error) {
+	if o.reviewer == nil || in.resp.Verdict == VerdictSKIPPED {
+		return in.resp, nil
+	}
+	scope := phaseLeakScope{projectRoot: in.projectRoot, cycleState: in.cs, phase: in.phase, baseline: in.baseline}
+	if err := o.recoverPhaseLeak(in.ctx, scope); err != nil {
+		return in.resp, err
+	}
+	review := o.performEffectsAndReview(in.ctx, o.reviewInputFor(in.cs, in.phase, in.projectRoot, in.resp))
+	rv := resumedCorrector{o: o, ctx: in.ctx, scope: scope, cycle: in.cycle, runner: in.runner, count: in.count, predicates: in.predicates}
+	return rv.correct(in.req, in.resp, review)
+}
+
+type resumedCorrector struct {
+	o          *Orchestrator
+	ctx        context.Context
+	scope      phaseLeakScope
+	cycle      int
+	runner     PhaseRunner
+	count      func(Phase, PhaseRequest) PhaseRequest
+	predicates predicateBase
+}
+
+func (rv resumedCorrector) correct(req PhaseRequest, resp PhaseResponse, review ReviewResult) (PhaseResponse, error) {
+	o, cs, phase := rv.o, rv.scope.cycleState, rv.scope.phase
+	lr := &cycleRun{ctx: rv.ctx, predicatesAtBuild: rv.predicates.sources, predicateBaseFault: rv.predicates.fault, o: o, cs: cs, cycle: rv.cycle, req: CycleRequest{ProjectRoot: rv.scope.projectRoot}, retryConfig: o.retryConfig}
+	maxCorrections := lr.correctionLimitFor(phase, o.retryConfig.ContractCorrectionRetries)
+	conv := o.newFloorConvergence(rv.cycle, phase, review.Failures)
+	var refused blockerStatement
+	for correction := 1; !review.Approve; correction++ {
+		var outcome BlockerOutcome
+		var diag Diagnostic
+		outcome, diag, refused = lr.provenBlocker(phase, o.reviewInputFor(cs, phase, rv.scope.projectRoot, resp), review)
+		rounds := blockerRoundsDecision(outcome)
+		if rounds.End {
+			if outcome == Routable {
+				return resp, resumedBlocker{diag: diag}
+			}
+			return resp, NewBlockerEnd(outcome, diag)
+		}
+		if correction > maxCorrections && !lr.climbResumed(phase, review, &req) && !conv.grant() {
+			break
+		}
+		refusal := ""
+		if rounds.Claim {
+			refusal = lr.sendRefusal(phase, refused)
+		}
+		req.CorrectionDirective = withBlockerRefusal(preferDigest(composeCorrection(correction, review.Reason, review.Remediation), req), refusal)
+		o.emitGateCorrection(gateCorrection{
+			origin: originResumedCorrection, cycle: rv.cycle, phase: phase, correction: correction, max: maxCorrections + conv.used,
+			rung: interaction.RungRedispatch, cli: req.Driver.String(), reason: review.Reason,
+		})
+		req = rv.count(phase, req)
+		corrected, err := o.redispatchResumedCorrection(rv.ctx, rv.runner, req, phase, correction)
+		if err != nil {
+			return corrected, err
+		}
+		resp = corrected
+		if err := o.recoverPhaseLeak(rv.ctx, rv.scope); err != nil {
+			return resp, err
+		}
+		o.normalizeBuildWorktree(rv.ctx, phase, cs, rv.scope.projectRoot)
+		review = o.performEffectsAndReview(rv.ctx, o.reviewInputFor(cs, phase, rv.scope.projectRoot, resp))
+		conv.observe(review.Failures)
+	}
+	if review.Approve {
+		return resp, nil
+	}
+	lr.sendLastRefusal(phase, refused, blockerStatement.lastRound)
+	return rv.reject(resp, review, maxCorrections+conv.used)
+}
+
+func (rv resumedCorrector) reject(resp PhaseResponse, review ReviewResult, corrections int) (PhaseResponse, error) {
+	cs, phase := rv.scope.cycleState, rv.scope.phase
+	phaseErr := fmt.Errorf("resume review gate: phase %q deliverable rejected after %d correction(s): %s", phase, corrections, review.Reason)
+	if rv.o.degradesRejection(cs, phase, review) {
+		return rv.o.degradeExhaustedReview(rv.ctx, cs, phase, phaseErr), nil
+	}
+	return resp, resumedRejection{err: phaseErr}
+}
+
+type resumedRejection struct{ err error }
+
+func (r resumedRejection) Error() string { return r.err.Error() }
+func (r resumedRejection) Unwrap() error { return r.err }
+
+func (o *Orchestrator) redispatchResumedCorrection(ctx context.Context, runner PhaseRunner, req PhaseRequest, phase Phase, correction int) (PhaseResponse, error) {
+	cancel := o.observer.Start(ctx, string(phase), req)
+	corrected, err := runner.Run(ctx, req)
+	if cancel != nil {
+		cancel()
+	}
+	if err != nil {
+		if isQuotaWall(err) {
+			return corrected, fmt.Errorf("resume review gate: phase %s correction %d: %w", phase, correction, quotaWall{err})
+		}
+		return corrected, fmt.Errorf("resume review gate: phase %q correction %d dispatch failed: %w", phase, correction, err)
+	}
+	if !IsVerdict(corrected.Verdict) {
+		return corrected, fmt.Errorf("resume review gate: phase %q correction %d returned non-canonical verdict %q", phase, correction, corrected.Verdict)
+	}
+	return corrected, nil
+}
+
+func defaultCurrentHead(projectRoot string) (string, error) {
+	out, stderr, code, err := gitexec.Git{Dir: projectRoot, Exec: gitRunner}.Capture(context.Background(), "rev-parse", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	if code != 0 {
+		return out, fmt.Errorf("git rev-parse HEAD: rc=%d: %s", code, strings.TrimSpace(stderr))
+	}
+	return out, nil
+}
+
+func defaultPathExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func strFromAny(v any) string {
+	s, _ := v.(string)
+	return s
+}
+
+func intFromAny(v any) int {
+	switch n := v.(type) {
+	case float64:
+		return int(n)
+	case int:
+		return n
+	}
+	return 0
+}
+
+func floatFromAny(v any) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case int:
+		return float64(n)
+	}
+	return 0
+}
+
+func stringsFromAny(v any) []string {
+	arr, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, e := range arr {
+		if s, ok := e.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func IsResumableReason(reason string) bool { return resumableReasons[reason] }
+
+func CheckpointResumable(statePath, projectRoot string, opts ResumeOptions) (*ResumePoint, error) {
+	return loadResumeStateFrom(statePath, projectRoot, opts.withDefaults().withMaxAge(filepath.Join(projectRoot, ".evolve")))
+}
+
+func (o ResumeOptions) withDefaults() ResumeOptions {
+	if o.MainAhead == nil {
+		o.MainAhead = defaultMainAhead
+	}
+	if o.Now == nil {
+		o.Now = time.Now
+	}
+	if o.Log == nil {
+		o.Log = io.Discard
+	}
+	if o.PathExists == nil {
+		o.PathExists = defaultPathExists
+	}
+	return o
+}

@@ -1,0 +1,154 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"github.com/mickeyyaya/evolve-loop/go/internal/integration"
+	"io"
+	"path/filepath"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/cyclebudget"
+	"github.com/mickeyyaya/evolve-loop/go/internal/fleet"
+	"github.com/mickeyyaya/evolve-loop/go/internal/loopwave"
+	"github.com/mickeyyaya/evolve-loop/go/internal/orchestrator"
+	"github.com/mickeyyaya/evolve-loop/go/internal/policy"
+)
+
+type loopBatchCoordinator struct {
+	ctx          context.Context
+	cfg          loopConfig
+	deps         orchDeps
+	orch         loopCycleRunner
+	cycleEnv     map[string]string
+	cycleContext map[string]string
+	result       *loopResult
+	workflow     policy.WorkflowConfig
+	stdout       io.Writer
+	stderr       io.Writer
+	waveEngine   *loopwave.Engine
+	preWave      func(iteration int) (batchDecision, bool)
+	leases       map[string]*orchestrator.Leases
+	zeroShip     zeroShipTally
+	now          func() time.Time
+	loadGraph    graphLoader
+	lastGraph    graphLoad
+
+	newDriver         func(pool int) (*integration.Driver, error)
+	driverFinishLimit time.Duration
+	driverTick        time.Duration
+}
+
+func (b *loopBatchCoordinator) run() int {
+	cfg := b.cfg
+	deps := b.deps
+	lr := b.result
+	stdout := b.stdout
+	stderr := b.stderr
+	wc := b.workflow
+
+	dc := loadDispatchConfig(cfg.EvolveDir)
+	dispPolicy := resolveDispatchPolicy(dc.Policy, stderr)
+	threshold := resolveCircuitBreakerThreshold(dc.RepeatThreshold)
+
+	prevRanCycle := -1
+	sameCycleStreak := 0
+
+	maxConsecutiveFails := wc.MaxConsecutiveFails
+	consecutiveFails := 0
+
+	budgetStage := cyclebudget.ParseStage(wc.CycleBudget)
+	effectiveMax := cfg.MaxCycles
+	if budgetStage == cyclebudget.Enforce && !cfg.MaxCyclesExplicit {
+		effectiveMax = wc.MaxCyclesCap
+		fmt.Fprintf(stderr, "[loop] no --cycles: advisor-decided, completion-driven (stops when the backlog drains), safety cap=%d\n", effectiveMax)
+	}
+
+	fleetCfg := loadFleetConfig(cfg.EvolveDir, stderr, b.deps.Signals)
+	for _, w := range fleetCfg.Warnings {
+		fmt.Fprintf(stderr, "[loop] WARN: fleet: %s\n", w)
+	}
+	var waveBinPath string
+
+	var starvationTracker fleet.StarvationTracker
+
+	var goalStall, nonprogress goalStallTracker
+	stallCfg := loadGoalStallConfig(cfg.EvolveDir)
+
+	batchStartCycle, _ := readBatchWindowFloor(context.Background(), deps.Storage)
+	b.zeroShip.from = b.clock()
+	sequentialState := sequentialBatchState{
+		dispPolicy:          dispPolicy,
+		threshold:           threshold,
+		prevRanCycle:        prevRanCycle,
+		sameCycleStreak:     sameCycleStreak,
+		maxConsecutiveFails: maxConsecutiveFails,
+		consecutiveFails:    consecutiveFails,
+		budgetStage:         budgetStage,
+		effectiveMax:        effectiveMax,
+		goalStall:           goalStall,
+		nonprogress:         nonprogress,
+		stallCfg:            stallCfg,
+	}
+
+iterations:
+	for i := b.resumeAt(effectiveMax); i < effectiveMax; i++ {
+		switch decision := b.prepareIteration(i, &fleetCfg, &waveBinPath, batchStartCycle); decision.flow {
+		case batchStopIterations:
+			break iterations
+		case batchReturn:
+			return decision.exitCode
+		}
+		switch decision := b.dispatchFleetIteration(i, fleetCfg, waveBinPath, &starvationTracker); decision.flow {
+		case batchNextIteration:
+			continue
+		case batchReturn:
+			return decision.exitCode
+		}
+		switch decision := b.runSequentialIteration(i, &sequentialState); decision.flow {
+		case batchNextIteration:
+			continue
+		case batchStopIterations:
+			break iterations
+		case batchReturn:
+			return decision.exitCode
+		}
+	}
+
+	if lr.StopReason == "error" || lr.StopReason == "fail" {
+		lr.emitFatal(stdout, stderr, cfg, lastCycleIn(*lr))
+		return 2
+	}
+	if rc, halted := noWorkHandoffHaltAfterWave(cfg.EvolveDir, cfg.ProjectRoot, stderr, b.deps.Signals); halted {
+		lr.StopReason = "pipeline_blocker_halt"
+		lr.emitFatal(stdout, stderr, cfg, 0)
+		return rc
+	}
+	finalizeCompletedCycle(cfg, stderr)
+	gcHookFn(cfg, filepath.Join(gcManifestDir(cfg.EvolveDir), "batch-end"), stderr)
+	lr.emit(stdout)
+	return b.batchExitCode()
+}
+
+func (b *loopBatchCoordinator) batchExitCode() int {
+	if b.ctx.Err() != nil {
+		if lanes := batchLaneClaims(b.cfg.ProjectRoot, b.result.batchFirstCycle, b.stderr); len(lanes) > 0 {
+			printStoppedLanes(b.stderr, "during the batch closeout", lanes)
+			return 130
+		}
+		fmt.Fprintln(b.stderr, "[loop] received interrupt (SIGINT/SIGTERM) during the batch closeout; the batch completed — exiting 130 so a chained run stops")
+		return 130
+	}
+	if b.result.RecoverableFailures > 0 || b.result.ContinuedFailures > 0 {
+		return 3
+	}
+	return 0
+}
+
+func (b *loopBatchCoordinator) resumeAt(effectiveMax int) int {
+	done := b.cfg.ResumeWaves
+	if done > 0 {
+		fmt.Fprintf(b.stderr, "[loop] boundary re-exec: continuing at wave %d — %d of %d iterations ran before the re-exec, %d left\n", done, done, effectiveMax, max(effectiveMax-done, 0))
+	}
+	return done
+}

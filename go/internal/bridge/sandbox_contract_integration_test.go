@@ -1,0 +1,702 @@
+//go:build integration && darwin
+
+package bridge
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/adapters/sandbox"
+	"github.com/mickeyyaya/evolve-loop/go/internal/dispatchcred"
+	"github.com/mickeyyaya/evolve-loop/go/internal/fakeclitest"
+	"github.com/mickeyyaya/evolve-loop/go/internal/inputindex"
+	"github.com/mickeyyaya/evolve-loop/go/internal/isolation"
+	"github.com/mickeyyaya/evolve-loop/go/internal/paths"
+	"github.com/mickeyyaya/evolve-loop/go/internal/profiles"
+)
+
+type contractVerdict string
+
+const (
+	contractAllow             contractVerdict = "allow"
+	contractDeny              contractVerdict = "deny"
+	contractGap               contractVerdict = "gap"
+	contractCredentialRefusal contractVerdict = "credential refusal"
+)
+
+type contractHost struct {
+	prefix                      []string
+	root, worktree, run, events string
+	resumeWitness               string
+	otherCycle, socketDir       string
+	runSocket, defaultSocket    string
+	runName, runPID             string
+	ownTTY, peerTTY, scratch    string
+	stubBin, netPort, home      string
+	evolveBin                   string
+	dispatch                    dispatchcred.Store
+	keychain                    string
+}
+
+type contractRow struct {
+	action    string
+	want      contractVerdict
+	script    func(h contractHost) string
+	env       []string
+	check     func(t *testing.T, h contractHost, out string)
+	isolation string
+}
+
+const cycle1853ProbeLines = `d=$(mktemp -d /tmp/swxprobe.XXXX)
+TMUX_TMPDIR=$d tmux -f /dev/null new-session -d -s probe; echo "rc=$?"
+TMUX_TMPDIR=$d tmux has-session -t probe 2>/dev/null && echo own-server
+TMUX_TMPDIR=$d tmux kill-server 2>/dev/null
+rm -rf $d`
+
+var agentContract = []contractRow{
+	{action: "start a private tmux server (-L) and run a window on its own pty", want: contractAllow,
+		script: func(h contractHost) string {
+			return "d=" + h.scratch + "/own; mkdir -p $d && export TMUX_TMPDIR=$d && tmux -L mine -f /dev/null start-server \\; set -g default-shell /bin/sh \\; set -s exit-empty off \\; new-session -d -s keep && { tmux -L mine has-session -t keep || { echo 'the private tmux server never became ready'; exit 1; }; } && tmux -L mine new-window -d 'tty > " + h.scratch + "/window.tty; tmux -L mine wait-for -S ran' && tmux -L mine wait-for ran && cat " + h.scratch + "/window.tty; s=$?; tmux -L mine kill-server 2>/dev/null; exit $s"
+		},
+		check: func(t *testing.T, h contractHost, out string) {
+			if !strings.HasPrefix(out, "/dev/ttys") || out == h.ownTTY || out == h.peerTTY {
+				t.Fatalf("the window must run on a pty of its own, got %q (own pane %s, peer %s)", out, h.ownTTY, h.peerTTY)
+			}
+		}},
+	{action: "connect to the run socket", want: contractDeny,
+		script: func(h contractHost) string { return "tmux -L " + h.runName + " has-session -t victim" }},
+	{action: "connect to the default socket", want: contractDeny,
+		script: func(contractHost) string { return "tmux has-session -t victim" }},
+	{action: "tmux kill-server against the run server", want: contractDeny,
+		script: func(h contractHost) string { return "tmux -L " + h.runName + " kill-server" }},
+	{action: "rename the run socket", want: contractDeny,
+		script: func(h contractHost) string { return "mv " + h.runSocket + " " + h.socketDir + "/moved" }},
+	{action: "hard-link the run socket", want: contractDeny,
+		script: func(h contractHost) string { return "ln " + h.runSocket + " " + h.socketDir + "/linked" }},
+	{action: "unlink the run socket", want: contractDeny,
+		script: func(h contractHost) string { return "rm " + h.runSocket }},
+	{action: "connect through a symlink to the run socket", want: contractDeny,
+		script: func(h contractHost) string {
+			return "ln -s " + h.runSocket + " " + h.scratch + "/sym && tmux -S " + h.scratch + "/sym kill-server"
+		}},
+	{action: "rename the socket directory", want: contractDeny,
+		script: func(h contractHost) string { return "mv " + h.socketDir + " " + h.socketDir + "-moved" }},
+	{action: "make and remove a file in the socket directory", want: contractAllow,
+		script: func(h contractHost) string {
+			return "touch " + h.socketDir + "/mine && rm " + h.socketDir + "/mine && echo ok"
+		}},
+	{action: "signal a host process (the run server)", want: contractDeny,
+		script: func(h contractHost) string { return "kill " + h.runPID }},
+	{action: "signal its own child", want: contractAllow,
+		script: func(contractHost) string { return "sleep 60 & kill $! && wait $!; test $? -gt 128 && echo ok" }},
+	{action: "write in its own worktree", want: contractAllow,
+		script: func(h contractHost) string { return "echo ok > " + h.worktree + "/own && cat " + h.worktree + "/own" }},
+	{action: "write in its own cycle run directory", want: contractAllow,
+		script: func(h contractHost) string { return "echo ok > " + h.run + "/own && cat " + h.run + "/own" }},
+	{action: "write in another cycle's .evolve/runs/cycle-M", want: contractDeny,
+		script: func(h contractHost) string { return "echo x > " + h.otherCycle + "/forged" },
+		check: func(t *testing.T, h contractHost, _ string) {
+			if _, err := os.Stat(filepath.Join(h.otherCycle, "forged")); !os.IsNotExist(err) {
+				t.Fatalf("the denied write left a file on the host: %v", err)
+			}
+		}},
+	{action: "write in the protected .evolve/events/", want: contractDeny,
+		script: func(h contractHost) string { return "echo x > " + h.events + "/forged" }},
+	{action: "write the host resume witness in .evolve/resume-witness/", want: contractDeny,
+		script: func(h contractHost) string { return "echo x > " + h.resumeWitness + "/cycle-7.json" }},
+	{action: "write to another pane's tty", want: contractDeny,
+		script: func(h contractHost) string { return "printf '' > " + h.peerTTY }},
+	{action: "read another pane's tty", want: contractDeny,
+		script: func(h contractHost) string { return ": < " + h.peerTTY }},
+	{action: "open its own pane tty for read and write", want: contractAllow,
+		script: func(h contractHost) string { return "printf '' > " + h.ownTTY + " && : < " + h.ownTTY + " && echo ok" }},
+	{action: "incident cycle-1853: the exact probe with TMUX unset, as the boot leaves the pane", want: contractAllow,
+		script: func(contractHost) string { return cycle1853ProbeLines },
+		check: func(t *testing.T, h contractHost, out string) {
+			if !strings.Contains(out, "rc=0") || !strings.Contains(out, "own-server") {
+				t.Fatalf("the probe must get a private server of its own, got %q", out)
+			}
+			runServerSurvives(t, h)
+		}},
+	{action: "incident cycle-1853: the exact probe with TMUX still naming the run server", want: contractAllow,
+		script: func(contractHost) string { return cycle1853ProbeLines },
+		env:    []string{"TMUX=<run>"},
+		check: func(t *testing.T, h contractHost, out string) {
+			if strings.Contains(out, "own-server") {
+				t.Fatalf("with TMUX set the probe must not reach any server, got %q", out)
+			}
+			runServerSurvives(t, h)
+		}},
+	{action: "isolation N3: exec an LLM binary (a claude stub) with --version", want: contractDeny, isolation: "N3",
+		script: func(h contractHost) string { return "PATH=" + h.stubBin + ":$PATH claude --version" }},
+	{action: "exec an older installed version of the claude stub under the install root", want: contractDeny,
+		script: func(h contractHost) string { return h.home + "/.local/share/claude/versions/2.1.304 --version" }},
+	{action: "re-enter the profile through sandbox-exec to exec the claude stub", want: contractDeny,
+		script: func(h contractHost) string {
+			return "sandbox-exec -f " + h.prefix[2] + " " + h.stubBin + "/claude --version"
+		}},
+	{action: "isolation N4: evolve agent run with the env markers stripped is refused at enforce", want: contractCredentialRefusal, isolation: "N4",
+		script: func(h contractHost) string {
+			return strippedMarkers + h.evolveBin + " agent run --refused-before-parse"
+		}},
+	{action: "evolve phase scout with the env markers stripped is refused at enforce", want: contractCredentialRefusal,
+		script: func(h contractHost) string {
+			return strippedMarkers + h.evolveBin + " phase scout --refused-before-parse"
+		}},
+	{action: "evolve subagent run with the env markers stripped is refused at enforce", want: contractCredentialRefusal,
+		script: func(h contractHost) string {
+			return strippedMarkers + h.evolveBin + " subagent run --refused-before-parse"
+		}},
+	{action: "evolve loop with the env markers stripped is refused at enforce", want: contractCredentialRefusal,
+		script: func(h contractHost) string { return strippedMarkers + h.evolveBin + " loop --refused-before-parse" }},
+	{action: "evolve wave next with the env markers stripped is refused at enforce", want: contractCredentialRefusal,
+		script: func(h contractHost) string {
+			return strippedMarkers + h.evolveBin + " wave next --refused-before-parse"
+		}},
+	{action: "X17e: evolve inbox add (class R) in a cell is refused at enforce", want: contractCredentialRefusal,
+		script: func(h contractHost) string {
+			return strippedMarkers + h.evolveBin + " inbox add --refused-before-parse"
+		}},
+	{action: "X17e: evolve inbox claim (class D) in a cell is refused at enforce", want: contractCredentialRefusal,
+		script: func(h contractHost) string {
+			return strippedMarkers + h.evolveBin + " inbox claim --refused-before-parse"
+		}},
+	{action: "rename an ancestor of the dispatch store under a writable home, then run evolve agent run", want: contractCredentialRefusal,
+		script: func(h contractHost) string {
+			ancestor := filepath.Dir(h.dispatch.Dir)
+			return "mv " + ancestor + " " + ancestor + "-moved; " + strippedMarkers + h.evolveBin + " agent run --refused-before-parse"
+		},
+		check: restoreDispatchStore},
+	{action: "swap a symlink to a store of its own in for an ancestor of the dispatch store", want: contractDeny,
+		script: func(h contractHost) string {
+			ancestor := filepath.Dir(h.dispatch.Dir)
+			return "mv " + ancestor + " " + ancestor + "-moved && mkdir " + ancestor + "-evil && ln -s " + ancestor + "-evil " + ancestor + " && " + strippedMarkers + h.evolveBin + " agent run --refused-before-parse"
+		},
+		check: restoreDispatchStore},
+	{action: "turn the dispatch stage off", want: contractDeny,
+		script: func(h contractHost) string { return "echo off > " + filepath.Join(h.dispatch.Dir, "stage") }},
+	{action: "plant a dispatch credential", want: contractDeny,
+		script: func(h contractHost) string { return "echo x > " + filepath.Join(h.dispatch.HeldDir(), "planted") }},
+	{action: "read the dispatch credential", want: contractDeny,
+		script: func(h contractHost) string { return "cat " + filepath.Join(h.dispatch.HeldDir(), "credential") }},
+	{action: "isolation N5: read the raw output <ws>/.bridge/scout-stdout.log", want: contractDeny, isolation: "N5",
+		script: func(h contractHost) string { return "cat " + h.run + "/.bridge/scout-stdout.log" }},
+	{action: "read a raw log that the bridge left in the own workspace", want: contractDeny,
+		script: func(h contractHost) string { return "cat " + h.run + "/build-stdout.log" }},
+	{action: "rename a raw log of the own workspace to a name that no rule matches", want: contractDeny,
+		script: func(h contractHost) string {
+			return "mv " + h.run + "/build-stdout.log " + h.run + "/b.txt && cat " + h.run + "/b.txt"
+		}},
+	{action: "hard-link a raw log of the own workspace under another name", want: contractDeny,
+		script: func(h contractHost) string {
+			return "ln " + h.run + "/build-stdout.log " + h.run + "/b.txt && cat " + h.run + "/b.txt"
+		}},
+	{action: "write a pipeline lineage record in .evolve/lineage/", want: contractDeny,
+		script: func(h contractHost) string {
+			return `echo '{"cycle":9,"item_ids":["item-a"]}' > ` + h.root + "/.evolve/lineage/cycle-9.json"
+		}},
+	{action: "B5: append a ship to .evolve/ship-journal.jsonl", want: contractDeny,
+		script: func(h contractHost) string {
+			return `echo '{"cycle":9,"class":"cycle","sha":"forged"}' >> ` + h.root + "/.evolve/ship-journal.jsonl"
+		}},
+	{action: "B5: write a landing record in .evolve/landing/", want: contractDeny,
+		script: func(h contractHost) string {
+			return `echo '{"cycle":9,"status":"complete","commit_sha":"forged"}' > ` + h.root + "/.evolve/landing/cycle-9.json"
+		}},
+	{action: "B5: write a deliverable record in .evolve/waves/", want: contractDeny,
+		script: func(h contractHost) string {
+			return `echo '{"cycle":9}' > ` + h.root + "/.evolve/waves/integration-current/deliverable-9.json"
+		}},
+	{action: "overwrite the existing lineage record of the own cycle", want: contractDeny,
+		script: func(h contractHost) string {
+			return `echo '{"cycle":7,"item_ids":["item-b","item-c"]}' > ` + h.root + "/.evolve/lineage/cycle-7.json"
+		},
+		check: func(t *testing.T, h contractHost, _ string) {
+			record, ok := inputindex.ReadRecord(h.root, 7)
+			if !ok || len(record.ItemIDs) != 1 || record.ItemIDs[0] != "item-a" {
+				t.Fatalf("the record of cycle 7 must keep [item-a] after the denied write, got %+v %v", record, ok)
+			}
+		}},
+	{action: "write a file in the own workspace", want: contractAllow,
+		script: func(h contractHost) string {
+			return "echo kept > " + h.run + "/notes.txt && cat " + h.run + "/notes.txt"
+		}},
+	{action: "rewrite the lane-scope.json of the own workspace", want: contractDeny,
+		script: func(h contractHost) string { return `echo '{"todo_ids":["item-b"]}' > ` + h.run + "/lane-scope.json" }},
+	{action: "a retry opens its predecessor's retrospective through inputs/index.json", want: contractAllow,
+		script: func(h contractHost) string {
+			return `p=$(sed -n 's/.*"path": *"\([^"]*retrospective-report\.md\)".*/\1/p' ` + h.run + `/inputs/index.json) && test -n "$p" && cat "` + h.root + `/$p"`
+		},
+		check: func(t *testing.T, _ contractHost, out string) {
+			if out != "lesson of cycle 6" {
+				t.Fatalf("the indexed read must return the predecessor's lesson, got %q", out)
+			}
+		}},
+	{action: "isolation N7: a retry reads an unrelated cycle's audit-report.md", want: contractDeny, isolation: "N7",
+		script: func(h contractHost) string {
+			return "cat " + filepath.Join(filepath.Dir(h.otherCycle), "cycle-9", "audit-report.md")
+		}},
+	{action: "read the seat token holder", want: contractDeny,
+		script: func(h contractHost) string { return "cat " + paths.SeatTokenPath(h.home) }},
+	{action: "isolation N8: read ~/.ssh", want: contractDeny, isolation: "N8",
+		script: func(contractHost) string { return `cat "$HOME/.ssh/id_fixture"` }},
+	{action: "the Claude OAuth login reads its Keychain item through the security service", want: contractAllow,
+		script: func(h contractHost) string {
+			return `security find-generic-password -s "Claude Code-credentials" -w "` + h.keychain + `"`
+		},
+		check: func(t *testing.T, _ contractHost, out string) {
+			if out != "fixture-oauth-token" {
+				t.Fatalf("the cell must read the OAuth item of its Keychain, got %q", out)
+			}
+		}},
+	{action: "write the pipeline-written inputs/index.json", want: contractDeny,
+		script: func(h contractHost) string { return "echo '{}' > " + h.run + "/inputs/index.json" }},
+	{action: "isolation N17: a cell writes the access log .evolve/context-access/", want: contractDeny, isolation: "N17",
+		script: func(h contractHost) string {
+			return `echo '{"type":"open","entry":"d1"}' >> ` + filepath.Join(inputindex.AccessDir(h.root), "cycle-7.jsonl")
+		}},
+	{action: "isolation N9: open a TCP connection (loopback listener of the host)", want: contractAllow, isolation: "N9",
+		script: func(h contractHost) string { return "nc -z -w 2 127.0.0.1 " + h.netPort + " && echo ok" }},
+}
+
+func restoreDispatchStore(t *testing.T, h contractHost, _ string) {
+	t.Helper()
+	ancestor := filepath.Dir(h.dispatch.Dir)
+	if _, err := os.Lstat(ancestor + "-moved"); err != nil {
+		return
+	}
+	for _, leftover := range []string{ancestor, ancestor + "-evil"} {
+		if err := os.RemoveAll(leftover); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Rename(ancestor+"-moved", ancestor); err != nil {
+		t.Fatalf("the host puts the store back for the next rows: %v", err)
+	}
+}
+
+const strippedMarkers = "env -u EVOLVE_DISPATCH_DEPTH -u EVOLVE_PHASE "
+
+func contractFailure(want contractVerdict, out string, err error) error {
+	var exit *exec.ExitError
+	switch {
+	case want == contractCredentialRefusal && (!errors.As(err, &exit) || exit.ExitCode() != 3 || !strings.Contains(out, "dispatch credential") || !strings.Contains(out, "operation not permitted")):
+		return fmt.Errorf("contract: the verb refuses with exit 3 because the cell cannot read the dispatch credential; got err=%v out=%q", err, out)
+	case want == contractAllow && err != nil:
+		return fmt.Errorf("contract: allow; the profile refused it: %v: %q", err, out)
+	case want == contractDeny && (err == nil || !strings.Contains(out, "Operation not permitted")):
+		return fmt.Errorf("contract: deny with EPERM; got err=%v out=%q", err, out)
+	case want == contractGap && err != nil:
+		return fmt.Errorf("the known gap is closed (%v: %q); change this row to deny and update docs/architecture/agent-sandbox-contract.md", err, out)
+	}
+	return nil
+}
+
+func TestAgentSandboxContract(t *testing.T) {
+	h := newContractHost(t)
+	h.withEvolveBinary(t)
+	for _, row := range agentContract {
+		t.Run(row.action, func(t *testing.T) {
+			out, err := h.agent(t, row)
+			failure := contractFailure(row.want, out, err)
+			if row.isolation != "" {
+				note, jerr := isolation.Judge(row.isolation, failure)
+				if jerr != nil {
+					t.Fatal(jerr)
+				}
+				t.Log(note)
+			} else if failure != nil {
+				t.Fatal(failure)
+			}
+			runServerSurvives(t, h)
+			if row.check != nil {
+				row.check(t, h, out)
+			}
+		})
+	}
+}
+
+func TestAgentSandboxContract_TheLauncherStillStartsTheCLIThatTheCellCannotExec(t *testing.T) {
+	h := newContractHost(t)
+	args := append(append([]string{}, h.prefix[1:]...), filepath.Join(h.stubBin, "claude"), "--version")
+	out, err := exec.Command(h.prefix[0], args...).CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != "stub-claude 0.0.0" {
+		t.Fatalf("sandbox-exec must still exec the CLI of the cell; the deny is for each later exec: err=%v out=%q", err, out)
+	}
+}
+
+func TestAgentSandboxContract_ShadowReportsTheExecAndLetsItRun(t *testing.T) {
+	h := newContractHost(t)
+	h.prefix = builderPrefix(t, requireNativeSandbox(t), h, "shadow")
+	out, err := h.agent(t, contractRow{script: func(h contractHost) string { return "PATH=" + h.stubBin + ":$PATH claude --version" }})
+	if err != nil || out != "stub-claude 0.0.0" {
+		t.Fatalf("shadow must let the exec run: err=%v out=%q", err, out)
+	}
+	out, err = h.agent(t, contractRow{script: func(h contractHost) string {
+		return "cat " + filepath.Join(filepath.Dir(h.otherCycle), "cycle-9", "audit-report.md") + " " + h.run + "/.bridge/scout-stdout.log $HOME/.ssh/id_fixture"
+	}})
+	if err != nil || !strings.Contains(out, "audit of an unrelated item") || !strings.Contains(out, "fixture secret") {
+		t.Fatalf("shadow must let each guarded read run and only report it: err=%v out=%q", err, out)
+	}
+}
+
+func (h *contractHost) withKeychain(t *testing.T) {
+	t.Helper()
+	h.keychain = filepath.Join(h.home, "Library", "Keychains", "sbc.keychain-db")
+	for _, args := range [][]string{
+		{"create-keychain", "-p", "sbc", h.keychain},
+		{"add-generic-password", "-s", "Claude Code-credentials", "-a", "sbc", "-w", "fixture-oauth-token", h.keychain},
+	} {
+		if out, err := exec.Command("security", args...).CombinedOutput(); err != nil {
+			t.Fatalf("security %v: %v: %s", args[0], err, out)
+		}
+	}
+	t.Cleanup(func() { _ = exec.Command("security", "delete-keychain", h.keychain).Run() })
+}
+
+func TestAgentSandboxContract_TheHostHoldsTheCredentialThatTheCellCannotRead(t *testing.T) {
+	h := newContractHost(t)
+	h.withEvolveBinary(t)
+	out, err := exec.Command(h.evolveBin, "subagent", "run").CombinedOutput()
+	if strings.Contains(string(out), "dispatch credential") || !strings.Contains(string(out), "expected <agent> <cycle> <workspace>") {
+		t.Fatalf("outside the cell the pipeline holds the credential and the verb runs: err=%v out=%q", err, out)
+	}
+}
+
+func TestAgentSandboxContract_N10_AnAgyPaneCannotWriteAProtectedPath(t *testing.T) {
+	h := newContractHost(t)
+	h.prefix = cellPrefix(t, requireNativeSandbox(t), h, "enforce", "agy-tmux")
+	for _, rel := range []string{"go/internal/guards/role.go", ".claude/settings.json", "go/internal/phases/audit/probe_quarantine.go"} {
+		out, err := h.agent(t, contractRow{script: func(h contractHost) string {
+			return "mkdir -p " + filepath.Dir(filepath.Join(h.worktree, rel)) + " ; echo x > " + filepath.Join(h.worktree, rel)
+		}})
+		note, jerr := isolation.Judge("N10", contractFailure(contractDeny, out, err))
+		if jerr != nil {
+			t.Fatalf("%s: %v", rel, jerr)
+		}
+		t.Log(rel, note)
+	}
+	if out, err := h.agent(t, contractRow{script: func(h contractHost) string {
+		return "mkdir -p " + h.worktree + "/go/internal/guards2 && echo ok > " + h.worktree + "/go/internal/guards2/x.go && cat " + h.worktree + "/go/internal/guards2/x.go"
+	}}); err != nil || out != "ok" {
+		t.Fatalf("the agy cell must still write an unprotected path of its worktree: err=%v out=%q", err, out)
+	}
+}
+
+func (h contractHost) agent(t *testing.T, row contractRow) (string, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	defer reapPrivateTmuxServers(h.scratch)
+	args := append(append([]string{}, h.prefix[1:]...), "/bin/sh", "-c", row.script(h))
+	cmd := exec.CommandContext(ctx, h.prefix[0], args...)
+	cmd.WaitDelay = contractAgentWaitDelay
+	cmd.Env = paneEnv(os.Environ())
+	for _, kv := range row.env {
+		cmd.Env = append(cmd.Env, strings.Replace(kv, "<run>", h.runSocket+","+h.runPID+",0", 1))
+	}
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("inconclusive: the agent command timed out: %q", out)
+	}
+	return strings.TrimSpace(string(out)), err
+}
+
+const contractAgentWaitDelay = 2 * time.Second
+
+const contractReapDeadline = 3 * time.Second
+
+func reapPrivateTmuxServers(scratch string) {
+	_ = filepath.WalkDir(scratch, func(path string, d fs.DirEntry, err error) error {
+		if err == nil && d.Type()&fs.ModeSocket != 0 {
+			ctx, cancel := context.WithTimeout(context.Background(), contractReapDeadline)
+			defer cancel()
+			_ = exec.CommandContext(ctx, "tmux", "-S", path, "kill-server").Run()
+		}
+		return nil
+	})
+}
+
+func paneEnv(env []string) []string {
+	return slices.DeleteFunc(slices.Clone(env), func(kv string) bool {
+		return strings.HasPrefix(kv, "TMUX=") || strings.HasPrefix(kv, "TMUX_PANE=")
+	})
+}
+
+func runServerSurvives(t *testing.T, h contractHost) {
+	t.Helper()
+	out, err := exec.Command("tmux", "-S", h.runSocket, "list-sessions", "-F", "#{session_name}").CombinedOutput()
+	if got := strings.Fields(string(out)); err != nil || !slices.Equal(got, []string{"agent", "victim"}) {
+		t.Fatalf("the run server must survive with its sessions [agent victim], got %q err=%v", out, err)
+	}
+}
+
+func newContractHost(t *testing.T) contractHost {
+	t.Helper()
+	requireTmux(t)
+	probe := requireNativeSandbox(t)
+	base := contractTempDir(t, "/tmp", "sbc")
+	t.Setenv("TMUX_TMPDIR", base)
+	t.Setenv(TmuxSocketEnv, fmt.Sprintf("evolve-bridge-c%d", os.Getpid()))
+	h := contractHost{runName: tmuxSocketName(), socketDir: TmuxSocketDir(), scratch: contractTempDir(t, "/tmp", "sbc-agent")}
+	if err := os.MkdirAll(h.socketDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	h.runSocket = filepath.Join(h.socketDir, h.runName)
+	h.defaultSocket = filepath.Join(h.socketDir, "default")
+	startContractServer(t, h.runSocket, "victim", "agent")
+	startContractServer(t, h.defaultSocket, "victim")
+	h.runPID = contractTmux(t, h.runSocket, "display-message", "-p", "#{pid}")
+	h.ownTTY = contractTmux(t, h.runSocket, "display-message", "-p", "-t", "=agent:", "#{pane_tty}")
+	h.peerTTY = contractTmux(t, h.runSocket, "display-message", "-p", "-t", "=victim:", "#{pane_tty}")
+	h.withProject(t)
+	h.prefix = builderPrefix(t, probe, h, "enforce")
+	return h
+}
+
+func (h *contractHost) withProject(t *testing.T) {
+	t.Helper()
+	h.root, h.worktree = contractTempDir(t, "", "sbc-root"), contractTempDir(t, "", "sbc-wt")
+	h.run = filepath.Join(h.root, ".evolve", "runs", "cycle-7")
+	h.otherCycle = filepath.Join(h.root, ".evolve", "runs", "cycle-8")
+	h.events = filepath.Join(h.root, ".evolve", "events")
+	h.resumeWitness = filepath.Join(h.root, ".evolve", "resume-witness")
+	for _, dir := range []string{h.run, h.otherCycle, h.events, h.resumeWitness, inputindex.AccessDir(h.root), filepath.Join(h.root, ".evolve", "landing"), filepath.Join(h.root, ".evolve", "waves", "integration-current")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.withIsolationFixtures(t)
+}
+
+func (h *contractHost) withIsolationFixtures(t *testing.T) {
+	t.Helper()
+	h.home = contractTempDir(t, "", "sbc-home")
+	h.dispatch = dispatchcred.Store{Dir: filepath.Join(h.home, ".evolve", "dispatch")}
+	t.Setenv("HOME", h.home)
+	runs := filepath.Dir(h.run)
+	for rel, body := range map[string]string{
+		filepath.Join(h.run, ".bridge", "scout-stdout.log"):       "raw output of the scout\n",
+		filepath.Join(runs, "cycle-6", "retrospective-report.md"): "lesson of cycle 6\n",
+		filepath.Join(runs, "cycle-9", "audit-report.md"):         "audit of an unrelated item\n",
+		filepath.Join(h.run, "build-stdout.log"):                  "raw output of the build\n",
+		filepath.Join(runs, "cycle-9", "lane-scope.json"):         `{"todo_ids":["item-b"]}`,
+		filepath.Join(h.run, "lane-scope.json"):                   `{"todo_ids":["item-a"]}`,
+		filepath.Join(h.home, ".ssh", "id_fixture"):               "fixture secret of the cell home\n",
+		paths.SeatTokenPath(h.home):                               "fixture-seat-token\n",
+	} {
+		if err := os.MkdirAll(filepath.Dir(rel), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(rel, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for cycle, item := range map[int]string{6: "item-a", 7: "item-a", 9: "item-b"} {
+		if err := inputindex.WriteRecord(h.root, inputindex.Record{Cycle: cycle, ItemIDs: []string{item}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.reindex(t)
+	h.withKeychain(t)
+	h.stubBin = contractTempDir(t, "", "sbc-bin")
+	fakeclitest.Install(t, filepath.Join(h.stubBin, "claude"), "#!/bin/sh\necho stub-claude 0.0.0\n")
+	olderVersion := filepath.Join(h.home, ".local", "share", "claude", "versions", "2.1.304")
+	if err := os.MkdirAll(filepath.Dir(olderVersion), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeclitest.Install(t, olderVersion, "#!/bin/sh\necho stub-claude 2.1.304\n")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	h.netPort = strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
+}
+
+func (h *contractHost) withEvolveBinary(t *testing.T) {
+	t.Helper()
+	h.evolveBin = filepath.Join(contractTempDir(t, "", "sbc-evolve"), "evolve")
+	flags := "-X github.com/mickeyyaya/evolve-loop/go/internal/dispatchcred.root=" + h.dispatch.Dir
+	build := exec.Command("go", "build", "-ldflags", flags, "-o", h.evolveBin, "./cmd/evolve")
+	build.Dir = filepath.Join("..", "..")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build the evolve binary with the dispatch store of the cell home: %v\n%s", err, out)
+	}
+}
+
+func builderPrefix(t *testing.T, probe sandbox.ProbeResult, h contractHost, execStage string) []string {
+	t.Helper()
+	return cellPrefix(t, probe, h, execStage, "claude-tmux")
+}
+
+func cellPrefix(t *testing.T, probe sandbox.ProbeResult, h contractHost, execStage, cli string) []string {
+	t.Helper()
+	return seatPrefix(t, probe, h, execStage, cli, "builder")
+}
+
+func seatPrefix(t *testing.T, probe sandbox.ProbeResult, h contractHost, execStage, cli, seat string) []string {
+	t.Helper()
+	profilesDir, err := filepath.Abs(filepath.Join("..", "..", "..", ".evolve", "profiles"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prof, err := profiles.NewFromDir(profilesDir).Get(seat)
+	if err != nil || prof.Sandbox == nil || !prof.Sandbox.Enabled {
+		t.Fatalf("the %s profile must declare an enabled sandbox: %v", seat, err)
+	}
+	cfg := &Config{CLI: cli, Agent: seat, ProjectRoot: h.root, Worktree: h.worktree, Workspace: h.run,
+		RequireSandbox: true, SandboxWriteSubpaths: prof.Sandbox.WriteSubpaths}
+	if cfg.DenyPaths, err = resolveSandboxDenials(prof.Sandbox.DenySubpaths, h.root, h.worktree, true); err != nil {
+		t.Fatal(err)
+	}
+	cfg.DispatchID = "sbc-" + strconv.Itoa(os.Getpid())
+	deps := Deps{Env: map[string]string{}, LookupEnv: mapLookup(nil), ExecStage: execStage, ReadStage: execStage, GuaranteeStage: execStage, LookPath: stubOnlyLookPath(h.stubBin),
+		DispatchStore: func() (dispatchcred.Store, error) { return h.dispatch, nil }}
+	deps.SandboxWrap = defaultSandboxWrapWithProbe(deps, func() sandbox.ProbeResult { return probe })
+	prefix, ok := sandboxPrefixForLaunch(deps, cfg, h.ownTTY)
+	if !ok {
+		t.Fatalf("the bridge refused to wrap the %s", seat)
+	}
+	return prefix
+}
+
+func stubOnlyLookPath(stubBin string) func(string) (string, error) {
+	return func(name string) (string, error) {
+		if name == "claude" {
+			return filepath.Join(stubBin, name), nil
+		}
+		return "", exec.ErrNotFound
+	}
+}
+
+func startContractServer(t *testing.T, socket string, sessions ...string) {
+	t.Helper()
+	t.Cleanup(func() { _ = exec.Command("tmux", "-S", socket, "kill-server").Run() })
+	contractTmux(t, socket, "-f", os.DevNull, "new-session", "-d", "-s", sessions[0], "-x", "80", "-y", "24")
+	for _, s := range sessions[1:] {
+		contractTmux(t, socket, "new-session", "-d", "-s", s, "-x", "80", "-y", "24")
+	}
+}
+
+func contractTmux(t *testing.T, socket string, args ...string) string {
+	t.Helper()
+	out, err := exec.Command("tmux", append([]string{"-S", socket}, args...)...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("tmux -S %s %v: %v: %s", socket, args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func (h contractHost) reindex(t *testing.T) {
+	t.Helper()
+	record, _ := inputindex.ReadRecord(h.root, 7)
+	idx, err := inputindex.Build(inputindex.Request{ProjectRoot: h.root, Workspace: h.run, Cycle: 7, Phase: "build", ItemIDs: record.ItemIDs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := inputindex.Write(h.run, idx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAgentSandboxContract_AForgedLaneScopeGainsNoGrantAtTheNextDispatch(t *testing.T) {
+	h := newContractHost(t)
+	h.prefix = builderPrefix(t, requireNativeSandbox(t), h, "shadow")
+	if out, err := h.agent(t, contractRow{script: func(h contractHost) string {
+		return `echo '{"todo_ids":["item-b"]}' > ` + h.run + "/lane-scope.json && cat " + h.run + "/lane-scope.json"
+	}}); err != nil || !strings.Contains(out, "item-b") {
+		t.Fatalf("inconclusive: the shadow cell must be able to forge its lane scope: err=%v out=%q", err, out)
+	}
+	h.reindex(t)
+	h.prefix = builderPrefix(t, requireNativeSandbox(t), h, "enforce")
+	unrelated := filepath.Join(filepath.Dir(h.otherCycle), "cycle-9", "audit-report.md")
+	out, err := h.agent(t, contractRow{script: func(contractHost) string { return "cat " + unrelated }})
+	if failure := contractFailure(contractDeny, out, err); failure != nil {
+		t.Fatalf("a forged lane scope must not pull an unrelated cycle into the next index: %v", failure)
+	}
+}
+
+func TestAgentSandboxContract_AnOpenOfAnIndexedPathWritesOneAccessRecord(t *testing.T) {
+	h := newContractHost(t)
+	since := time.Now().Add(-2 * time.Second)
+	if out, err := h.agent(t, contractRow{script: func(h contractHost) string {
+		return "cat " + filepath.Join(filepath.Dir(h.run), "cycle-6", "retrospective-report.md")
+	}}); err != nil || out != "lesson of cycle 6" {
+		t.Fatalf("the indexed read must run: err=%v out=%q", err, out)
+	}
+	idx, err := inputindex.Read(h.run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &Config{CLI: "claude-tmux", Agent: idx.Phase, Cycle: 7, ProjectRoot: h.root, Worktree: h.worktree, Workspace: h.run,
+		RequireSandbox: true, DispatchID: "sbc-" + strconv.Itoa(os.Getpid())}
+	var stderr strings.Builder
+	deps := Deps{hostOS: "darwin", ReadStage: "enforce", Env: map[string]string{}, Stderr: &stderr, Now: time.Now, Sleep: time.Sleep,
+		SandboxReports: logShowReports(logShowPath), SandboxFence: sandboxFence(sandboxExecPath)}
+	started := time.Now()
+	deps.reportReadViolations(context.Background(), cfg, since)
+	records, err := inputindex.ReadAccess(h.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failure := fmt.Errorf("no access record names the retrospective of cycle 6 after %s of polling for the fence (stderr %q)", time.Since(started).Round(time.Millisecond), stderr.String())
+	for _, r := range records {
+		if r.Type == inputindex.AccessOpen && r.Kind == "retrospective" && r.Cycle == 7 && r.Source == inputindex.AccessSourceSandbox {
+			failure = nil
+		}
+	}
+	note, jerr := isolation.Judge("N16", failure)
+	if jerr != nil {
+		t.Fatal(jerr)
+	}
+	t.Log(note)
+}
+
+func TestAgentSandboxContract_TheSelfhealOrchestratorSeatHoldsN3AndN4(t *testing.T) {
+	h := newContractHost(t)
+	h.withEvolveBinary(t)
+	h.prefix = seatPrefix(t, requireNativeSandbox(t), h, "enforce", "claude-tmux", "selfheal-orchestrator")
+	rows := []contractRow{
+		{action: "N3 for the orchestrator seat: exec an LLM binary", want: contractDeny,
+			script: func(h contractHost) string { return "PATH=" + h.stubBin + ":$PATH claude --version" }},
+		{action: "N4 for the orchestrator seat: evolve agent run with the env markers stripped", want: contractCredentialRefusal,
+			script: func(h contractHost) string {
+				return strippedMarkers + h.evolveBin + " agent run --refused-before-parse"
+			}},
+		{action: "the orchestrator seat cannot start its own verb: evolve selfheal propose with the env markers stripped", want: contractCredentialRefusal,
+			script: func(h contractHost) string {
+				return strippedMarkers + h.evolveBin + " selfheal propose --refused-before-parse"
+			}},
+		{action: "the orchestrator seat cannot write a file of the repository", want: contractDeny,
+			script: func(h contractHost) string { return "echo x > " + h.root + "/.evolve/forged.json" }},
+	}
+	for _, row := range rows {
+		t.Run(row.action, func(t *testing.T) {
+			out, err := h.agent(t, row)
+			if failure := contractFailure(row.want, out, err); failure != nil {
+				t.Fatal(failure)
+			}
+		})
+	}
+}

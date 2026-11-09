@@ -1,0 +1,38 @@
+{
+  "name": "capacity-plan",
+  "catalog": "on-demand",
+  "archetype": "plan",
+  "agent": "evolve-capacity-plan",
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/scout-report.md"
+    ],
+    "signals": []
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/capacity-plan-report.md"
+    ],
+    "signals": [
+      "capacity.gap_count"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Demand Forecast",
+      "Current Capacity",
+      "Capacity Gap"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "ops-incident"
+      }
+    ]
+  },
+  "after": "triage",
+  "optional": true
+}

@@ -1,0 +1,64 @@
+package bridge
+
+import (
+	"context"
+	"fmt"
+)
+
+type agyDriver struct{}
+
+func (agyDriver) Name() string { return "agy" }
+
+func (agyDriver) DeepProbeArgs(m Manifest) []string {
+	return headlessProbeArgs(m)
+}
+
+func (agyDriver) Launch(ctx context.Context, cfg *Config, deps Deps) (int, error) {
+	if cfg.PermissionMode != "" {
+		fmt.Fprintf(deps.Stderr, "[agy] permission_mode='%s' is not supported on this CLI\n", cfg.PermissionMode)
+		fmt.Fprintln(deps.Stderr, "[agy] Only claude-p and claude-tmux drivers support --permission-mode.")
+		fmt.Fprintln(deps.Stderr, "[agy] Agy exposes only --dangerously-skip-permissions; use --allow-bypass + omit permission_mode.")
+		return ExitBadFlags, nil
+	}
+	if cfg.StreamOutput {
+		fmt.Fprintln(deps.Stderr, "[agy] NOTE: stream_output=true is not supported on this CLI — no-op (agy has no streaming output flag)")
+	}
+	if cfg.SessionName != "" {
+		fmt.Fprintf(deps.Stderr, "[agy] NOTE: --session-name='%s' is no-op for this driver (single-shot process).\n", cfg.SessionName)
+	}
+
+	switch cfg.Model {
+	case "haiku", "sonnet", "opus", "auto", "":
+		fmt.Fprintf(deps.Stderr, "[agy] tier '%s' → agy default; agy has no -m flag\n", cfg.Model)
+	default:
+		fmt.Fprintf(deps.Stderr, "[agy] WARN: model '%s' is not a Claude tier alias — agy ignores it anyway\n", cfg.Model)
+	}
+
+	prompt, err := preparePrompt(cfg, deps)
+	if err != nil {
+		return ExitBadFlags, err
+	}
+	args := []string{"-p", prompt, "--dangerously-skip-permissions"}
+	args = append(args, cfg.Realization.LaunchFlags...)
+	args = append(args, cfg.ExtraFlags...)
+	name, args, wrapped := wrapHeadlessInvocation(deps, cfg, resolveBinary(deps, "agy"), args)
+	if sandboxRequiredButUnavailable(deps, cfg, wrapped) {
+		fmt.Fprintln(deps.Stderr, "[agy] required OS sandbox is unavailable; refusing an unconfined launch")
+		return ExitSafetyGate, nil
+	}
+	stdoutF, stderrF, closeFn, err := openDriverLogs(cfg)
+	if err != nil {
+		return ExitBadFlags, err
+	}
+	defer closeFn()
+
+	observeModelDispatch(deps, defaultModelDispatch())
+	rc, err := deps.Runner(ctx, name, cfg.Worktree, args, dispatchEnv(deps, cfg), nil, stdoutF, stderrF)
+	if err != nil {
+		return ExitMissingBinary, fmt.Errorf("[agy] %w", err)
+	}
+	fmt.Fprintf(deps.Stderr, "[agy] agy exited rc=%d\n", rc)
+	return rc, nil
+}
+
+func init() { Register(agyDriver{}) }

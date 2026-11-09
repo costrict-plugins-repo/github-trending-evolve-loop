@@ -1,0 +1,261 @@
+package lifecycle
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/inboxbatch"
+)
+
+type Location struct {
+	Path  string
+	Cycle int
+}
+
+func Locate(inboxDir, id string) (Location, error) {
+	for _, dir := range inboxbatch.ProcessingCycleDirs(inboxDir) {
+		if path, ferr := FindFileByTaskID(dir, id); ferr == nil {
+			cycle, _ := inboxbatch.ParseProcessingCycle(filepath.Base(dir))
+			return Location{Path: path, Cycle: cycle}, nil
+		}
+	}
+	path, err := FindFileByTaskID(inboxDir, id)
+	switch {
+	case err == nil:
+		return Location{Path: path}, nil
+	case errors.Is(err, ErrNotFound) || os.IsNotExist(err):
+		return Location{}, ErrNotFound
+	default:
+		return Location{}, err
+	}
+}
+
+func FindFileByTaskID(dir, taskID string) (string, error) {
+	entries, err := jsonEntries(dir)
+	if err != nil {
+		return "", err
+	}
+	for _, e := range entries {
+		path := filepath.Join(dir, e.Name())
+		if id, ok := readID(path); ok && id == taskID {
+			return path, nil
+		}
+	}
+	return "", ErrNotFound
+}
+
+func (m *Mover) locatePending(verb, taskID string) (Location, error) {
+	if taskID == "" {
+		return Location{}, fmt.Errorf("%w: %s requires task_id", ErrBadArgs, verb)
+	}
+	loc, err := Locate(m.inboxDir, taskID)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		return loc, fmt.Errorf("%w: %s", ErrNotFound, taskID)
+	case err != nil:
+		return loc, fmt.Errorf("%s: locate %s: %w", verb, taskID, err)
+	case loc.Cycle != 0:
+		return loc, fmt.Errorf("%w: %s (held by cycle %d)", ErrNotFound, taskID, loc.Cycle)
+	}
+	return loc, nil
+}
+
+func jsonEntries(dir string) ([]os.DirEntry, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var out []os.DirEntry
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+func readID(path string) (string, bool) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	var doc struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return "", false
+	}
+	return inboxbatch.ItemID(doc.ID, path), true
+}
+
+func readTaskIDOrUnknown(path string) string {
+	if id, ok := readID(path); ok && id != "" {
+		return id
+	}
+	return "unknown"
+}
+
+func (m *Mover) ReadFailureCount(taskID string) (int, bool) {
+	rec, ok := m.readFailureFields(taskID)
+	return rec.FailureCount, ok
+}
+
+func (m *Mover) ReadLastFailureClass(taskID string) string {
+	rec, _ := m.readFailureFields(taskID)
+	return rec.LastFailureClass
+}
+
+func (m *Mover) ReadLastFailureRung(taskID string) string {
+	rec, _ := m.readFailureFields(taskID)
+	return rec.LastFailureRung
+}
+
+type failureFields struct {
+	FailureCount     int    `json:"failure_count"`
+	LastFailureClass string `json:"last_failure_class"`
+	LastFailureRung  string `json:"last_failure_rung"`
+}
+
+func (m *Mover) readFailureFields(taskID string) (failureFields, bool) {
+	dirs := append([]string{m.inboxDir}, inboxbatch.ProcessingCycleDirs(m.inboxDir)...)
+	for _, d := range dirs {
+		path, err := FindFileByTaskID(d, taskID)
+		if err != nil {
+			continue
+		}
+		if rec, ok := readFailureFieldsAt(path); ok {
+			return rec, true
+		}
+	}
+	return failureFields{}, false
+}
+
+func readFailureCountAt(path string) (int, bool) {
+	rec, ok := readFailureFieldsAt(path)
+	return rec.FailureCount, ok
+}
+
+func readFailureFieldsAt(path string) (failureFields, bool) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return failureFields{}, false
+	}
+	var rec failureFields
+	if json.Unmarshal(raw, &rec) != nil {
+		return failureFields{}, false
+	}
+	return rec, true
+}
+
+type failureRecord struct {
+	reason, class, fingerprint, rung string
+	cycle                            int
+}
+
+func BumpFailureCount(path, reason string) (int, error) {
+	return bumpWith(path, failureRecord{reason: reason}, nil)
+}
+
+func bumpWith(path string, rec failureRecord, shedAt func(count int) bool) (int, error) {
+	count := 0
+	err := UpdateItemJSON(path, func(item map[string]json.RawMessage) {
+		if raw, ok := item[inboxbatch.FailureCountField]; ok {
+			_ = json.Unmarshal(raw, &count)
+		}
+		if rec.cycle > 0 && chargedCycle(item) == rec.cycle {
+			return
+		}
+		count++
+		if rec.cycle > 0 {
+			item[inboxbatch.LastFailureCycleField] = json.RawMessage(strconv.Itoa(rec.cycle))
+		}
+		item[inboxbatch.FailureCountField] = json.RawMessage(strconv.Itoa(count))
+		stampText(item, inboxbatch.LastFailureReasonField, rec.reason)
+		stampOrClear(item, inboxbatch.LastFailureClassField, rec.class)
+		stampOrClear(item, inboxbatch.LastFailureFingerprintField, rec.fingerprint)
+		stampOrClear(item, inboxbatch.LastFailureRungField, rec.rung)
+		if shedAt != nil && shedAt(count) {
+			delete(item, inboxbatch.ContinuationField)
+		}
+	})
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func chargedCycle(item map[string]json.RawMessage) int {
+	var cycle int
+	if raw, ok := item[inboxbatch.LastFailureCycleField]; ok {
+		_ = json.Unmarshal(raw, &cycle)
+	}
+	return cycle
+}
+
+func stampText(item map[string]json.RawMessage, key, value string) {
+	if value != "" {
+		rb, _ := json.Marshal(value)
+		item[key] = rb
+	}
+}
+
+func stampOrClear(item map[string]json.RawMessage, key, value string) {
+	delete(item, key)
+	stampText(item, key, value)
+}
+
+func UpdateItemJSON(path string, mutate func(m map[string]json.RawMessage)) error {
+	return updateAdmittedItemJSON(path, admitEvery, mutate)
+}
+
+func admitEvery([]byte) error { return nil }
+
+func updateAdmittedItemJSON(path string, admit func(body []byte) error, mutate func(m map[string]json.RawMessage)) error {
+	return rewriteItemJSON(path, admit, func(item map[string]json.RawMessage) error {
+		mutate(item)
+		return nil
+	})
+}
+
+func rewriteItemJSON(path string, admit func(body []byte) error, rewrite func(item map[string]json.RawMessage) error) error {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if err := admit(body); err != nil {
+		return err
+	}
+	var item map[string]json.RawMessage
+	if err := json.Unmarshal(body, &item); err != nil {
+		return err
+	}
+	if item == nil {
+		return fmt.Errorf("%w: %s is not a JSON object", ErrInvalidItem, path)
+	}
+	if err := rewrite(item); err != nil {
+		return err
+	}
+	out, err := json.Marshal(item)
+	if err != nil {
+		return err
+	}
+	tmp := fmt.Sprintf("%s.tmp.%d", path, os.Getpid())
+	if err := os.WriteFile(tmp, out, 0o644); err != nil {
+		return err
+	}
+	return commitTmp(tmp, path)
+}
+
+func commitTmp(tmp, path string) error {
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}

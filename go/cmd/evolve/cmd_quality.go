@@ -1,0 +1,246 @@
+package main
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/codeshape"
+	"github.com/mickeyyaya/evolve-loop/go/internal/paths"
+	"github.com/mickeyyaya/evolve-loop/go/internal/pipelinerates"
+	"github.com/mickeyyaya/evolve-loop/go/internal/policy"
+	"github.com/mickeyyaya/evolve-loop/go/internal/qualitypanel"
+	"github.com/mickeyyaya/evolve-loop/go/internal/signalcenter"
+)
+
+const (
+	qualityUsage      = "usage: evolve quality report|show --scope wave|tree|judges|replay [--json] --project-root P | evolve quality compare --index PQ1|PQ4 --a WINDOW --b WINDOW [--paired] [--json] --project-root P (WINDOW: wave:N or waves:A-B)"
+	qualityPolicyPath = ".evolve/" + paths.PolicyFile
+)
+
+type qualityReader struct {
+	index string
+	read  func(root string) ([]qualitypanel.Reading, error)
+}
+
+type qualityEnv struct {
+	scopes    map[string][]qualityReader
+	newCenter func(root, evolveDir string, console io.Writer) (*signalcenter.Center, func())
+}
+
+var qualityScopes = map[string][]qualityReader{"wave": waveQualityReaders(), "tree": treeQualityReaders(), "judges": nil, "replay": nil}
+
+func waveQualityReaders() []qualityReader {
+	return []qualityReader{
+		pipelineReader("PQ1", func(cs []pipelinerates.Cycle, _ string) ([]qualitypanel.Reading, error) {
+			return pipelinerates.ShipRate(cs), nil
+		}),
+		pipelineReader("PQ4", func(cs []pipelinerates.Cycle, _ string) ([]qualitypanel.Reading, error) {
+			return pipelinerates.DeadlineRate(cs), nil
+		}),
+		pipelineReader("CQ2", func(cs []pipelinerates.Cycle, root string) ([]qualitypanel.Reading, error) {
+			return pipelinerates.PackagesPerShip(cs, pipelinerates.GitShipPaths(root))
+		}),
+		shapeReader("CQ1", func(t codeshape.Tree, _ string) ([]qualitypanel.Reading, error) {
+			return []qualitypanel.Reading{codeshape.TreeConformance(t)}, nil
+		}),
+		pipelineReader("CQ1", func(cs []pipelinerates.Cycle, root string) ([]qualitypanel.Reading, error) {
+			return codeshape.ChangedConformance(root, cs)
+		}),
+		pipelineReader("PQ5", func(cs []pipelinerates.Cycle, _ string) ([]qualitypanel.Reading, error) {
+			return pipelinerates.CostPerShip(cs), nil
+		}),
+	}
+}
+
+func treeQualityReaders() []qualityReader {
+	return []qualityReader{
+		shapeReader("CQ4", func(t codeshape.Tree, root string) ([]qualitypanel.Reading, error) {
+			readings := []qualitypanel.Reading{codeshape.InterfaceDepth(t), codeshape.TreeDuplication(t)}
+			cycles, err := pipelinerates.LoadCycles(root)
+			if err != nil {
+				return readings, err
+			}
+			r, err := codeshape.DiffDuplication(root, t, cycles)
+			if err != nil {
+				return readings, err
+			}
+			return append(readings, r), nil
+		}),
+		{index: "CQ5", read: func(root string) ([]qualitypanel.Reading, error) {
+			lines, files, err := codeshape.RuleLines(root)
+			return []qualitypanel.Reading{codeshape.JudgmentSurface(lines, files)}, err
+		}},
+	}
+}
+
+func shapeReader(index string, read func(codeshape.Tree, string) ([]qualitypanel.Reading, error)) qualityReader {
+	return qualityReader{index: index, read: func(root string) ([]qualitypanel.Reading, error) {
+		tree, err := codeshape.Scan(codeshape.GoRoot(root))
+		if err != nil {
+			return nil, err
+		}
+		return read(tree, root)
+	}}
+}
+
+func pipelineReader(index string, read func([]pipelinerates.Cycle, string) ([]qualitypanel.Reading, error)) qualityReader {
+	return qualityReader{index: index, read: func(root string) ([]qualitypanel.Reading, error) {
+		cycles, err := pipelinerates.LoadCycles(root)
+		if err != nil {
+			return nil, err
+		}
+		return read(cycles, root)
+	}}
+}
+
+func runQuality(args []string, _ io.Reader, stdout, stderr io.Writer) int {
+	return runQualityWith(qualityEnv{scopes: qualityScopes, newCenter: newQualityCenter}, args, stdout, stderr)
+}
+
+func newQualityCenter(root, evolveDir string, console io.Writer) (*signalcenter.Center, func()) {
+	return newRoleSignalCenter("quality", root, evolveDir, console)
+}
+
+func runQualityWith(env qualityEnv, args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == "compare" {
+		return runQualityCompare(env, args[1:], stdout, stderr)
+	}
+	if len(args) > 0 && args[0] == "show" {
+		return runQualityShow(env, args, stdout, stderr)
+	}
+	a, err := parseQualityArgs("report", args, env.scopes)
+	if err != nil {
+		fmt.Fprintf(stderr, "quality: %v\n%s\n", err, qualityUsage)
+		return exitUsage
+	}
+	human := humanWriter(stdout, a.json)
+	readers := env.scopes[a.scope]
+	if len(readers) == 0 {
+		fmt.Fprintf(human, "quality report: scope %s has no index readers yet (ADR-0153 components Q2 to Q10 add them)\n", a.scope)
+	}
+	center, closeCenter := env.newCenter(a.root, paths.EvolveDirOf(a.root), stderr)
+	defer closeCenter()
+	t := collectQuality(center.Emit, a.root, readers)
+	if a.json {
+		return printVerbJSON("quality report", t.result(a.scope), stdout, stderr)
+	}
+	fmt.Fprintf(stdout, "quality report: scope %s: %d reading(s), %d breach(es), %d warning(s)\n", a.scope, t.readings, t.breaches, t.warnings)
+	return 0
+}
+
+type qualityReportArgs struct {
+	scope, root string
+	json        bool
+}
+
+type qualityReportResult struct {
+	Scope    string `json:"scope"`
+	Readings int    `json:"readings"`
+	Breaches int    `json:"breaches"`
+	Warnings int    `json:"warnings"`
+}
+
+func parseQualityArgs(verb string, args []string, scopes map[string][]qualityReader) (qualityReportArgs, error) {
+	var a qualityReportArgs
+	if len(args) == 0 || args[0] != verb {
+		return a, fmt.Errorf("want the %s verb", verb)
+	}
+	operands, err := (cliFlags{values: map[string]*string{"--scope": &a.scope, "--project-root": &a.root}, bools: map[string]*bool{"--json": &a.json}}).parse(args[1:])
+	switch {
+	case err != nil:
+		return a, err
+	case len(operands) > 0:
+		return a, fmt.Errorf("unexpected argument %q", operands[0])
+	case a.root == "":
+		return a, errors.New("--project-root is required")
+	}
+	if _, ok := scopes[a.scope]; !ok {
+		return a, fmt.Errorf("scope %q is not wave, tree, judges or replay", a.scope)
+	}
+	a.root = paths.AbsoluteRoot("--project-root", a.root, nil)
+	return a, nil
+}
+
+type qualityTally struct {
+	sink                         func(signalcenter.Event)
+	readings, breaches, warnings int
+}
+
+func collectQuality(sink func(signalcenter.Event), root string, readers []qualityReader) qualityTally {
+	t := qualityTally{sink: sink}
+	stages := t.stages(root)
+	for _, rd := range readers {
+		readings, err := rd.read(root)
+		if err != nil {
+			t.emit(readerWarning(rd.index, err))
+		}
+		t.publish(readings, stages)
+	}
+	return t
+}
+
+func (t qualityTally) result(scope string) qualityReportResult {
+	return qualityReportResult{Scope: scope, Readings: t.readings, Breaches: t.breaches, Warnings: t.warnings}
+}
+
+func (t *qualityTally) stages(root string) map[string]qualitypanel.Stage {
+	stages, err := policy.QualityStagesFor(root)
+	if err != nil {
+		t.emit(qualitypanel.SourceWarning("", qualitypanel.CodeSourceUnreadable, qualityPolicyPath, err.Error()))
+	}
+	return stages
+}
+
+func (t *qualityTally) publish(readings []qualitypanel.Reading, stages map[string]qualitypanel.Stage) {
+	for _, r := range readings {
+		for _, e := range qualitypanel.Events(r, qualitypanel.StageFor(r.Index, stages)) {
+			t.emit(e)
+		}
+	}
+}
+
+func (t *qualityTally) emit(e signalcenter.Event) {
+	switch e.Kind {
+	case signalcenter.KindQualityReading:
+		t.readings++
+	case signalcenter.KindQualityBreach:
+		t.breaches++
+	default:
+		t.warnings++
+	}
+	t.sink(e)
+}
+
+func readerWarning(index string, err error) signalcenter.Event {
+	var pathErr *fs.PathError
+	if errors.Is(err, fs.ErrNotExist) && errors.As(err, &pathErr) {
+		return qualitypanel.SourceWarning(index, qualitypanel.CodeSourceAbsent, pathErr.Path, err.Error())
+	}
+	return qualitypanel.SourceWarning(index, qualitypanel.CodeSourceUnreadable, "", err.Error())
+}
+
+type qualityShowResult struct {
+	qualityReportResult
+	Events []signalcenter.Event `json:"events"`
+}
+
+func runQualityShow(env qualityEnv, args []string, stdout, stderr io.Writer) int {
+	a, err := parseQualityArgs("show", args, env.scopes)
+	if err != nil {
+		fmt.Fprintf(stderr, "quality show: %v\n%s\n", err, qualityUsage)
+		return exitUsage
+	}
+	events := []signalcenter.Event{}
+	t := collectQuality(func(e signalcenter.Event) { events = append(events, e) }, a.root, env.scopes[a.scope])
+	result := qualityShowResult{t.result(a.scope), events}
+	if a.json {
+		return printVerbJSON("quality show", result, stdout, stderr)
+	}
+	for _, e := range events {
+		fmt.Fprintln(stdout, signalcenter.FormatLine(e))
+	}
+	fmt.Fprintf(stdout, "quality show: scope %s: %d reading(s), %d breach(es), %d warning(s)\n", a.scope, t.readings, t.breaches, t.warnings)
+	return cliExitOK
+}
