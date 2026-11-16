@@ -1,0 +1,148 @@
+package bridge
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+	"testing"
+	"time"
+)
+
+var positionalTmuxCLIs = map[string]func(m Manifest) error{
+	"ollama-tmux": func(m Manifest) error {
+		model := m.ModelTierMap["deep"]
+		if model == "" {
+			return fmt.Errorf("ollama-tmux model_tier_map has no deep entry")
+		}
+		if cmd := ollamaComposeLaunchCmd("ollama", model, nil); !strings.Contains(cmd, model) {
+			return fmt.Errorf("positional launch line %q does not carry the model %q", cmd, model)
+		}
+		return nil
+	},
+}
+
+func tierChannelEffective(m Manifest) error {
+	distinct := map[string]struct{}{}
+	for _, tier := range []string{"fast", "balanced", "deep"} {
+		if v := m.ModelTierMap[tier]; v != "" {
+			distinct[v] = struct{}{}
+		}
+	}
+	spec := m.Params["model_tier"]
+	switch spec.Channel {
+	case "flag":
+		if spec.Flag == "" {
+			return fmt.Errorf("channel=flag with empty flag name")
+		}
+		deep := m.ModelTierMap["deep"]
+		r := Realize(m, LaunchIntent{ModelTier: "deep"})
+		if deep == "" || !containsToken(r.LaunchFlags, spec.Flag) || !containsToken(r.LaunchFlags, deep) {
+			return fmt.Errorf("Realize(tier=deep) did not emit %s %q (LaunchFlags=%v)", spec.Flag, deep, r.LaunchFlags)
+		}
+		return nil
+	case "repl":
+		if spec.Template == "" {
+			return fmt.Errorf("channel=repl with empty template")
+		}
+		deep := m.ModelTierMap["deep"]
+		r := Realize(m, LaunchIntent{ModelTier: "deep"})
+		if deep == "" || len(r.REPLInput) == 0 || !strings.Contains(strings.Join(r.REPLInput, "\n"), deep) {
+			return fmt.Errorf("Realize(tier=deep) did not seed REPL input with %q (REPLInput=%v)", deep, r.REPLInput)
+		}
+		return nil
+	default:
+		if check, ok := positionalTmuxCLIs[m.CLI]; ok {
+			return check(m)
+		}
+		if len(distinct) > 1 {
+			return fmt.Errorf("multi-model CLI (%d distinct tier models) with channel=%q silently drops intent.ModelTier", len(distinct), spec.Channel)
+		}
+		return nil
+	}
+}
+
+func TestModelTierMatrixParity(t *testing.T) {
+	injectCatalogDir(t, t.TempDir())
+	for _, name := range ManifestNames() {
+		m, err := LoadManifest(name)
+		if err != nil {
+			t.Fatalf("LoadManifest(%s): %v", name, err)
+		}
+		if !m.IsTmux() {
+			continue
+		}
+		t.Run(name, func(t *testing.T) {
+			if err := tierChannelEffective(m); err != nil {
+				t.Errorf("%s does not translate intent.ModelTier effectively: %v", name, err)
+			}
+		})
+	}
+
+	t.Run("synthetic-multimodel-NoopRejected", func(t *testing.T) {
+		syn := Manifest{
+			CLI: "synthetic-tmux", Binary: "syn", Transport: "tmux",
+			Params:       map[string]ParamSpec{"model_tier": {Channel: "noop"}},
+			ModelTierMap: map[string]string{"fast": "syn-a", "balanced": "syn-b", "deep": "syn-c"},
+		}
+		if err := tierChannelEffective(syn); err == nil {
+			t.Error("a multi-model manifest with channel=noop must be REJECTED by the parity rule — it silently drops the tier")
+		}
+	})
+}
+
+func TestAgyTierDeepLaunchCarriesModelToPane(t *testing.T) {
+	injectCatalogDir(t, t.TempDir())
+	m, err := LoadManifest("agy-tmux")
+	if err != nil {
+		t.Fatalf("LoadManifest(agy-tmux): %v", err)
+	}
+	deep := m.ModelTierMap["deep"]
+	if deep == "" {
+		t.Fatal("agy-tmux model_tier_map has no deep entry")
+	}
+
+	ws := t.TempDir()
+	cfg := &Config{
+		Workspace:   ws,
+		Worktree:    ws,
+		ProjectRoot: ws,
+		Agent:       "parity-probe",
+		AllowBypass: true,
+		BootOnly:    true,
+		Realization: RealizeFor("agy-tmux", LaunchIntent{ModelTier: "deep", Permission: "bypass"}),
+	}
+	frames := make([]string, 12)
+	for i := range frames {
+		frames[i] = footerShowing(modelNameOf(cfg.Realization.modelDispatchEffect.model), "low")
+	}
+	tm := &FakeTmuxController{CaptureFrames: frames}
+	deps := Deps{
+		Tmux:      tm,
+		Sleep:     func(time.Duration) {},
+		LookupEnv: mapLookup(map[string]string{"EVOLVE_PHASE_RECOVERY": "off"}),
+		Stderr:    os.Stderr,
+	}.withDefaults()
+
+	code, err := agyTmuxDriver{target: "agy-tmux"}.Launch(context.Background(), cfg, deps)
+	if err != nil || code != ExitOK {
+		t.Fatalf("agyTmuxDriver.Launch = (%d, %v), want (ExitOK, nil)", code, err)
+	}
+	wantLine := "--model " + shellQuotePOSIX(deep)
+	var launchLine string
+	for _, sent := range tm.SentKeys {
+		if strings.HasPrefix(sent, "agy ") || strings.Contains(sent, " agy ") {
+			launchLine = sent
+			break
+		}
+	}
+	if launchLine == "" {
+		t.Fatalf("no agy launch line reached the pane; SentKeys=%v", tm.SentKeys)
+	}
+	if !strings.Contains(launchLine, wantLine) {
+		t.Errorf("launch line %q does not carry the resolved deep model (%q)", launchLine, wantLine)
+	}
+	if !strings.Contains(launchLine, "--dangerously-skip-permissions") {
+		t.Errorf("launch line %q lost the permission realization", launchLine)
+	}
+}

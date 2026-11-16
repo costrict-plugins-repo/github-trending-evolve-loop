@@ -1,0 +1,39 @@
+{
+  "name": "opportunity-map",
+  "catalog": "on-demand",
+  "archetype": "plan",
+  "agent": "evolve-opportunity-map",
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/scout-report.md"
+    ],
+    "signals": []
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/opportunity-map-report.md"
+    ],
+    "signals": [
+      "opportunity.count"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Desired Outcome",
+      "Opportunities",
+      "Candidate Solutions",
+      "Assumption Tests"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "product-discovery"
+      }
+    ]
+  },
+  "after": "triage",
+  "optional": true
+}

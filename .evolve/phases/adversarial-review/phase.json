@@ -1,0 +1,41 @@
+{
+  "name": "adversarial-review",
+  "archetype": "evaluate",
+  "agent": "evolve-adversarial-review",
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/build-report.md"
+    ],
+    "signals": [
+      "build.files_touched",
+      "build.severity_max"
+    ]
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/adversarial-review-report.md"
+    ],
+    "signals": [
+      "adversarial.severity_max",
+      "adversarial.exploit_count"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Threat Model",
+      "Findings",
+      "Verdict"
+    ],
+    "verdict_from_sentinel": "shadow"
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "build.files_touched",
+        "op": "gt",
+        "value": 0
+      }
+    ]
+  },
+  "after": "build"
+}

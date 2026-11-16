@@ -1,0 +1,97 @@
+package audit
+
+import (
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+)
+
+func TestClassify_DispositionEvidenceMixedTypeArrayFailsClosed(t *testing.T) {
+	t.Parallel()
+	ws, req := continuationFixture(t, 1398, 1403, oneDefect)
+	cite := evidenceFile(t, req.ProjectRoot, "go/internal/core/fleet.go")
+	writeJSON(t, filepath.Join(ws, dispositionFile), map[string]any{
+		"dispositions": []any{
+			map[string]any{"id": "d1", "status": "FIXED", "evidence": []any{cite, 42}},
+		},
+	})
+
+	verdict, diags, _ := hooks{}.Classify(narrativeReport("PASS"), req, core.BridgeResponse{})
+
+	if verdict == core.VerdictPASS {
+		t.Errorf("a mixed-type evidence array ([string, number]) must fail closed — admitting it would let a malformed claim close an inherited defect. diagnostics:\n%s", diagsText(diags))
+	}
+}
+
+func TestClassify_DispositionEvidenceNullOnFixedStillBlocks(t *testing.T) {
+	t.Parallel()
+	ws, req := continuationFixture(t, 1398, 1403, oneDefect)
+	writeJSON(t, filepath.Join(ws, dispositionFile), map[string]any{
+		"dispositions": []any{
+			map[string]any{"id": "d1", "status": "FIXED", "evidence": nil},
+		},
+	})
+
+	verdict, diags, _ := hooks{}.Classify(narrativeReport("PASS"), req, core.BridgeResponse{})
+
+	if verdict == core.VerdictPASS {
+		t.Errorf("`evidence: null` on a FIXED claim is an unevidenced closure and must block. diagnostics:\n%s", diagsText(diags))
+	}
+}
+
+func TestClassify_DispositionEvidenceWhitespaceOnlyStillBlocks(t *testing.T) {
+	t.Parallel()
+	ws, req := continuationFixture(t, 1398, 1403, oneDefect)
+	writeJSON(t, filepath.Join(ws, dispositionFile), map[string]any{
+		"dispositions": []any{
+			map[string]any{"id": "d1", "status": "FIXED", "evidence": "   \t  "},
+		},
+	})
+
+	verdict, diags, _ := hooks{}.Classify(narrativeReport("PASS"), req, core.BridgeResponse{})
+
+	if verdict == core.VerdictPASS {
+		t.Errorf("whitespace-only evidence must be treated as no evidence — trimming must not admit it. diagnostics:\n%s", diagsText(diags))
+	}
+}
+
+func TestClassify_DispositionEvidenceSemicolonJoinedBothResolvePasses(t *testing.T) {
+	t.Parallel()
+	ws, req := continuationFixture(t, 1398, 1403, oneDefect)
+	cite1 := evidenceFile(t, req.ProjectRoot, "go/internal/core/fleet.go")
+	cite2 := evidenceFile(t, req.ProjectRoot, "go/internal/core/cyclerun.go")
+	writeJSON(t, filepath.Join(ws, dispositionFile), map[string]any{
+		"dispositions": []any{
+			map[string]any{"id": "d1", "status": "FIXED", "evidence": cite1 + "; " + cite2},
+		},
+	})
+
+	verdict, diags, _ := hooks{}.Classify(narrativeReport("PASS"), req, core.BridgeResponse{})
+
+	if verdict != core.VerdictPASS {
+		t.Errorf("a semicolon-joined pair of resolvable citations must be honoured exactly like the array form; got %q. diagnostics:\n%s", verdict, diagsText(diags))
+	}
+}
+
+func TestClassify_DispositionEvidenceSemicolonJoinedOneMissingBlocks(t *testing.T) {
+	t.Parallel()
+	ws, req := continuationFixture(t, 1398, 1403, oneDefect)
+	cite := evidenceFile(t, req.ProjectRoot, "go/internal/core/fleet.go")
+	writeJSON(t, filepath.Join(ws, dispositionFile), map[string]any{
+		"dispositions": []any{
+			map[string]any{"id": "d1", "status": "FIXED", "evidence": cite + "; go/missing/phantom.go:9"},
+		},
+	})
+
+	verdict, diags, _ := hooks{}.Classify(narrativeReport("PASS"), req, core.BridgeResponse{})
+	text := diagsText(diags)
+
+	if verdict == core.VerdictPASS {
+		t.Errorf("one unresolvable half of a semicolon-joined citation must block the claim (AND-semantics). diagnostics:\n%s", text)
+	}
+	if strings.Contains(text, evidenceUnparseableMarker) {
+		t.Errorf("the block must come from resolution, not parsing. diagnostics:\n%s", text)
+	}
+}

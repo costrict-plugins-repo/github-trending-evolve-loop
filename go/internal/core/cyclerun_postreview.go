@@ -1,0 +1,96 @@
+package core
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/explanationdocs"
+)
+
+var postReviewExecutable = os.Executable
+
+func (cr *cycleRun) applyPostReviewGuards(next Phase, dr *dispatchResult) (loopAction, error) {
+	if cr.o.explanationRefreshEligible(cr.cs, next) {
+		requiresBuild, err := explanationdocs.RefreshResult(cr.ctx, explanationBinding(cr.req.ProjectRoot, cr.cs))
+		reentry, abortErr := cr.o.routeAfterExplanationRefresh(&cr.cs, next, requiresBuild, err)
+		if abortErr != nil {
+			phaseErr := fmt.Errorf("refresh Build explanation after %s: %w", next, abortErr)
+			cr.o.recordPhaseOutcome(&cr.result, &cr.phaseTimings, cr.cs.WorkspacePath, phaseOutcomeFrom(next, dr.resp, dr.attemptCount, phaseErr.Error(), cr.cs.PhaseStartedAt))
+			cr.recordFailureLearning(next, phaseErr, 1)
+			return loopAbort, phaseErr
+		}
+		if reentry != "" {
+			cr.scheduledNext = reentry
+		}
+	}
+
+	if cr.o.latchShip(cr.req.ProjectRoot, &cr.cs, next, dr.resp.Verdict) {
+		cr.preserveWorktree = false
+	}
+
+	if dr.treeGuard != nil {
+		res := dr.treeGuard.Check(cr.ctx, cr.req.ProjectRoot, dr.beforeDirty)
+		if res.SnapshotMissed {
+			return cr.abortUncheckedPhase(next, dr)
+		} else if !res.OK() {
+			var relBin string
+			if execPath, err := postReviewExecutable(); err == nil {
+				if rel, err := filepath.Rel(cr.req.ProjectRoot, execPath); err == nil && !strings.HasPrefix(rel, "..") {
+					relBin = filepath.ToSlash(rel)
+				}
+			}
+
+			_ = discardMainLeak(cr.ctx, cr.req.ProjectRoot, "go/evolve")
+			if relBin != "" && relBin != "go/evolve" {
+				if isGitignored(cr.ctx, cr.req.ProjectRoot, relBin) {
+					fmt.Fprintf(os.Stderr, "[orchestrator] WARN: relBin path %q is gitignored; skipping discardMainLeak to prevent checkout error\n", relBin)
+				} else {
+					_ = discardMainLeak(cr.ctx, cr.req.ProjectRoot, relBin)
+				}
+			}
+
+			res2 := dr.treeGuard.Check(cr.ctx, cr.req.ProjectRoot, dr.beforeDirty)
+			if res2.SnapshotMissed {
+				return cr.abortUncheckedPhase(next, dr)
+			}
+			if res2.OK() {
+				fmt.Fprintf(os.Stderr, "[orchestrator] WARN tree-diff: discarded binary rebuild churn in phase %s; continuing\n", next)
+			} else {
+				leaked := res2.Leaked
+				realLeaks, waived := filterRealLeaks(leaked, cr.leakExemptions(), os.Stderr)
+				if len(realLeaks) == 0 {
+					if waived > 0 {
+						fmt.Fprintf(os.Stderr, "[orchestrator] WARN tree-diff: phase %s continued only because %d leaked path(s) were console-leased (ADR-0080 S4) — not a clean phase\n", next, waived)
+					} else {
+						fmt.Fprintf(os.Stderr, "[orchestrator] WARN tree-diff: phase %s wrote only legitimate main-tree paths (.evolve/ workspace); continuing\n", next)
+					}
+					leaked = nil
+				} else {
+					leaked = realLeaks
+				}
+				if len(leaked) > 0 {
+					phaseErr := fmt.Errorf("tree-diff guard: phase %q wrote to the main tree outside its worktree %q — leaked paths: %v",
+						string(next), dr.phaseWorktree, leaked)
+					cr.o.recordPhaseOutcome(&cr.result, &cr.phaseTimings, cr.cs.WorkspacePath, phaseOutcomeFrom(next, dr.resp, dr.attemptCount, phaseErr.Error(), cr.cs.PhaseStartedAt))
+					cr.recordFailureLearning(next, phaseErr, 1)
+					evolveBinPath := filepath.Join(cr.req.ProjectRoot, "go/bin/evolve")
+					if _, err := os.Stat(evolveBinPath); os.IsNotExist(err) {
+						fmt.Fprintf(os.Stderr, "[orchestrator] ABNORMAL: go/bin/evolve absent after cycle abort — trust-kernel guards degraded\n")
+					}
+					return loopAbort, phaseErr
+				}
+			}
+		}
+	}
+
+	return loopNext, nil
+}
+
+func (cr *cycleRun) abortUncheckedPhase(next Phase, dr *dispatchResult) (loopAction, error) {
+	phaseErr := fmt.Errorf("tree-diff guard: the post-phase main-tree snapshot for %s failed after %d attempts, so the phase's writes cannot be checked", next, snapshotAttempts)
+	cr.o.recordPhaseOutcome(&cr.result, &cr.phaseTimings, cr.cs.WorkspacePath, phaseOutcomeFrom(next, dr.resp, dr.attemptCount, phaseErr.Error(), cr.cs.PhaseStartedAt))
+	cr.recordFailureLearning(next, phaseErr, 1)
+	return loopAbort, phaseErr
+}

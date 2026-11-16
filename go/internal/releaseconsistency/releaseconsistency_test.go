@@ -1,0 +1,297 @@
+package releaseconsistency
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/test/fixtures"
+)
+
+func makeRepo(t *testing.T, version string) string {
+	t.Helper()
+	mm := majorMinor(version)
+	return fixtures.NewWorkspace(t).WithFiles(map[string]string{
+		".claude-plugin/plugin.json":      fmt.Sprintf(`{"name":"evo","version":"%s"}`, version),
+		".claude-plugin/marketplace.json": fmt.Sprintf(`{"plugins":[{"name":"evo","version":"%s"}]}`, version),
+		"skills/loop/SKILL.md":            fmt.Sprintf("---\nname: x\n---\n\n# Evolve Loop v%s\n\nbody\n", mm),
+		"README.md":                       fmt.Sprintf("# Evolve Loop\n\n**Current (v%s)** description\n\n| v%s | 2026 |\n", mm, mm),
+		"CHANGELOG.md":                    fmt.Sprintf("# Changelog\n\n## [%s] - 2026-05-24\n\nEntries.\n", version),
+	}).Build().Root
+}
+
+func TestCheck_HappyPath(t *testing.T) {
+	d := makeRepo(t, "11.8.2")
+	var buf bytes.Buffer
+	res, err := Run(Options{ProjectRoot: d, Target: "11.8.2", Stderr: &buf})
+	if err != nil {
+		t.Fatalf("err = %v\nlog=%s", err, buf.String())
+	}
+	if res.Errors != 0 {
+		t.Errorf("Errors = %d, want 0", res.Errors)
+	}
+	for _, c := range res.Checks {
+		if c.Status != "OK" {
+			t.Errorf("check %s: status=%s, want OK", c.File, c.Status)
+		}
+	}
+}
+
+func TestCheck_MissingPluginJSON(t *testing.T) {
+	d := t.TempDir()
+	_, err := Run(Options{ProjectRoot: d, Target: "1.0.0"})
+	if !errors.Is(err, ErrInconsistent) {
+		t.Fatalf("err = %v, want ErrInconsistent", err)
+	}
+}
+
+func TestCheck_PluginJSONMismatch(t *testing.T) {
+	d := makeRepo(t, "11.8.1")
+	var buf bytes.Buffer
+	_, err := Run(Options{ProjectRoot: d, Target: "11.8.2", Stderr: &buf})
+	if !errors.Is(err, ErrInconsistent) {
+		t.Fatalf("err = %v, want ErrInconsistent", err)
+	}
+	if !strings.Contains(buf.String(), "MISMATCH") {
+		t.Errorf("log missing MISMATCH: %s", buf.String())
+	}
+}
+
+func TestCheck_CodexMirrorMismatch(t *testing.T) {
+	d := makeRepo(t, "21.4.2")
+	codexDir := filepath.Join(d, ".codex-plugin")
+	if err := os.MkdirAll(codexDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(codexDir, "plugin.json"), []byte(`{"name":"evo","version":"21.4.1"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	_, err := Run(Options{ProjectRoot: d, Target: "21.4.2", Stderr: &buf})
+	if !errors.Is(err, ErrInconsistent) {
+		t.Fatalf("stale Codex mirror must fail consistency, err = %v\nlog=%s", err, buf.String())
+	}
+	if !strings.Contains(buf.String(), ".codex-plugin/plugin.json") {
+		t.Errorf("log should flag the codex mismatch: %s", buf.String())
+	}
+}
+
+func TestCheck_CodexMirrorAbsentTolerated(t *testing.T) {
+	d := makeRepo(t, "21.4.2")
+	var buf bytes.Buffer
+	res, err := Run(Options{ProjectRoot: d, Target: "21.4.2", Stderr: &buf})
+	if err != nil {
+		t.Fatalf("absent Codex mirror must be tolerated, err = %v\nlog=%s", err, buf.String())
+	}
+	if res.Errors != 0 {
+		t.Errorf("Errors = %d, want 0 (absent codex is skipped)", res.Errors)
+	}
+}
+
+func TestCheck_NoChangelogEntry(t *testing.T) {
+	d := makeRepo(t, "11.8.2")
+	fixtures.MustWrite(t, filepath.Join(d, "CHANGELOG.md"), "# Changelog\n\nno entries\n")
+	_, err := Run(Options{ProjectRoot: d, Target: "11.8.2"})
+	if !errors.Is(err, ErrInconsistent) {
+		t.Fatalf("err = %v, want ErrInconsistent", err)
+	}
+}
+
+func TestCheck_SkillHeadingMismatch(t *testing.T) {
+	d := makeRepo(t, "11.8.2")
+	fixtures.MustWrite(t, filepath.Join(d, "skills/loop/SKILL.md"), "# Evolve Loop v10.0\n\nstale\n")
+	_, err := Run(Options{ProjectRoot: d, Target: "11.8.2"})
+	if !errors.Is(err, ErrInconsistent) {
+		t.Fatalf("err = %v, want ErrInconsistent", err)
+	}
+}
+
+func TestCheck_DerivesTargetFromPluginJSON(t *testing.T) {
+	d := makeRepo(t, "11.8.2")
+	var buf bytes.Buffer
+	res, err := Run(Options{ProjectRoot: d, Stderr: &buf})
+	if err != nil {
+		t.Fatalf("err = %v\nlog=%s", err, buf.String())
+	}
+	if res.Target != "11.8.2" {
+		t.Errorf("Target = %q, want '11.8.2'", res.Target)
+	}
+}
+
+func TestCheck_ReadmeCurrentMismatch(t *testing.T) {
+	d := makeRepo(t, "11.8.2")
+	fixtures.MustWrite(t, filepath.Join(d, "README.md"), "# Evolve Loop\n\n**Current (v9.0)** stale\n")
+	_, err := Run(Options{ProjectRoot: d, Target: "11.8.2"})
+	if !errors.Is(err, ErrInconsistent) {
+		t.Fatalf("err = %v, want ErrInconsistent", err)
+	}
+}
+
+func TestCheck_EmptyProjectRoot(t *testing.T) {
+	_, err := Run(Options{Target: "1.0.0"})
+	if err == nil {
+		t.Error("want err for empty ProjectRoot")
+	}
+}
+
+func TestExtractJSONVersion(t *testing.T) {
+	d := t.TempDir()
+	p := fixtures.MustWrite(t, filepath.Join(d, "v.json"), `{"version":"1.2.3"}`)
+	v, err := extractJSONVersion(p)
+	if err != nil || v != "1.2.3" {
+		t.Errorf("extractJSONVersion = (%q, %v), want (1.2.3, nil)", v, err)
+	}
+	bad := fixtures.MustWrite(t, filepath.Join(d, "no-version.json"), `{"name":"foo"}`)
+	if _, err := extractJSONVersion(bad); err == nil {
+		t.Error("want err for no version field")
+	}
+}
+
+func TestCheck_MarkerFileMissing(t *testing.T) {
+	d := makeRepo(t, "11.8.2")
+	if err := os.Remove(filepath.Join(d, ".claude-plugin/marketplace.json")); err != nil {
+		t.Fatalf("rm: %v", err)
+	}
+	var buf bytes.Buffer
+	res, err := Run(Options{ProjectRoot: d, Target: "11.8.2", Stderr: &buf})
+	if !errors.Is(err, ErrInconsistent) {
+		t.Fatalf("err = %v, want ErrInconsistent", err)
+	}
+	if res.Errors != 1 {
+		t.Errorf("Errors = %d, want 1", res.Errors)
+	}
+	var mk Check
+	for _, c := range res.Checks {
+		if c.File == ".claude-plugin/marketplace.json" {
+			mk = c
+		}
+	}
+	if mk.Status != "MISSING" {
+		t.Errorf("marketplace.json status = %q, want MISSING", mk.Status)
+	}
+	if !strings.Contains(buf.String(), "MISSING  .claude-plugin/marketplace.json") {
+		t.Errorf("log missing MISSING line: %s", buf.String())
+	}
+}
+
+func TestCheck_MarkerNoVersionField(t *testing.T) {
+	d := makeRepo(t, "11.8.2")
+	fixtures.MustWrite(t, filepath.Join(d, ".claude-plugin/marketplace.json"), `{"plugins":[{"name":"evo"}]}`)
+	var buf bytes.Buffer
+	res, err := Run(Options{ProjectRoot: d, Target: "11.8.2", Stderr: &buf})
+	if !errors.Is(err, ErrInconsistent) {
+		t.Fatalf("err = %v, want ErrInconsistent", err)
+	}
+	var mk Check
+	for _, c := range res.Checks {
+		if c.File == ".claude-plugin/marketplace.json" {
+			mk = c
+		}
+	}
+	if mk.Status != "NO_MATCH" {
+		t.Errorf("marketplace.json status = %q, want NO_MATCH", mk.Status)
+	}
+	if !strings.Contains(buf.String(), "NO MATCH .claude-plugin/marketplace.json") {
+		t.Errorf("log missing NO MATCH line: %s", buf.String())
+	}
+}
+
+func TestCheck_SkillFileMissing(t *testing.T) {
+	d := makeRepo(t, "11.8.2")
+	if err := os.Remove(filepath.Join(d, "skills/loop/SKILL.md")); err != nil {
+		t.Fatalf("rm: %v", err)
+	}
+	res, err := Run(Options{ProjectRoot: d, Target: "11.8.2"})
+	if !errors.Is(err, ErrInconsistent) {
+		t.Fatalf("err = %v, want ErrInconsistent", err)
+	}
+	if statusOf(res, "skills/loop/SKILL.md") != "MISSING" {
+		t.Errorf("SKILL.md status = %q, want MISSING", statusOf(res, "skills/loop/SKILL.md"))
+	}
+}
+
+func TestCheck_SkillHeadingAbsent(t *testing.T) {
+	d := makeRepo(t, "11.8.2")
+	fixtures.MustWrite(t, filepath.Join(d, "skills/loop/SKILL.md"), "---\nname: x\n---\n\n# Some Other Title\n\nbody\n")
+	res, err := Run(Options{ProjectRoot: d, Target: "11.8.2"})
+	if !errors.Is(err, ErrInconsistent) {
+		t.Fatalf("err = %v, want ErrInconsistent", err)
+	}
+	if statusOf(res, "skills/loop/SKILL.md") != "NO_MATCH" {
+		t.Errorf("SKILL.md status = %q, want NO_MATCH", statusOf(res, "skills/loop/SKILL.md"))
+	}
+}
+
+func TestCheck_ReadmeFileMissing(t *testing.T) {
+	d := makeRepo(t, "11.8.2")
+	if err := os.Remove(filepath.Join(d, "README.md")); err != nil {
+		t.Fatalf("rm: %v", err)
+	}
+	res, err := Run(Options{ProjectRoot: d, Target: "11.8.2"})
+	if !errors.Is(err, ErrInconsistent) {
+		t.Fatalf("err = %v, want ErrInconsistent", err)
+	}
+	if statusOf(res, "README.md") != "MISSING" {
+		t.Errorf("README.md current-version status = %q, want MISSING", statusOf(res, "README.md"))
+	}
+}
+
+func TestCheck_ReadmeCurrentCellAbsent(t *testing.T) {
+	d := makeRepo(t, "11.8.2")
+	fixtures.MustWrite(t, filepath.Join(d, "README.md"), "# Evolve Loop\n\nno current cell here\n\n| v11.8 | 2026 |\n")
+	res, err := Run(Options{ProjectRoot: d, Target: "11.8.2"})
+	if !errors.Is(err, ErrInconsistent) {
+		t.Fatalf("err = %v, want ErrInconsistent", err)
+	}
+	var current Check
+	for _, c := range res.Checks {
+		if c.File == "README.md" {
+			current = c
+			break
+		}
+	}
+	if current.Status != "NO_MATCH" {
+		t.Errorf("README current-version status = %q, want NO_MATCH", current.Status)
+	}
+}
+
+func TestCheck_ChangelogFileMissing(t *testing.T) {
+	d := makeRepo(t, "11.8.2")
+	if err := os.Remove(filepath.Join(d, "CHANGELOG.md")); err != nil {
+		t.Fatalf("rm: %v", err)
+	}
+	res, err := Run(Options{ProjectRoot: d, Target: "11.8.2"})
+	if !errors.Is(err, ErrInconsistent) {
+		t.Fatalf("err = %v, want ErrInconsistent", err)
+	}
+	if statusOf(res, "CHANGELOG.md") != "MISSING" {
+		t.Errorf("CHANGELOG.md status = %q, want MISSING", statusOf(res, "CHANGELOG.md"))
+	}
+}
+
+func statusOf(res Result, file string) string {
+	for _, c := range res.Checks {
+		if c.File == file {
+			return c.Status
+		}
+	}
+	return "<absent>"
+}
+
+func TestMajorMinor(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"1.2.3", "1.2"},
+		{"11.8.2", "11.8"},
+		{"1.2", "1.2"},
+		{"1", "1"},
+	}
+	for _, tc := range cases {
+		if got := majorMinor(tc.in); got != tc.want {
+			t.Errorf("majorMinor(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}

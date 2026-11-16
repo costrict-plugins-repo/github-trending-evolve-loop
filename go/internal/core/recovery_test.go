@@ -1,0 +1,31 @@
+package core
+
+import (
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/kerneltest"
+)
+
+func TestRecoveryTarget_ConfigDriven(t *testing.T) {
+	t.Parallel()
+	ref := kerneltest.Load(t)
+	o := NewOrchestrator(nil, nil, nil, WithCatalog(ref.Catalog))
+
+	if got := o.recoveryTarget(PhaseRetro, VerdictPASS, PhaseEnd); got != PhaseShip {
+		t.Errorf("retro PASS recovery = %q, want ship (from config)", got)
+	}
+	if got := o.recoveryTarget(PhaseDebugger, "RESHIP", PhaseEnd); got != PhaseShip {
+		t.Errorf("debugger RESHIP recovery = %q, want ship (seam config)", got)
+	}
+	if got := o.recoveryTarget(PhaseRetro, "no-such-recovery-key", PhaseTDD); got != PhaseTDD {
+		t.Errorf("unmapped recovery key must fall back to the literal; got %q", got)
+	}
+}
+
+func TestRecoveryTarget_DegradesWithoutCatalog(t *testing.T) {
+	t.Parallel()
+	o := NewOrchestrator(nil, nil, nil)
+	if got := o.recoveryTarget(PhaseRetro, VerdictPASS, PhaseShip); got != PhaseShip {
+		t.Errorf("no-catalog recovery must use the literal fallback; got %q", got)
+	}
+}

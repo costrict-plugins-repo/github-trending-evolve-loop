@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "cli": "agy",
+  "binary": "agy",
+  "probe_unsandboxed_reason": "A version, update, model or doctor probe of agy reads its sign-in and writes its state and its own install under $HOME. The phase sandbox grants no write outside the cell, so the probe runs outside it.",
+  "env_passthrough": ["XDG_CONFIG_HOME", "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION", "GOOGLE_GENAI_USE_VERTEXAI", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "no_proxy", "all_proxy"],
+  "model_family": "gemini",
+  "collectors": {"tokens": "agy-conversation-v1"},
+  "capabilities": ["tools", "edit"],
+  "home_reads": ["~/.gemini"],
+  "context_window": 200000,
+  "binary_min_version": "1.0.0",
+  "auto_update_off_env": "AGY_CLI_DISABLE_AUTO_UPDATE",
+  "default_env": {"AGY_CLI_DISABLE_AUTO_UPDATE": "1"},
+  "transport": "headless",
+  "default_tier": "full",
+  "tier_dependencies": {
+    "full": ["agy"]
+  },
+  "prompt_marker": null,
+  "default_model": "gemini-3.5-flash",
+  "default_args": [],
+  "params": {
+    "model_tier": {
+      "channel": "noop"
+    }
+  },
+  "interactive_prompts": [
+    {
+      "name": "auth_recheck",
+      "regex": "Authentication required|Please log in|Sign in to (Antigravity|Google|Gemini)|Login expired",
+      "response_keys": null,
+      "tail_lines": 12,
+      "policy": "escalate",
+      "note": "Bridge cannot complete OAuth/Google login; escalate to operator"
+    },
+    {
+      "name": "rate_limit",
+      "regex": "rate.?limit|too many requests|429|RESOURCE_EXHAUSTED",
+      "response_keys": null,
+      "policy": "escalate",
+      "note": "Operator decides retry vs abandon"
+    },
+    {
+      "name": "quota_exhausted",
+      "regex": "quota.*exceed|daily limit|monthly limit|free.tier limit",
+      "response_keys": null,
+      "policy": "escalate",
+      "note": "Distinguishable from transient rate-limit; usually requires plan upgrade"
+    },
+    {
+      "name": "permission_prompt",
+      "regex": "Allow .*\\?|Grant permission|Approve action",
+      "response_keys": "y,Enter",
+      "policy": "auto_respond",
+      "note": "Belt-and-suspenders alongside --dangerously-skip-permissions; harmless if bypass already accepted it"
+    }
+  ],
+  "stub": false,
+  "model_tier_map": {
+    "fast": "gemini-3.5-flash",
+    "balanced": "gemini-3.5-flash",
+    "deep": "gemini-3.5-flash",
+    "top": "gemini-3.5-flash"
+  },
+  "note": "agy is Antigravity, Gemini-backed (NOT Anthropic). model_tier is channel=noop: agy 1.0.3 has NO -m/--model flag in ANY mode (verified live 2026-05-31: `agy -m X --print` → 'flags provided but not defined: -m'). The 2026-05 'correction' to channel=flag was wrong (it claimed `agy -m <model> -p` worked; it does not) and is the same root cause as the agy-tmux exit=80 incident — see docs/incidents/cycle-154-agy-tmux-m-flag-repl-boot-timeout.md. model_tier_map retained as documentation of the implicit default only. Cost-leak guards: GEMINI_API_KEY / GOOGLE_API_KEY."
+}

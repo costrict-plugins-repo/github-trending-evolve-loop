@@ -1,0 +1,205 @@
+package ship
+
+import (
+	"context"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/shiperr"
+)
+
+func newLaneRepo(t *testing.T) string {
+	t.Helper()
+	repo := makeRepo(t)
+	goDir := filepath.Join(repo, "go")
+	mustWrite(t, filepath.Join(goDir, "go.mod"), "module example.com/lane\n\ngo 1.24\n")
+	writeGreenGuardSuites(t, goDir)
+	runGit(t, repo, "add", "go")
+	runGit(t, repo, "commit", "-qm", "baseline: green guard suites")
+	return repo
+}
+
+func readScanLog(t *testing.T, workspace string) string {
+	t.Helper()
+	body, err := os.ReadFile(filepath.Join(workspace, scanLogName))
+	if err != nil {
+		t.Fatalf("scan log must be written on every gate run: %v", err)
+	}
+	return string(body)
+}
+
+func containsAny(haystack string, needles ...string) bool {
+	for _, n := range needles {
+		if strings.Contains(haystack, n) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRepoContractGate_NewlyAddedSkippedTestDoesNotBlockShip(t *testing.T) {
+	t.Parallel()
+	repo := newLaneRepo(t)
+	const path = "go/internal/reproduction/skip_test.go"
+	mustWrite(t, filepath.Join(repo, path),
+		"package reproduction\n\nimport \"testing\"\n\nfunc TestNewlyAddedSkipped(t *testing.T) { t.Skip(\"pending fix: tracked red-first reproducer\") }\n")
+	runGit(t, repo, "add", path)
+
+	ws := t.TempDir()
+	if err := runRepoContractGate(context.Background(), "enforce", repo, ws, io.Discard); err != nil {
+		t.Fatalf("a t.Skip-ped newly added reproducer must not block the ship, got %v", err)
+	}
+	if log := readScanLog(t, ws); strings.Contains(log, "--- FAIL: TestNewlyAddedSkipped") {
+		t.Fatalf("a skipped reproducer must not be recorded as a failure, got:\n%s", log)
+	}
+}
+
+func TestRepoContractGate_NewlyAddedTaggedFailingTestIsNotSilentlyGreen(t *testing.T) {
+	t.Parallel()
+	repo := newLaneRepo(t)
+	pkgDir := filepath.Join(repo, "go", "internal", "reproduction")
+	mustWrite(t, filepath.Join(pkgDir, "green_test.go"),
+		"package reproduction\n\nimport \"testing\"\n\nfunc TestUntaggedGreen(t *testing.T) {}\n")
+	const failingTest = "TestNewlyAddedIntegrationRed"
+	mustWrite(t, filepath.Join(pkgDir, "integration_test.go"),
+		"//go:build integration\n\npackage reproduction\n\nimport \"testing\"\n\nfunc "+failingTest+"(t *testing.T) { t.Fatal(\"deliberate red behind a build tag\") }\n")
+	runGit(t, repo, "add", "go/internal/reproduction")
+
+	err := runRepoContractGate(context.Background(), "enforce", repo, t.TempDir(), io.Discard)
+	if err == nil {
+		t.Fatalf("a newly added FAILING test behind //go:build integration must block the ship; the untagged run reporting the package green is exactly incident 25040cea")
+	}
+	se, ok := shiperr.AsShipError(err)
+	if !ok || se.Code != shiperr.CodeRepoContractGate {
+		t.Fatalf("error = %v, want structured REPO_CONTRACT_GATE", err)
+	}
+	if !strings.Contains(err.Error(), failingTest) {
+		t.Fatalf("gate error must name the tag-guarded failing test %s, got %q", failingTest, err)
+	}
+}
+
+func TestRepoContractGate_NewlyAddedTagGuardedGreenPackageIsNotFalseRed(t *testing.T) {
+	t.Parallel()
+	repo := newLaneRepo(t)
+	const path = "go/acs/cycle9999/predicates_test.go"
+	mustWrite(t, filepath.Join(repo, path),
+		"//go:build acs\n\npackage cycle9999\n\nimport \"testing\"\n\nfunc TestC9999_001_Healthy(t *testing.T) {}\n")
+	runGit(t, repo, "add", path)
+
+	ws := t.TempDir()
+	if err := runRepoContractGate(context.Background(), "enforce", repo, ws, io.Discard); err != nil {
+		t.Fatalf("a tag-guarded added test package that is GREEN under its own tag must not red the gate (this shape is minted by every cycle, including this one), got %v", err)
+	}
+	log := readScanLog(t, ws)
+	if !strings.Contains(log, "acs/cycle9999") {
+		t.Fatalf("scan log must record how the tag-guarded candidate was handled (rerun under its tag, or an explicit exclusion) — silent omission is the false-green half of the same defect; got:\n%s", log)
+	}
+}
+
+func TestRepoContractGate_AddedTestDiscoveryFailureIsRecorded(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	goDir := filepath.Join(root, "go")
+	mustWrite(t, filepath.Join(goDir, "go.mod"), "module example.com/lane\n\ngo 1.24\n")
+	writeGreenGuardSuites(t, goDir)
+
+	ws := t.TempDir()
+	err := runRepoContractGate(context.Background(), "enforce", root, ws, io.Discard)
+	se, ok := shiperr.AsShipError(err)
+	if !ok || se.Code != shiperr.CodeRepoContractInfra {
+		t.Fatalf("an undiscoverable diff is the INFRA class, got %v", err)
+	}
+	log := readScanLog(t, ws)
+	if !strings.Contains(log, "added-test") {
+		t.Fatalf("scan log must name the added-test backstop when its discovery step fails, got:\n%s", log)
+	}
+	if !containsAny(log, "unavailable", "failed", "disabled", "skipped") {
+		t.Fatalf("scan log must state that the added-test backstop did NOT run (unavailable/failed/disabled), never leave the reader to assume it did; got:\n%s", log)
+	}
+}
+
+func TestRepoContractGate_RedMessagesDistinguishFixedPackFromAddedTests(t *testing.T) {
+	t.Run("fixed pack RED still names every guard suite", func(t *testing.T) {
+		swapRepoContractTest(t, redPack("internal/phasespec.TestCatalogParity"))
+		err := runRepoContractGate(context.Background(), "enforce", evolveLoopLane(t), t.TempDir(), io.Discard)
+		if err == nil {
+			t.Fatal("fixed-pack RED must fail the ship")
+		}
+		for _, suite := range []string{"phasespec", "profiles", "phasecoherence", "routingtest", "rawgitratchet", "sizeratchet", "testmainexit", "repocontract", "policy", "guards", "acssuite", "fleet"} {
+			if !strings.Contains(err.Error(), suite) {
+				t.Errorf("fixed-pack RED must keep naming the guard suite %q so the operator knows where to look, got %q", suite, err)
+			}
+		}
+	})
+
+	t.Run("added-test RED identifies itself as an added-test failure", func(t *testing.T) {
+		repo := newLaneRepo(t)
+		const path = "go/internal/reproduction/red_test.go"
+		const failingTest = "TestNewlyAddedRedNeedsAttribution"
+		mustWrite(t, filepath.Join(repo, path),
+			"package reproduction\n\nimport \"testing\"\n\nfunc "+failingTest+"(t *testing.T) { t.Fatal(\"deliberate red\") }\n")
+		runGit(t, repo, "add", path)
+
+		err := runRepoContractGate(context.Background(), "enforce", repo, t.TempDir(), io.Discard)
+		if err == nil {
+			t.Fatal("added-test RED must fail the ship")
+		}
+		if !containsAny(err.Error(), "added-test", "newly added") {
+			t.Errorf("added-test RED must say the NEWLY ADDED test is what went red, not report it as the fixed scanner pack, got %q", err)
+		}
+		if !strings.Contains(err.Error(), failingTest) {
+			t.Errorf("added-test RED must name %s, got %q", failingTest, err)
+		}
+	})
+}
+
+func TestRepoContractTestArgs_CarriesAnExplicitTimeout(t *testing.T) {
+	t.Parallel()
+	args := repoContractTestArgs([]string{"./internal/core"}, nil)
+
+	i := indexOfArg(args, "-timeout")
+	if i < 0 {
+		t.Fatalf("the gate must not leave `go test` on its 10m default — a slow-but-green pack "+
+			"times out under fleet load and the panic reads as a real contract RED. args=%v", args)
+	}
+	if i+1 >= len(args) || args[i+1] != repoContractTestTimeout {
+		t.Fatalf("-timeout must carry %q, got args=%v", repoContractTestTimeout, args)
+	}
+	if d, err := time.ParseDuration(repoContractTestTimeout); err != nil {
+		t.Fatalf("repoContractTestTimeout %q is not a duration go test accepts: %v", repoContractTestTimeout, err)
+	} else if d <= 10*time.Minute {
+		t.Fatalf("repoContractTestTimeout %v is no headroom over Go's 10m default — ./internal/core "+
+			"already measured 355.8s at ship, and the whole point is to clear it under load", d)
+	}
+	if p := indexOfArg(args, "./internal/core"); p >= 0 && p < i {
+		t.Fatalf("-timeout must come before the package operands, got args=%v", args)
+	}
+}
+
+func TestRepoContractTestArgs_KeepsTagsAndPackagesAfterTheTimeout(t *testing.T) {
+	t.Parallel()
+	args := repoContractTestArgs([]string{"./acs/cycle1679"}, []string{"acs"})
+
+	want := []string{"test", "-json", "-count=1", "-timeout", repoContractTestTimeout, "-tags", "acs", "./acs/cycle1679"}
+	if len(args) != len(want) {
+		t.Fatalf("argv shape changed: got %v, want %v", args, want)
+	}
+	for i := range want {
+		if args[i] != want[i] {
+			t.Fatalf("argv[%d] = %q, want %q (full: %v)", i, args[i], want[i], args)
+		}
+	}
+}
+
+func indexOfArg(args []string, want string) int {
+	for i, a := range args {
+		if a == want {
+			return i
+		}
+	}
+	return -1
+}

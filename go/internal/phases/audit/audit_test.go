@@ -1,0 +1,1017 @@
+package audit
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"testing/fstest"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/acssuite"
+	"github.com/mickeyyaya/evolve-loop/go/internal/config"
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+	"github.com/mickeyyaya/evolve-loop/go/internal/explanationdocs"
+	"github.com/mickeyyaya/evolve-loop/go/internal/phasecontract"
+	"github.com/mickeyyaya/evolve-loop/go/internal/phaseio"
+	"github.com/mickeyyaya/evolve-loop/go/internal/phases/registry"
+	"github.com/mickeyyaya/evolve-loop/go/internal/phases/runner/runnertest"
+	"github.com/mickeyyaya/evolve-loop/go/internal/prompts"
+	"github.com/mickeyyaya/evolve-loop/go/test/fixtures"
+)
+
+const auditorExplanationExample = `## Explanation Documentation
+- Status: VERIFIED
+- Build status: required
+- Document: docs/explain/builds/cycle-42-run-42.md
+- Document SHA256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+- Evidence: docs/explain/builds/cycle-42-run-42.md:1 accurately explains the behavior implemented at config/app.yaml:1`
+
+func TestAuditorExplanationLiteralExampleMatchesProductionReader(t *testing.T) {
+	t.Parallel()
+	body, err := os.ReadFile(filepath.Join("..", "..", "..", "..", "agents", "evolve-auditor-reference.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := auditContractExample(t, string(body), "audit-explanation-review")
+	if got != auditorExplanationExample {
+		t.Fatalf("Auditor explanation example drifted\n--- got ---\n%s\n--- want ---\n%s", got, auditorExplanationExample)
+	}
+	req := core.PhaseRequest{
+		ExplanationDocumentationVersion: explanationdocs.CurrentContractVersion,
+		BuildExplanationState:           core.BuildExplanationAvailable,
+		BuildExplanation: &phaseio.ExplanationView{
+			Status: "required", DocumentPath: "docs/explain/builds/cycle-42-run-42.md",
+			DocumentSHA256: strings.Repeat("b", 64), MaterialPaths: []string{"config/app.yaml"},
+		},
+	}
+	if _, err := validateExplanationReview(got, req); err != nil {
+		t.Fatalf("documented Auditor example rejected by production reader: %v", err)
+	}
+}
+
+func auditContractExample(t *testing.T, body, name string) string {
+	t.Helper()
+	marker := "<!-- CONTRACT-EXAMPLE:" + name + " -->"
+	start := strings.Index(body, marker)
+	if start < 0 {
+		t.Fatalf("missing contract example marker %s", marker)
+	}
+	rest := body[start+len(marker):]
+	const fence = "```markdown\n"
+	open := strings.Index(rest, fence)
+	if open < 0 {
+		t.Fatalf("%s lacks a markdown fence", marker)
+	}
+	rest = rest[open+len(fence):]
+	close := strings.Index(rest, "\n```")
+	if close < 0 {
+		t.Fatalf("%s has no closing fence", marker)
+	}
+	return rest[:close]
+}
+
+func TestExtractHonorsPhaseContract(t *testing.T) {
+	t.Parallel()
+	canonical := phasecontract.Audit.Sections[0].Canonical
+	got, found := extractAuditVerdict(canonical+": PASS\n", config.StageOff)
+	if !found || got != core.VerdictPASS {
+		t.Fatalf("extract under contract canonical %q = (%q,%v), want (PASS,true)", canonical, got, found)
+	}
+}
+
+func TestExtractPrefersSentinel(t *testing.T) {
+	t.Parallel()
+	body := "## Verdict\n**PASS**\n" + phasecontract.RenderVerdictSentinel("audit", "FAIL") + "\n"
+	got, found := extractAuditVerdict(body, config.StageOff)
+	if !found || got != core.VerdictFAIL {
+		t.Fatalf("sentinel-first: got (%q,%v), want (FAIL,true)", got, found)
+	}
+	got, found = extractAuditVerdict("## Verdict\n**WARN**\n", config.StageOff)
+	if !found || got != core.VerdictWARN {
+		t.Fatalf("regex fallback: got (%q,%v), want (WARN,true)", got, found)
+	}
+}
+
+type fakeBridge struct {
+	resp          core.BridgeResponse
+	err           error
+	writeArtifact string
+	gotReq        core.BridgeRequest
+}
+
+func (f *fakeBridge) Launch(ctx context.Context, req core.BridgeRequest) (core.BridgeResponse, error) {
+	f.gotReq = req
+	if f.writeArtifact != "" && req.ArtifactPath != "" {
+		_ = os.MkdirAll(filepath.Dir(req.ArtifactPath), 0o755)
+		_ = os.WriteFile(req.ArtifactPath, []byte(f.writeArtifact), 0o644)
+		f.resp.Stdout = f.writeArtifact
+	}
+	return f.resp, f.err
+}
+
+func (f *fakeBridge) Probe(ctx context.Context) (core.BridgeProbe, error) {
+	return core.BridgeProbe{}, nil
+}
+
+func fakePromptsFS(body string) *prompts.Loader {
+	return prompts.NewFromFS(fstest.MapFS{
+		"agents/evolve-auditor.md": &fstest.MapFile{
+			Data: []byte("---\nname: evolve-auditor\n---\n" + body),
+		},
+	})
+}
+
+func writeACSVerdict(t *testing.T, ws string, redCount int) {
+	t.Helper()
+	v := map[string]any{
+		"cycle":      42,
+		"red_count":  redCount,
+		"total":      10,
+		"predicates": []any{},
+	}
+	b, _ := json.Marshal(v)
+	if err := os.WriteFile(filepath.Join(ws, "acs-verdict.json"), b, 0o644); err != nil {
+		t.Fatalf("write verdict: %v", err)
+	}
+}
+
+func activeMissingExplanationRequest(t *testing.T) core.PhaseRequest {
+	t.Helper()
+	root := t.TempDir()
+	workspace := filepath.Join(root, ".evolve", "runs", "cycle-42")
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binding := explanationdocs.CycleBinding{
+		ProjectRoot: root, Worktree: t.TempDir(), Workspace: workspace,
+		BaseSHA: strings.Repeat("a", 40), Cycle: 42, RunID: "run-42",
+		ContractVersion: explanationdocs.CurrentContractVersion,
+	}
+	if err := explanationdocs.Activate(binding); err != nil {
+		t.Fatal(err)
+	}
+	if err := explanationdocs.SealBuild(binding); err != nil {
+		t.Fatal(err)
+	}
+	return core.PhaseRequest{
+		Cycle: 42, RunID: "run-42", ProjectRoot: root, Worktree: binding.Worktree,
+		Workspace: workspace, WorktreeBaseSHA: binding.BaseSHA,
+		ExplanationDocumentationVersion: explanationdocs.CurrentContractVersion,
+	}
+}
+
+func TestBindExplanationResult_MissingRequiredHandoffBecomesEGPSRed(t *testing.T) {
+	t.Parallel()
+	req := activeMissingExplanationRequest(t)
+	workspace := req.Workspace
+	writeACSVerdict(t, workspace, 0)
+	if err := verifyExplanationDocumentation(req); err == nil || !strings.Contains(err.Error(), "build-explanation.json") {
+		t.Fatalf("missing explanation verification error=%v", err)
+	}
+
+	h := hooks{explanationCheck: verifyExplanationDocumentation}
+	got, _, _ := h.Classify("## Verdict\n**PASS**\n", req, core.BridgeResponse{})
+	if got != core.VerdictFAIL {
+		t.Fatalf("deterministic explanation gate must override narrative PASS, got %s", got)
+	}
+	body, err := os.ReadFile(filepath.Join(workspace, "acs-verdict.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var verdict acssuite.Verdict
+	if err := json.Unmarshal(body, &verdict); err != nil {
+		t.Fatal(err)
+	}
+	if verdict.RedCount != 0 || len(verdict.Results) != 0 {
+		t.Fatalf("native host check was mislabeled as an ACS predicate: %+v", verdict)
+	}
+}
+
+func TestClassify_MissingExplanationReviewStillBlocksAndACompleteOnePasses(t *testing.T) {
+	t.Parallel()
+	workspace := t.TempDir()
+	writeACSVerdict(t, workspace, 0)
+	view := &core.PhaseRequest{
+		Workspace:                       workspace,
+		ExplanationDocumentationVersion: explanationdocs.CurrentContractVersion,
+		BuildExplanationState:           core.BuildExplanationAvailable,
+		BuildExplanation: &phaseio.ExplanationView{
+			Status: "required", Reason: "material behavior changed",
+			DocumentPath: "docs/explain/builds/cycle-42.md", DocumentSHA256: "document-sha",
+			MaterialPaths: []string{"go/internal/example/example.go"},
+		},
+	}
+	h := hooks{}
+	got, diags, _ := h.Classify("## Verdict\n**PASS**\n", *view, core.BridgeResponse{})
+	if got != core.VerdictFAIL || !hasError(diags) {
+		t.Fatalf("missing qualitative explanation review verdict=%s diags=%v, want FAIL: no review text is no reasoning", got, diags)
+	}
+	report := `## Explanation Documentation
+- Status: VERIFIED
+- Build status: required
+- Build reason: material behavior changed
+- Document: docs/explain/builds/cycle-42.md
+- Document SHA256: document-sha
+- Evidence: compared docs/explain/builds/cycle-42.md:1 with go/internal/example/example.go:12 in the base-bound diff
+
+## Verdict
+**PASS**
+`
+	if got, diags, _ := h.Classify(report, *view, core.BridgeResponse{}); got != core.VerdictPASS {
+		t.Fatalf("complete qualitative explanation review verdict=%s diags=%v", got, diags)
+	}
+}
+
+func needsCorrectionReview() (string, core.PhaseRequest) {
+	req := core.PhaseRequest{
+		ExplanationDocumentationVersion: explanationdocs.CurrentContractVersion,
+		BuildExplanationState:           core.BuildExplanationAvailable,
+		BuildExplanation: &phaseio.ExplanationView{
+			Status: "required", DocumentPath: "docs/explain/builds/cycle-42.md",
+			DocumentSHA256: "sha", MaterialPaths: []string{"go/app.go"},
+		},
+	}
+	return `## Explanation Documentation
+- Status: NEEDS_CORRECTION
+- Build status: required
+- Document: docs/explain/builds/cycle-42.md
+- Document SHA256: sha
+- Evidence: docs/explain/builds/cycle-42.md:1 misstates the branch behavior implemented at go/app.go:19
+`, req
+}
+
+func TestValidateExplanationReview_RejectsTokenEvidenceAndAcceptsNegativeJudgment(t *testing.T) {
+	t.Parallel()
+	req := core.PhaseRequest{
+		ExplanationDocumentationVersion: explanationdocs.CurrentContractVersion,
+		BuildExplanationState:           core.BuildExplanationAvailable,
+		BuildExplanation: &phaseio.ExplanationView{
+			Status: "required", DocumentPath: "docs/explain/builds/cycle-42.md",
+			DocumentSHA256: "sha", MaterialPaths: []string{"go/app.go"},
+		},
+	}
+	weak := `## Explanation Documentation
+- Status: VERIFIED
+- Build status: required
+- Document: docs/explain/builds/cycle-42.md
+- Document SHA256: sha
+- Evidence: x
+`
+	if _, err := validateExplanationReview(weak, req); err == nil || !strings.Contains(err.Error(), "concrete") {
+		t.Fatalf("token evidence was accepted — the reasoning floor is the one rule left (ADR-0102): %v", err)
+	}
+	negative, req := needsCorrectionReview()
+	advisories, err := validateExplanationReview(negative, req)
+	if err != nil || !containsAdvisory(advisories, "NEEDS_CORRECTION") || containsAdvisory(advisories, "Status must") {
+		t.Fatalf("the reviewer's negative judgment is an advisory, never a block (ADR-0102): advisories=%v err=%v", advisories, err)
+	}
+}
+
+func TestValidateExplanationReview_PathOnlyEvidenceIsAdvisory(t *testing.T) {
+	t.Parallel()
+	req := core.PhaseRequest{
+		ExplanationDocumentationVersion: explanationdocs.CurrentContractVersion,
+		BuildExplanationState:           core.BuildExplanationAvailable,
+		BuildExplanation: &phaseio.ExplanationView{
+			Status: "required", DocumentPath: "docs/explain/builds/cycle-42.md",
+			DocumentSHA256: "sha", MaterialPaths: []string{"go/app.go"},
+		},
+	}
+	report := `## Explanation Documentation
+- Status: VERIFIED
+- Build status: required
+- Document: docs/explain/builds/cycle-42.md
+- Document SHA256: sha
+- Evidence: reviewed docs/explain/builds/cycle-42.md and go/app.go against the implementation
+`
+	advisories, err := validateExplanationReview(report, req)
+	if err != nil || !containsAdvisory(advisories, "path:line") {
+		t.Fatalf("path-only evidence is an advisory, never a block (ADR-0102): advisories=%v err=%v", advisories, err)
+	}
+}
+
+func TestValidateExplanationReview_NotApplicableDocumentClaimsAreAdvisory(t *testing.T) {
+	t.Parallel()
+	req := core.PhaseRequest{
+		ExplanationDocumentationVersion: explanationdocs.CurrentContractVersion,
+		BuildExplanationState:           core.BuildExplanationAvailable,
+		BuildExplanation:                &phaseio.ExplanationView{Status: "not_applicable", Reason: "tests only"},
+	}
+	report := `## Explanation Documentation
+- Status: VERIFIED
+- Build status: not_applicable
+- Document: docs/explain/builds/forged.md
+- Document SHA256: forged
+- Evidence: verified the base-bound diff contains no material changes
+`
+	advisories, err := validateExplanationReview(report, req)
+	if err != nil || !containsAdvisory(advisories, "must omit") {
+		t.Fatalf("forged document fields on an N/A review are an advisory (ADR-0102): advisories=%v err=%v", advisories, err)
+	}
+}
+
+func TestValidateExplanationReview_InvalidPostBuildStateRequiresFail(t *testing.T) {
+	t.Parallel()
+	req := core.PhaseRequest{
+		ExplanationDocumentationVersion: explanationdocs.CurrentContractVersion,
+		BuildExplanationState:           core.BuildExplanationInvalid,
+	}
+	report := `## Explanation Documentation
+- Status: VERIFIED
+- Evidence: the host snapshot is missing
+`
+	if _, err := validateExplanationReview(report, req); err == nil || !strings.Contains(err.Error(), "Status: FAIL") {
+		t.Fatalf("a missing delivery reviewed as anything but FAIL still blocks (delivery is the must-have): %v", err)
+	}
+}
+
+func writeACSVerdictSkip(t *testing.T, ws string, redCount, skipCount int) {
+	t.Helper()
+	verdict := "PASS"
+	if redCount > 0 {
+		verdict = "FAIL"
+	}
+	v := map[string]any{
+		"cycle":      42,
+		"red_count":  redCount,
+		"skip_count": skipCount,
+		"verdict":    verdict,
+		"predicate_suite": map[string]any{
+			"total":         redCount + skipCount,
+			"skipped_count": skipCount,
+		},
+		"results": []any{
+			map[string]any{"ac_id": "cycle-42/001", "result": "skip", "exit_code": 77},
+		},
+	}
+	b, _ := json.Marshal(v)
+	if err := os.WriteFile(filepath.Join(ws, "acs-verdict.json"), b, 0o644); err != nil {
+		t.Fatalf("write verdict: %v", err)
+	}
+}
+
+func TestRun_SkipCountWithRedZero_PASS(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	writeACSVerdictSkip(t, ws, 0, 4)
+	body := "# Audit Report\n\n## Verdict\n**PASS**\n"
+	fb := &fakeBridge{writeArtifact: body}
+	phase := New(Config{Bridge: fb, Prompts: fakePromptsFS("body")})
+	resp, _ := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle: 1, ProjectRoot: "/p", Workspace: ws,
+	})
+	if resp.Verdict != core.VerdictPASS {
+		t.Errorf("Verdict=%q, want PASS (red_count==0 with skip_count=4)", resp.Verdict)
+	}
+}
+
+func TestRun_RedCountWithSkipsPresent_FAIL(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	writeACSVerdictSkip(t, ws, 2, 3)
+	body := "# Audit Report\n\n## Verdict\n**PASS**\n"
+	fb := &fakeBridge{writeArtifact: body}
+	phase := New(Config{Bridge: fb, Prompts: fakePromptsFS("body")})
+	resp, _ := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle: 1, ProjectRoot: "/p", Workspace: ws,
+	})
+	if resp.Verdict != core.VerdictFAIL {
+		t.Errorf("Verdict=%q, want FAIL (red_count=2 even with skips)", resp.Verdict)
+	}
+}
+
+func TestRun_HappyPath_PASS(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	writeACSVerdict(t, ws, 0)
+	body := "# Audit Report\n\n## Verdict\n**PASS**\n\nNo defects found.\n"
+	fb := &fakeBridge{writeArtifact: body, resp: core.BridgeResponse{CostUSD: 0.30}}
+	clock := fixtures.FixedClock(time.Unix(1_700_000_000, 0), 60*time.Millisecond)
+	phase := New(Config{
+		Bridge:  fb,
+		Prompts: fakePromptsFS("# Auditor body"),
+		NowFn:   clock,
+	})
+
+	resp, err := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle: 42, ProjectRoot: "/tmp/proj", Workspace: ws,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if resp.Verdict != core.VerdictPASS {
+		t.Errorf("Verdict=%q, want PASS", resp.Verdict)
+	}
+	if resp.NextPhase != "ship" {
+		t.Errorf("NextPhase=%q, want ship", resp.NextPhase)
+	}
+	if resp.DurationMS != 60 {
+		t.Errorf("DurationMS=%d, want 60", resp.DurationMS)
+	}
+	wantArtifact := filepath.Join(ws, "audit-report.md")
+	if fb.gotReq.ArtifactPath != wantArtifact {
+		t.Errorf("ArtifactPath=%q", fb.gotReq.ArtifactPath)
+	}
+}
+
+func TestRun_AuditPASSButRedCountNonZero_FAIL(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	writeACSVerdict(t, ws, 3)
+	body := "# Audit Report\n\n## Verdict\n**PASS**\n"
+	fb := &fakeBridge{writeArtifact: body}
+	phase := New(Config{Bridge: fb, Prompts: fakePromptsFS("body")})
+	resp, _ := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle: 1, ProjectRoot: "/p", Workspace: ws,
+	})
+	if resp.Verdict != core.VerdictFAIL {
+		t.Errorf("Verdict=%q, want FAIL (EGPS red_count=3)", resp.Verdict)
+	}
+	gotEGPSDiag := false
+	for _, d := range resp.Diagnostics {
+		if strings.Contains(d.Message, "red_count") {
+			gotEGPSDiag = true
+		}
+	}
+	if !gotEGPSDiag {
+		t.Errorf("missing red_count diagnostic; got %+v", resp.Diagnostics)
+	}
+}
+
+func TestRun_AuditFAIL_FAIL(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	writeACSVerdict(t, ws, 0)
+	body := "# Audit Report\n\n## Verdict\n**FAIL**\n\nDefect: missing auth check.\n"
+	fb := &fakeBridge{writeArtifact: body}
+	phase := New(Config{Bridge: fb, Prompts: fakePromptsFS("body")})
+	resp, _ := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle: 1, ProjectRoot: "/p", Workspace: ws,
+	})
+	if resp.Verdict != core.VerdictFAIL {
+		t.Errorf("Verdict=%q, want FAIL (audit said FAIL)", resp.Verdict)
+	}
+}
+
+func TestRun_AuditWARN_WARN(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	writeACSVerdict(t, ws, 0)
+	body := "# Audit Report\n\n## Verdict\n**WARN**\n\nMinor cleanup recommended.\n"
+	fb := &fakeBridge{writeArtifact: body}
+	phase := New(Config{Bridge: fb, Prompts: fakePromptsFS("body")})
+	resp, _ := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle: 1, ProjectRoot: "/p", Workspace: ws,
+	})
+	if resp.Verdict != core.VerdictWARN {
+		t.Errorf("Verdict=%q, want WARN", resp.Verdict)
+	}
+}
+
+func TestRun_StrictAuditMode_WARNBecomesFAIL(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	writeACSVerdict(t, ws, 0)
+	proj := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(proj, ".evolve"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(proj, ".evolve", "policy.json"),
+		[]byte(`{"workflow":{"strict_audit":true}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	body := "# Audit Report\n\n## Verdict\n**WARN**\n"
+	fb := &fakeBridge{writeArtifact: body}
+	phase := New(Config{Bridge: fb, Prompts: fakePromptsFS("body")})
+	resp, _ := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle: 1, ProjectRoot: proj, Workspace: ws,
+	})
+	if resp.Verdict != core.VerdictFAIL {
+		t.Errorf("Verdict=%q, want FAIL (strict-audit promotes WARN→FAIL)", resp.Verdict)
+	}
+}
+
+func TestRun_NoVerdictHeading_FAIL(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	writeACSVerdict(t, ws, 0)
+	body := "# Audit Report\n\nSome prose without a verdict heading.\n"
+	fb := &fakeBridge{writeArtifact: body}
+	phase := New(Config{Bridge: fb, Prompts: fakePromptsFS("body")})
+	resp, _ := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle: 1, ProjectRoot: "/p", Workspace: ws,
+	})
+	if resp.Verdict != core.VerdictFAIL {
+		t.Errorf("Verdict=%q, want FAIL", resp.Verdict)
+	}
+}
+
+func TestRun_MissingACSVerdict_FAIL(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	body := "# Audit Report\n\n## Verdict\n**PASS**\n"
+	fb := &fakeBridge{writeArtifact: body}
+	phase := New(Config{Bridge: fb, Prompts: fakePromptsFS("body")})
+	resp, _ := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle: 1, ProjectRoot: "/p", Workspace: ws,
+	})
+	if resp.Verdict != core.VerdictFAIL {
+		t.Errorf("Verdict=%q, want FAIL (no ACS verdict file)", resp.Verdict)
+	}
+}
+
+func TestRun_ACSVerdictMalformed_FAIL(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	_ = os.WriteFile(filepath.Join(ws, "acs-verdict.json"), []byte("not json"), 0o644)
+	body := "# Audit Report\n\n## Verdict\n**PASS**\n"
+	fb := &fakeBridge{writeArtifact: body}
+	phase := New(Config{Bridge: fb, Prompts: fakePromptsFS("body")})
+	resp, _ := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle: 1, ProjectRoot: "/p", Workspace: ws,
+	})
+	if resp.Verdict != core.VerdictFAIL {
+		t.Errorf("Verdict=%q, want FAIL (ACS verdict unparseable)", resp.Verdict)
+	}
+}
+
+func TestRun_EmptyArtifact_FAIL(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	writeACSVerdict(t, ws, 0)
+	fb := &fakeBridge{writeArtifact: ""}
+	phase := New(Config{Bridge: fb, Prompts: fakePromptsFS("body"), SleepFn: runnertest.FreeSleep, ContractVerifier: runnertest.EmptyArtifactVerifier})
+	resp, _ := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle: 1, ProjectRoot: "/p", Workspace: ws,
+	})
+	if resp.Verdict != core.VerdictFAIL {
+		t.Errorf("Verdict=%q, want FAIL", resp.Verdict)
+	}
+}
+
+func TestRun_EmptyArtifact_AuditSettleLadderKeepsProductionBounds(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	writeACSVerdict(t, ws, 0)
+	var rec runnertest.SleepRecorder
+	phase := New(Config{Bridge: &fakeBridge{writeArtifact: ""}, Prompts: fakePromptsFS("body"), ContractVerifier: runnertest.EmptyArtifactVerifier, SleepFn: rec.Sleep})
+	resp, _ := phase.Run(context.Background(), core.PhaseRequest{Cycle: 1, ProjectRoot: "/p", Workspace: ws})
+	if resp.Verdict != core.VerdictFAIL {
+		t.Errorf("Verdict=%q, want FAIL", resp.Verdict)
+	}
+	rec.AssertProductionLadder(t)
+}
+
+func TestRun_BridgeError_FAIL(t *testing.T) {
+	t.Parallel()
+	bridgeErr := errors.New("bridge fail")
+	fb := &fakeBridge{err: bridgeErr}
+	phase := New(Config{Bridge: fb, Prompts: fakePromptsFS("body")})
+	resp, err := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle: 1, ProjectRoot: "/p", Workspace: t.TempDir(),
+	})
+	if !errors.Is(err, bridgeErr) {
+		t.Errorf("err=%v", err)
+	}
+	if resp.Verdict != core.VerdictFAIL {
+		t.Errorf("Verdict=%q, want FAIL", resp.Verdict)
+	}
+}
+
+func TestRun_MissingBridge_ReturnsError(t *testing.T) {
+	t.Parallel()
+	phase := New(Config{Prompts: fakePromptsFS("body")})
+	_, err := phase.Run(context.Background(), core.PhaseRequest{Cycle: 1})
+	if err == nil || !strings.Contains(err.Error(), "bridge required") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestRun_MissingPrompts_ReturnsError(t *testing.T) {
+	t.Parallel()
+	phase := New(Config{Bridge: &fakeBridge{}})
+	_, err := phase.Run(context.Background(), core.PhaseRequest{Cycle: 1})
+	if err == nil || !strings.Contains(err.Error(), "prompts loader required") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestRun_AgentLoadFails_ReturnsError(t *testing.T) {
+	t.Parallel()
+	phase := New(Config{Bridge: &fakeBridge{}, Prompts: prompts.NewFromFS(fstest.MapFS{})})
+	_, err := phase.Run(context.Background(), core.PhaseRequest{Cycle: 1})
+	if err == nil {
+		t.Fatal("err=nil")
+	}
+}
+
+func TestName(t *testing.T) {
+	t.Parallel()
+	p := New(Config{})
+	if p.Name() != "audit" {
+		t.Errorf("Name=%q, want audit", p.Name())
+	}
+}
+
+func TestRun_MissingACSVerdict_GeneratedThenPASS(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	body := "# Audit Report\n\n## Verdict\n**PASS**\n"
+	fb := &fakeBridge{writeArtifact: body}
+	genCalls := 0
+	phase := New(Config{
+		Bridge:  fb,
+		Prompts: fakePromptsFS("body"),
+		GenerateVerdict: func(req core.PhaseRequest) error {
+			genCalls++
+			writeACSVerdict(t, req.Workspace, 0)
+			return nil
+		},
+	})
+	resp, err := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle: 1, ProjectRoot: "/p", Workspace: ws,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if genCalls != 1 {
+		t.Errorf("GenerateVerdict called %d times, want 1 (file was absent)", genCalls)
+	}
+	if resp.Verdict != core.VerdictPASS {
+		t.Errorf("Verdict=%q, want PASS (verdict generated, red_count=0)", resp.Verdict)
+	}
+	if resp.NextPhase != "ship" {
+		t.Errorf("NextPhase=%q, want ship", resp.NextPhase)
+	}
+}
+
+func TestRun_ACSVerdictPresent_HostRegenerates(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	writeACSVerdict(t, ws, 0)
+	body := "# Audit Report\n\n## Verdict\n**PASS**\n"
+	fb := &fakeBridge{writeArtifact: body}
+	genCalls := 0
+	phase := New(Config{
+		Bridge:          fb,
+		Prompts:         fakePromptsFS("body"),
+		GenerateVerdict: func(req core.PhaseRequest) error { genCalls++; writeACSVerdict(t, req.Workspace, 0); return nil },
+	})
+	resp, _ := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle: 1, ProjectRoot: "/p", Workspace: ws,
+	})
+	if genCalls != 1 {
+		t.Errorf("GenerateVerdict called %d times, want 1 (candidate must not suppress execution)", genCalls)
+	}
+	if resp.Verdict != core.VerdictPASS {
+		t.Errorf("Verdict=%q, want PASS", resp.Verdict)
+	}
+}
+
+func TestRun_GeneratorWritesNothing_FAILFloorHolds(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	body := "# Audit Report\n\n## Verdict\n**PASS**\n"
+	fb := &fakeBridge{writeArtifact: body}
+	phase := New(Config{
+		Bridge:          fb,
+		Prompts:         fakePromptsFS("body"),
+		GenerateVerdict: func(core.PhaseRequest) error { return nil },
+	})
+	resp, _ := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle: 1, ProjectRoot: "/p", Workspace: ws,
+	})
+	if resp.Verdict != core.VerdictFAIL {
+		t.Errorf("Verdict=%q, want FAIL (no verdict produced → floor holds)", resp.Verdict)
+	}
+}
+
+func writeAuditProfile(t *testing.T, contents string) string {
+	t.Helper()
+	root := t.TempDir()
+	dir := filepath.Join(root, ".evolve", "profiles")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir profiles: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "auditor.json"), []byte(contents), 0o644); err != nil {
+		t.Fatalf("write profile: %v", err)
+	}
+	return root
+}
+
+func TestRun_GeneratorReturnsError_ErrorDiagAndFAIL(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	body := "# Audit Report\n\n## Verdict\n**PASS**\n"
+	fb := &fakeBridge{writeArtifact: body}
+	phase := New(Config{
+		Bridge:          fb,
+		Prompts:         fakePromptsFS("body"),
+		GenerateVerdict: func(core.PhaseRequest) error { return errors.New("acssuite boom") },
+	})
+	resp, err := phase.Run(context.Background(), core.PhaseRequest{
+		Cycle: 1, ProjectRoot: "/p", Workspace: ws,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if resp.Verdict != core.VerdictFAIL {
+		t.Errorf("Verdict=%q, want FAIL (generation failed → no verdict file → floor holds)", resp.Verdict)
+	}
+	var found bool
+	for _, d := range resp.Diagnostics {
+		if d.Severity == "error" && strings.Contains(d.Message, "host predicate execution") && strings.Contains(d.Message, "acssuite boom") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected an error diagnostic naming the generation failure; got %+v", resp.Diagnostics)
+	}
+}
+
+func TestGenerateACSVerdict_SuiteRunError_Propagates(t *testing.T) {
+	t.Parallel()
+	err := generateACSVerdict(core.PhaseRequest{
+		Cycle: 0, ProjectRoot: t.TempDir(), Worktree: t.TempDir(), Workspace: t.TempDir(),
+	})
+	if err == nil {
+		t.Fatal("err=nil, want acssuite run error (Cycle<=0)")
+	}
+	if !strings.Contains(err.Error(), "acssuite run") {
+		t.Errorf("err=%v, want wrapped 'acssuite run'", err)
+	}
+}
+
+func TestGenerateACSVerdict_ZeroPredicatesWritesARedVerdictNamingTheCause(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	evolveDir := t.TempDir()
+	ws := filepath.Join(evolveDir, "runs", "cycle-9")
+	if err := os.MkdirAll(ws, 0o755); err != nil {
+		t.Fatalf("mkdir ws: %v", err)
+	}
+
+	if err := generateACSVerdict(core.PhaseRequest{
+		Cycle: 9, ProjectRoot: root, Worktree: root, Workspace: ws,
+	}); err != nil {
+		t.Fatalf("generateACSVerdict: %v", err)
+	}
+	reading, err := readACSVerdict(filepath.Join(ws, "acs-verdict.json"))
+	if err != nil {
+		t.Fatalf("a zero-predicate suite must still write its verdict: %v", err)
+	}
+	if reading.redCount != 1 || len(reading.harnessReds) != 1 || !strings.Contains(reading.harnessReds[0], "egps/no-predicates") {
+		t.Fatalf("red_count=%d harness reds=%v, want the one egps/no-predicates red", reading.redCount, reading.harnessReds)
+	}
+	if !strings.Contains(reading.harnessReds[0], filepath.Join(root, "go")) {
+		t.Errorf("the red must name why no predicate ran; got %q", reading.harnessReds[0])
+	}
+}
+
+func TestRegistry_AuditFactory_BuildsRunner(t *testing.T) {
+	t.Parallel()
+	factory, ok := registry.For(string(core.PhaseAudit))
+	if !ok {
+		t.Fatal(`registry.For("audit") returned ok=false; init() did not register`)
+	}
+	runner := factory(core.PhaseRequest{ProjectRoot: t.TempDir()})
+	if runner == nil {
+		t.Fatal("factory returned nil runner")
+	}
+	if runner.Name() != string(core.PhaseAudit) {
+		t.Errorf("Name=%q, want audit", runner.Name())
+	}
+}
+
+func TestExtractAuditVerdict_Formats(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name      string
+		content   string
+		want      string
+		wantFound bool
+	}{
+		{"canonical", "## Verdict\n**PASS**\n", core.VerdictPASS, true},
+		{"canonical no bold", "## Verdict\nPASS\n", core.VerdictPASS, true},
+		{"canonical blank line", "## Verdict\n\n**WARN**\n", core.VerdictWARN, true},
+		{"inline bold colon", "**Verdict: PASS**\n", core.VerdictPASS, true},
+		{"inline bold split colon", "**Verdict:** PASS\n", core.VerdictPASS, true},
+		{"inline heading colon", "## Verdict: PASS\n", core.VerdictPASS, true},
+		{"inline plain colon", "Verdict: FAIL\n", core.VerdictFAIL, true},
+		{"inline preserves FAIL", "**Verdict: FAIL**\n", core.VerdictFAIL, true},
+		{"inline preserves SKIPPED", "Verdict: SKIPPED\n", core.VerdictSKIPPED, true},
+		{"real report cycle-148 shape", "# Audit\n<!-- token -->\n\n**Verdict: PASS**\n**Confidence: 0.92**\n", core.VerdictPASS, true},
+		{"empty", "", "", false},
+		{"no verdict declared", "# Audit Report\n\nLooks fine to me.\n", "", false},
+		{"lowercase json key not matched", "  \"verdict\": \"PASS\",\n", "", false},
+		{"prose mentioning verdict not matched", "The verdict criteria require PASS or FAIL.\n", "", false},
+		{"no-colon prose not matched", "Verdict PASS is required before shipping.\n", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, found := extractAuditVerdict(tc.content, config.StageOff)
+			if found != tc.wantFound {
+				t.Fatalf("found=%v, want %v (verdict=%q)", found, tc.wantFound, got)
+			}
+			if found && got != tc.want {
+				t.Errorf("verdict=%q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRun_InlineVerdictFormat_PASS(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	writeACSVerdict(t, ws, 0)
+	body := "# Audit Report — Cycle 148\n<!-- audit_bound_tree_sha: deadbeef -->\n\n**Verdict: PASS**\n**Confidence: 0.92**\n\nNo defects.\n"
+	fb := &fakeBridge{writeArtifact: body, resp: core.BridgeResponse{CostUSD: 0.3}}
+	phase := New(Config{Bridge: fb, Prompts: fakePromptsFS("# body"), NowFn: fixtures.FixedClock(time.Unix(1_700_000_000, 0), 60*time.Millisecond)})
+
+	resp, err := phase.Run(context.Background(), core.PhaseRequest{Cycle: 148, ProjectRoot: t.TempDir(), Workspace: ws})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if resp.Verdict != core.VerdictPASS {
+		t.Errorf("Verdict=%q, want PASS (inline verdict + red_count=0 must ship)", resp.Verdict)
+	}
+	if resp.NextPhase != "ship" {
+		t.Errorf("NextPhase=%q, want ship", resp.NextPhase)
+	}
+}
+
+func TestRun_NonEmptyNoVerdict_RedZero_LoudDiag(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	writeACSVerdict(t, ws, 0)
+	body := "# Audit Report\n\nThe change looks acceptable but I forgot the verdict line.\n"
+	fb := &fakeBridge{writeArtifact: body, resp: core.BridgeResponse{CostUSD: 0.3}}
+	phase := New(Config{Bridge: fb, Prompts: fakePromptsFS("# body"), NowFn: fixtures.FixedClock(time.Unix(1_700_000_000, 0), 60*time.Millisecond)})
+
+	resp, err := phase.Run(context.Background(), core.PhaseRequest{Cycle: 1, ProjectRoot: t.TempDir(), Workspace: ws})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if resp.Verdict != core.VerdictFAIL {
+		t.Errorf("Verdict=%q, want FAIL (unparseable verdict)", resp.Verdict)
+	}
+	var found bool
+	for _, d := range resp.Diagnostics {
+		if d.Severity == "error" && strings.Contains(d.Message, "no parseable verdict") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a loud error diagnostic about the unparseable verdict; got %+v", resp.Diagnostics)
+	}
+}
+
+func TestValidateExplanationReview_ReadsTheSectionAsAuditorsWriteIt(t *testing.T) {
+	t.Parallel()
+	req := core.PhaseRequest{
+		ExplanationDocumentationVersion: explanationdocs.CurrentContractVersion,
+		BuildExplanationState:           core.BuildExplanationAvailable,
+		BuildExplanation: &phaseio.ExplanationView{
+			Status: "required", DocumentPath: "docs/explain/builds/cycle-42.md",
+			DocumentSHA256: "sha", MaterialPaths: []string{"go/app.go", "go/other.go"},
+		},
+	}
+	listValued := `## Explanation Documentation
+- Status: VERIFIED
+- Build status: required
+- Document: ` + "`docs/explain/builds/cycle-42.md`" + `
+- Document SHA256: sha
+- Evidence: docs/explain/builds/cycle-42.md:12 states the ordering implemented at go/app.go:29-31
+- Evidence: docs/explain/builds/cycle-42.md:20 names the seam at ` + "`go/other.go:7`" + `
+`
+	if advisories, err := validateExplanationReview(listValued, req); err != nil || len(advisories) != 0 {
+		t.Fatalf("several Evidence lines, a range and backticks are how auditors write; must pass clean: advisories=%v err=%v", advisories, err)
+	}
+	proseCited := `## Explanation Documentation
+- Status: VERIFIED
+- Build status: required
+- Document: docs/explain/builds/cycle-42.md
+- Document SHA256: sha
+- Binding: docs/explain/builds/cycle-42.md:12 reproduces the handoff; go/app.go:29 and go/other.go:7 match the Changed Areas.
+`
+	if advisories, err := validateExplanationReview(proseCited, req); err != nil || len(advisories) != 0 {
+		t.Fatalf("citations under another field name are still citations: advisories=%v err=%v", advisories, err)
+	}
+	uncited := `## Explanation Documentation
+- Status: VERIFIED
+- Build status: required
+- Document: docs/explain/builds/cycle-42.md
+- Document SHA256: sha
+- Evidence: docs/explain/builds/cycle-42.md:12 checked; go/app.go:29 matches
+- Evidence: go/other.go is listed as a Changed Area
+`
+	if advisories, err := validateExplanationReview(uncited, req); err != nil || !containsAdvisory(advisories, "go/other.go with path:line") {
+		t.Fatalf("a material path without a line is an advisory naming the path (ADR-0102): advisories=%v err=%v", advisories, err)
+	}
+}
+
+func hasWarning(diags []core.Diagnostic, substr string) bool {
+	for _, d := range diags {
+		if d.Severity == "warning" && strings.Contains(d.Message, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasError(diags []core.Diagnostic) bool {
+	for _, d := range diags {
+		if d.Severity == "error" {
+			return true
+		}
+	}
+	return false
+}
+
+func containsAdvisory(advisories []string, substr string) bool {
+	return strings.Contains(strings.Join(advisories, "\n"), substr)
+}
+
+func TestClassify_PathOnlyCitationsKeepThePassVerdictAndRecordTheAdvisory(t *testing.T) {
+	t.Parallel()
+	workspace := t.TempDir()
+	writeACSVerdict(t, workspace, 0)
+	req := core.PhaseRequest{
+		Workspace:                       workspace,
+		ExplanationDocumentationVersion: explanationdocs.CurrentContractVersion,
+		BuildExplanationState:           core.BuildExplanationAvailable,
+		BuildExplanation: &phaseio.ExplanationView{
+			Status: "required", Reason: "material behavior changed",
+			DocumentPath: "docs/explain/builds/cycle-1638.md", DocumentSHA256: "document-sha",
+			MaterialPaths: []string{".evolve/inbox/2026-07-21T02-00-00Z-triage-unified-solution-synthesis.json"},
+		},
+	}
+	report := `## Explanation Documentation
+- Status: VERIFIED
+- Build status: required
+- Document: docs/explain/builds/cycle-1638.md
+- Document SHA256: document-sha
+- Evidence: docs/explain/builds/cycle-1638.md:4 explains why every Changed Areas entry resolves; the inbox item .evolve/inbox/2026-07-21T02-00-00Z-triage-unified-solution-synthesis.json is covered by that statement
+
+## Verdict
+**PASS**
+`
+	got, diags, _ := hooks{}.Classify(report, req, core.BridgeResponse{})
+	if got != core.VerdictPASS {
+		t.Fatalf("verdict=%s diags=%v, want PASS: the reasoning is present, only the citation form is short", got, diags)
+	}
+	if !hasWarning(diags, "path:line") || !hasWarning(diags, explanationdocs.AdvisoryPrefix) || hasError(diags) {
+		t.Errorf("the citation gap rides the record as a prefixed advisory, not an error: %v", diags)
+	}
+}
+
+func TestValidateExplanationReview_DuplicateFieldIsAdvisory(t *testing.T) {
+	t.Parallel()
+	req := core.PhaseRequest{
+		ExplanationDocumentationVersion: explanationdocs.CurrentContractVersion,
+		BuildExplanationState:           core.BuildExplanationAvailable,
+		BuildExplanation:                &phaseio.ExplanationView{Status: "required", DocumentPath: "docs/explain/builds/cycle-42.md", DocumentSHA256: "sha"},
+	}
+	report := `## Explanation Documentation
+- Status: VERIFIED
+- Status: NEEDS_CORRECTION
+- Evidence: compared docs/explain/builds/cycle-42.md:1 with the diff line by line
+`
+	advisories, err := validateExplanationReview(report, req)
+	if err != nil || !containsAdvisory(advisories, "duplicate") {
+		t.Fatalf("a duplicated field is an advisory: advisories=%v err=%v", advisories, err)
+	}
+}
+
+func TestValidateExplanationReview_DuplicateSectionIsAdvisoryButFailsTheFloor(t *testing.T) {
+	t.Parallel()
+	req := core.PhaseRequest{ExplanationDocumentationVersion: explanationdocs.CurrentContractVersion, BuildExplanationState: core.BuildExplanationAvailable, BuildExplanation: &phaseio.ExplanationView{Status: "required", DocumentPath: "d.md", DocumentSHA256: "sha"}}
+	report := "## Explanation Documentation\n- Status: VERIFIED\n- Evidence: compared d.md:1 with the diff line by line\n\n## Explanation Documentation\n- Status: VERIFIED\n"
+	advisories, err := validateExplanationReview(report, req)
+	if err == nil || !strings.Contains(err.Error(), "concrete") || !containsAdvisory(advisories, "duplicate ##") {
+		t.Fatalf("a duplicated section is an advisory AND fails the reasoning floor: advisories=%v err=%v", advisories, err)
+	}
+}
+
+func TestValidateExplanationReview_MissingDeliveryReviewedAsFailIsCleanAndHostDefectsAreLoud(t *testing.T) {
+	t.Parallel()
+	invalid := core.PhaseRequest{ExplanationDocumentationVersion: explanationdocs.CurrentContractVersion, BuildExplanationState: core.BuildExplanationInvalid}
+	honest := "## Explanation Documentation\n- Status: FAIL\n- Evidence: the Build handoff snapshot is missing from the workspace\n"
+	if advisories, err := validateExplanationReview(honest, invalid); err != nil || len(advisories) != 0 {
+		t.Fatalf("a missing delivery reviewed as FAIL is clean: advisories=%v err=%v", advisories, err)
+	}
+	lost := core.PhaseRequest{ExplanationDocumentationVersion: explanationdocs.CurrentContractVersion, BuildExplanationState: core.BuildExplanationInvalid, BuildExplanationError: "typed handoff does not match verified host snapshot"}
+	if _, err := validateExplanationReview("## Explanation Documentation\n- Status: VERIFIED\n- Evidence: the document reads well against the diff\n", lost); err == nil || !strings.Contains(err.Error(), "(host: typed handoff does not match") {
+		t.Fatalf("the blocking rule names the host's reason for the lost handoff: %v", err)
+	}
+	weird := core.PhaseRequest{ExplanationDocumentationVersion: explanationdocs.CurrentContractVersion, BuildExplanationState: core.BuildExplanationAvailable, BuildExplanation: &phaseio.ExplanationView{Status: "weird"}}
+	report := "## Explanation Documentation\n- Status: MAYBE\n- Build status: weird\n- Evidence: compared d.md:1 with the diff line by line\n"
+	advisories, err := validateExplanationReview(report, weird)
+	if err == nil || !strings.Contains(err.Error(), "unknown status") || !containsAdvisory(advisories, "must be VERIFIED") {
+		t.Fatalf("a host-side handoff defect fails loudly and the findings made before it still ride along: advisories=%v err=%v", advisories, err)
+	}
+}

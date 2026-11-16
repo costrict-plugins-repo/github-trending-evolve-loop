@@ -1,0 +1,40 @@
+{
+  "name": "rollback-plan",
+  "archetype": "control",
+  "agent": "evolve-rollback-plan",
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/build-report.md"
+    ],
+    "signals": [
+      "build.files_touched"
+    ]
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/rollback-plan.md"
+    ],
+    "signals": [
+      "rollback.ready"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Reversion Mechanism",
+      "Blast Radius",
+      "Verification",
+      "Verdict"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "build.files_touched",
+        "op": "gt",
+        "value": 5
+      }
+    ]
+  },
+  "after": "audit",
+  "optional": true
+}

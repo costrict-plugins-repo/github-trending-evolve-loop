@@ -1,0 +1,22 @@
+{
+  "id": "claim-failed-closeout-charges-unanswered-pins",
+  "kind": "pipeline-repair",
+  "priority_class": "stability",
+  "weight": 0.45,
+  "title": "A lane that seals triage-empty-commitment-claimable-work charges and routes nothing, so its pins are redrawn every wave",
+  "files": [
+    "go/internal/cycleoutcome/cycleoutcome.go",
+    "go/internal/core/triage_termination.go"
+  ],
+  "summary": "Cycle 1757 sealed FAIL triage-empty-commitment-claimable-work with its pinned item neither routed nor bumped: the FAIL closeout's committed set (CommittedIDsFor) reads the decision's top_n only and falls back to the lane pin only when triage-decision.json is absent, so a present decision with an empty top_n charges nobody. R1b (2026-09-29) closes the single-item-lane case where the host's protected route emptied top_n, but a lane pinned to several items whose cards were all routed, or any lane whose triage left its pins unanswered, still ends FAIL with no failure_count bump and no route. The item never reaches the quarantine ceiling and is redrawn every wave.",
+  "fix": "On this termination reason, charge the lane's unanswered pins through the existing committedset.Committed precedence (pin minus deferred, minus answered dispositions): bump each toward the S5 ceiling, or route it when the decision's escalations name a protected surface.",
+  "acceptance": [
+    "A lane pinned to two items whose cards were both routed to the console ends with each pin bumped or routed (red today: neither)",
+    "A single-item lane under R1b keeps its planned no-work end and console route",
+    "A deferred pin is still owed work and is bumped, not routed"
+  ],
+  "created_at": "2026-09-29T17:30:00Z",
+  "source": "console, 2026-09-29, cycle 1757 deep-dive and the R1b architecture review (MEDIUM 3)",
+  "consumed_by": "console landing fix/claim-failed-charges-unanswered-pins (2026-09-29): BUILT (R1c). The claim-failed and planned no-work endings escaped the ADR-0044 C1 chokepoint (triage's PASS stayed the last entry), so 1757 classified integrity-breach (system-level: release, no bump) and 1758 paged FAILED_UNEXPLAINED. The closeout now records each ending via Recorder.RecordEnding (no PhasesRun, no sidecar): claim-failed = triage FAIL with triage's own error diagnostics first, then (lane only) TRIAGE_SCOPE_UNANSWERED naming the unanswered pins (task-level); no-work = triage SKIPPED; cyclehealth NO_WORK arm. ApplyFailure charges committedset.Unanswered (pin minus answers; deferred = owed). A zero-attempt record no longer erases a usage sidecar. A seal-reading design was rejected in architecture review (listeners never decide). Acceptance: multi-item lanes charge each unanswered pin; R1b single-item planned no-work unchanged; a deferred pin is bumped, not routed; sequential claim-failed keeps its classification.",
+  "consumed_at": "2026-09-29T19:00:00Z"
+}

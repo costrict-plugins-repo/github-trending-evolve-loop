@@ -1,0 +1,148 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"text/tabwriter"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/releasetargets"
+)
+
+type binVerify struct {
+	Asset  string
+	OK     bool
+	Detail string
+}
+
+type releaseAssetLister func(owner, repo, tag string) ([]string, error)
+
+func verifyReleaseBinaries(cfg releasetargets.Config, tag string, list releaseAssetLister) ([]binVerify, error) {
+	assets, err := list(cfg.RepoOwner, cfg.RepoName, tag)
+	if err != nil {
+		return nil, fmt.Errorf("list release assets for %s: %w", tag, err)
+	}
+	present := make(map[string]bool, len(assets))
+	for _, a := range assets {
+		present[a] = true
+	}
+
+	rows := make([]binVerify, 0, len(cfg.Targets)+1)
+	for _, tg := range cfg.Targets {
+		name, err := cfg.AssetName(tg)
+		if err != nil {
+			rows = append(rows, binVerify{Asset: tg.String(), OK: false, Detail: err.Error()})
+			continue
+		}
+		rows = append(rows, assetRow(name, present[name]))
+	}
+	rows = append(rows, assetRow(cfg.ChecksumsName, present[cfg.ChecksumsName]))
+	return rows, nil
+}
+
+func assetRow(name string, ok bool) binVerify {
+	if ok {
+		return binVerify{Asset: name, OK: true, Detail: "present in release"}
+	}
+	return binVerify{Asset: name, OK: false, Detail: "MISSING from release"}
+}
+
+func defaultReleaseAssetLister(owner, repo, tag string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/tags/%s", owner, repo, tag)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	if tok := os.Getenv("GITHUB_TOKEN"); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+
+	client := &http.Client{Timeout: 35 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: %w", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("release %s not found in %s/%s (no binaries published)", tag, owner, repo)
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("GitHub API %s returned %s: %s", url, resp.Status, string(body))
+	}
+
+	var payload struct {
+		Assets []struct {
+			Name string `json:"name"`
+		} `json:"assets"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, fmt.Errorf("decode release JSON: %w", err)
+	}
+	names := make([]string, 0, len(payload.Assets))
+	for _, a := range payload.Assets {
+		names = append(names, a.Name)
+	}
+	return names, nil
+}
+
+func runReleaseVerifyBinaries(args []string, _ io.Reader, stdout, stderr io.Writer) int {
+	if len(args) < 1 || args[0] == "" {
+		fmt.Fprintln(stderr, "usage: evolve release-verify-binaries <tag>")
+		fmt.Fprintln(stderr, "  <tag> is the release tag to verify, e.g. v21.1.1")
+		return 1
+	}
+	tag := args[0]
+
+	goreleaserPath := filepath.Join(sourceRoot(), ".goreleaser.yml")
+	cfg, err := releasetargets.ParseConfig(goreleaserPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "read release matrix: %v\n", err)
+		return 1
+	}
+	if cfg.RepoOwner == "" || cfg.RepoName == "" {
+		fmt.Fprintf(stderr, "release matrix %s has no release.github.owner/name\n", goreleaserPath)
+		return 1
+	}
+
+	return reportBinaryVerification(cfg, tag, defaultReleaseAssetLister, stdout, stderr)
+}
+
+func reportBinaryVerification(cfg releasetargets.Config, tag string, list releaseAssetLister, stdout, stderr io.Writer) int {
+	rows, err := verifyReleaseBinaries(cfg, tag, list)
+	if err != nil {
+		fmt.Fprintf(stderr, "release-verify-binaries: %v\n", err)
+		return 1
+	}
+
+	allOK := true
+	tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "ASSET\tSTATUS\tDETAIL")
+	for _, r := range rows {
+		status := "OK"
+		if !r.OK {
+			status = "FAIL"
+			allOK = false
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\n", r.Asset, status, r.Detail)
+	}
+	_ = tw.Flush()
+
+	if !allOK {
+		fmt.Fprintf(stderr, "release-verify-binaries: one or more expected binaries are missing from release %s\n", tag)
+		return 1
+	}
+	fmt.Fprintf(stdout, "release-verify-binaries: all %d prebuilt binaries + checksums present on release %s\n", len(cfg.Targets), tag)
+	return 0
+}

@@ -1,0 +1,91 @@
+package bridge
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestRunTmuxREPL_PauseWritesEscalationReport(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t, "claude-tmux", "")
+	defer os.RemoveAll(fx.ws)
+	tmux := &fakeTmux{paneSeq: []string{tmuxPromptMarkerDefault}}
+	rev := &scriptedReviewer{verdicts: []ReviewVerdict{
+		{Action: ReviewPause, Reason: "stalled-reason"},
+	}}
+	var got []stopReviewRec
+	spy := func(phase, action, reason string) {
+		got = append(got, stopReviewRec{phase, action, reason})
+	}
+	code, stderr := runTmuxOnStopReview(t, fx, tmux, rev, spy,
+		Deps{ArtifactTimeoutS: 2}, "--allow-bypass", "--agent=scout")
+
+	if code != ExitArtifactTimeout {
+		t.Fatalf("exit = %d, want %d (ExitArtifactTimeout after pause); stderr=%q", code, ExitArtifactTimeout, stderr)
+	}
+
+	reportPath := filepath.Join(fx.ws, "scout-escalation-report.json")
+	if _, err := os.Stat(reportPath); err != nil {
+		t.Fatalf("escalation report %s does not exist: %v", reportPath, err)
+	}
+
+	data, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatalf("failed to read escalation report: %v", err)
+	}
+
+	var report escalationReport
+	if err := json.Unmarshal(data, &report); err != nil {
+		t.Fatalf("failed to unmarshal escalation report: %v", err)
+	}
+
+	if report.Phase != "scout" {
+		t.Errorf("got phase %q, want %q", report.Phase, "scout")
+	}
+	if report.Action != "pause" {
+		t.Errorf("got action %q, want %q", report.Action, "pause")
+	}
+	if report.Reason != "stalled-reason" {
+		t.Errorf("got reason %q, want %q", report.Reason, "stalled-reason")
+	}
+	if report.StopKind != "artifact_timeout" {
+		t.Errorf("got stop_kind %q, want %q", report.StopKind, "artifact_timeout")
+	}
+}
+
+func TestRunTmuxREPL_ExtendNoEscalationReport(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t, "claude-tmux", "")
+	defer os.RemoveAll(fx.ws)
+
+	tmux := &fakeTmux{paneSeq: []string{tmuxPromptMarkerDefault}}
+
+	rev := &writingReviewer{artifact: fx.artifact}
+
+	code, stderr := runTmuxOnStopReview(t, fx, tmux, rev, nil,
+		Deps{ArtifactTimeoutS: 2}, "--allow-bypass", "--agent=scout")
+
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (success); stderr=%q", code, stderr)
+	}
+
+	reportPath := filepath.Join(fx.ws, "scout-escalation-report.json")
+	if _, err := os.Stat(reportPath); err == nil {
+		t.Fatalf("escalation report %s should not exist for successful (completed) run", reportPath)
+	}
+}
+
+type writingReviewer struct {
+	artifact string
+	wrote    bool
+}
+
+func (w *writingReviewer) Review(ev StopEvent) ReviewVerdict {
+	if !w.wrote {
+		_ = os.WriteFile(w.artifact, []byte("PROTOTYPE OK\n"), 0o644)
+		w.wrote = true
+	}
+	return ReviewVerdict{Action: ReviewExtend, Reason: "still working"}
+}

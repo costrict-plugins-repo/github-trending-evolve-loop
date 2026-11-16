@@ -1,0 +1,643 @@
+//go:build e2e
+
+package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/fakeclitest"
+	"github.com/mickeyyaya/evolve-loop/go/internal/faketmux"
+	"github.com/mickeyyaya/evolve-loop/go/internal/gittest"
+	"github.com/mickeyyaya/evolve-loop/go/internal/gotooltest"
+	"github.com/mickeyyaya/evolve-loop/go/internal/isolation"
+)
+
+var expectedPhasesHappyPath = []string{"scout", "triage", "tdd", "build", "audit", "ship"}
+
+type matrixRow struct {
+	id, family, driver string
+}
+
+var substitutionRows = []matrixRow{
+	{id: "M1", family: "claude", driver: "claude-p"},
+	{id: "M2", family: "agy", driver: "agy"},
+	{id: "M3", family: "agy-claude", driver: "agy-claude-tmux"},
+	{id: "M4", family: "codex", driver: "codex"},
+	{id: "M5", family: "ollama", driver: "ollama-tmux"},
+}
+
+var stubBinaries = []string{"claude", "agy", "codex", "ollama", "gemini"}
+
+func TestE2ECycleCLIMatrix(t *testing.T) {
+	t.Parallel()
+	evolveBin, fakeBin, repoRoot := mustBuildPipelineBins(t)
+	for _, row := range substitutionRows {
+		t.Run(row.id+"_"+row.family, func(t *testing.T) {
+			t.Parallel()
+			run := runMatrixCycle(t, row, evolveBin, fakeBin, repoRoot)
+			failure := run.substitutionFailure(row)
+			reportRow(t)(isolation.Judge(row.id, failure))
+			if row.id != "M1" {
+				return
+			}
+			if failure != nil || len(run.calls) == 0 {
+				t.Fatalf("row N1 and the phase marker check read the stub records of a green M1 run; M1 failed or ran no seat: %v", failure)
+			}
+			reportRow(t)(isolation.Judge("N1", run.envLeak()))
+			if err := run.agentRunNotRefused(); err != nil {
+				t.Error(err)
+			}
+			reportRow(t)(isolation.Judge("N6", run.indexMissing()))
+			reportRow(t)(isolation.Judge("N15", run.contextNotOpened()))
+		})
+	}
+}
+
+func reportRow(t *testing.T) func(string, error) {
+	t.Helper()
+	return func(note string, err error) {
+		t.Helper()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		t.Log(note)
+	}
+}
+
+type matrixRun struct {
+	projRoot string
+	err      error
+	out      string
+	entries  []ledgerEntry
+	calls    []stubCall
+}
+
+type stubCall struct {
+	binary     string
+	claudeCode string
+	sandbox    string
+	bypass     string
+	depth      string
+	agentRun   string
+	context    string
+}
+
+func runMatrixCycle(t *testing.T, row matrixRow, evolveBin, fakeBin, repoRoot string) matrixRun {
+	t.Helper()
+	projRoot := setupTempProject(t, repoRoot)
+	writeMatrixProject(t, projRoot, row.driver)
+	binDir := t.TempDir()
+	callLog := filepath.Join(t.TempDir(), "calls.log")
+	probeDir := filepath.Join(t.TempDir(), "n4-probe")
+	env := append(os.Environ(),
+		"CLAUDECODE=1",
+		"EVOLVE_RESEARCH_HOOK_DISABLED=1",
+		"EVOLVE_SANDBOX=off",
+		"EVOLVE_BYPASS_SHIP_GATE=1",
+	)
+	for _, bin := range stubBinaries {
+		path := filepath.Join(binDir, bin)
+		fakeclitest.Install(t, path, stubScript(bin, fakeBin, callLog, evolveBin, probeDir, projRoot))
+	}
+	env = append(env, installFakeTmux(t, binDir, fakeBin)...)
+	env = append(env, isolatedHome(t)...)
+	env = append(withoutEnv(env, "PATH"), "PATH="+stubFirstPath(t, binDir))
+	cmd := exec.Command(evolveBin, "cycle", "run",
+		"--project-root", projRoot,
+		"--goal-hash", "e2ematrix"+strings.ToLower(row.id),
+		"--evolve-dir", filepath.Join(projRoot, ".evolve"),
+		"--sandbox-off=e2e stub CLIs need no confinement",
+	)
+	cmd.Env = withoutEnv(env, "EVOLVE_CLI")
+	cmd.Dir = projRoot
+	out, err := runWithTimeout(cmd, 300*time.Second)
+	if err != nil && strings.HasPrefix(err.Error(), "timed out") {
+		t.Fatalf("inconclusive: the %s cycle timed out, which is not the routing gap of the row", row.family)
+	}
+	run := matrixRun{projRoot: projRoot, err: err, out: out, calls: readStubCalls(t, callLog)}
+	if _, statErr := os.Stat(filepath.Join(projRoot, ".evolve", "ledger.jsonl")); statErr == nil {
+		run.entries = readLedger(t, projRoot)
+	}
+	return run
+}
+
+func stubFirstPath(t *testing.T, binDir string) string {
+	t.Helper()
+	dirs := []string{binDir}
+	for _, tool := range []string{"go", "git", "bash"} {
+		path, err := exec.LookPath(tool)
+		if err != nil {
+			t.Fatalf("the matrix cycle needs %s: %v", tool, err)
+		}
+		dirs = append(dirs, filepath.Dir(path))
+	}
+	return strings.Join(append(dirs, "/usr/bin", "/bin", "/usr/sbin", "/sbin"), string(os.PathListSeparator))
+}
+
+func installFakeTmux(t *testing.T, binDir, fakeBin string) []string {
+	t.Helper()
+	root, err := faketmux.Claim()
+	if err != nil {
+		t.Fatalf("claim a fake tmux root: %v", err)
+	}
+	fakeclitest.Install(t, filepath.Join(binDir, "tmux"), "#!/bin/sh\n"+`exec "`+fakeBin+`" `+faketmux.Flag+` "`+root+`" "$@"`+"\n")
+	t.Cleanup(func() {
+		if err := faketmux.Reap(root); err != nil {
+			t.Errorf("stop the fake tmux panes under %s: %v", root, err)
+		}
+	})
+	return []string{"TMUX_TMPDIR=" + t.TempDir()}
+}
+
+func stubScript(bin, fakeBin, callLog, evolveBin, probeDir, projRoot string) string {
+	return "#!/bin/sh\n" +
+		"probe=skip\n" +
+		`if mkdir "` + probeDir + `" 2>/dev/null; then` + "\n" +
+		`  "` + evolveBin + `" agent run ` + nestedProbeProfile + ` </dev/null >/dev/null 2>"` + probeDir + `/stderr"` + "\n" +
+		`  rc=$?; named=no; grep -q '` + agentRunRefusal + `' "` + probeDir + `/stderr" && named=yes; probe=$rc:$named` + "\n" +
+		"fi\n" +
+		contextProbe(evolveBin, projRoot) +
+		`printf '%s CLAUDECODE=%s EVOLVE_SANDBOX=%s EVOLVE_BYPASS_SHIP_GATE=%s EVOLVE_DISPATCH_DEPTH=%s AGENTRUN=%s CONTEXT=%s\n' ` + bin + ` "${CLAUDECODE-unset}" "${EVOLVE_SANDBOX-unset}" "${EVOLVE_BYPASS_SHIP_GATE-unset}" "${EVOLVE_DISPATCH_DEPTH-unset}" "$probe" "$ctx" >> "` + callLog + `"` + "\n" +
+		`exec "` + fakeBin + `" "$@"` + "\n"
+}
+
+const (
+	nestedProbeProfile = "x4-nested-probe-no-such-profile"
+	agentRunRefusal    = "refused inside a phase"
+)
+
+func withoutEnv(env []string, key string) []string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, key+"=") {
+			out = append(out, kv)
+		}
+	}
+	return out
+}
+
+func writeMatrixProject(t *testing.T, projRoot, driver string) {
+	t.Helper()
+	writeProjectPolicy(t, projRoot, map[string]any{
+		"cli_routing": map[string]any{"clis": []string{driver}, "default": []string{driver}, "floors": map[string]any{}},
+		"isolation":   map[string]any{"i2": map[string]any{"stage": "enforce"}, "i5": map[string]any{"stage": "enforce"}},
+	})
+	profilesDir := filepath.Join(projRoot, ".evolve", "profiles")
+	for _, name := range []string{"intent", "scout", "triage", "tdd-engineer", "builder", "auditor", "retrospective"} {
+		body := fmt.Sprintf(`{"name":%q,"role":%q,"cli":%q,"model_tier_default":"sonnet","allowed_tools":["Read","Write","Bash"]}`, name, name, driver)
+		if err := os.WriteFile(filepath.Join(profilesDir, name+".json"), []byte(body), 0o644); err != nil {
+			t.Fatalf("write profile %s: %v", name, err)
+		}
+	}
+}
+
+func readStubCalls(t *testing.T, path string) []stubCall {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		t.Fatalf("read the stub call log: %v", err)
+	}
+	var calls []stubCall
+	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 7 {
+			t.Fatalf("stub call log line %q", line)
+		}
+		calls = append(calls, stubCall{
+			binary: f[0], claudeCode: strings.TrimPrefix(f[1], "CLAUDECODE="),
+			sandbox: strings.TrimPrefix(f[2], "EVOLVE_SANDBOX="), bypass: strings.TrimPrefix(f[3], "EVOLVE_BYPASS_SHIP_GATE="),
+			depth: strings.TrimPrefix(f[4], "EVOLVE_DISPATCH_DEPTH="), agentRun: strings.TrimPrefix(f[5], "AGENTRUN="), context: strings.TrimPrefix(f[6], "CONTEXT="),
+		})
+	}
+	return calls
+}
+
+func (r matrixRun) substitutionFailure(row matrixRow) error {
+	if r.err != nil {
+		return fmt.Errorf("evolve cycle run with %s as the only route: %v: %s\n%s", row.family, r.err, lastLineWith(r.out, "evolve cycle run:"), lastN(r.out, 1500))
+	}
+	var missing []string
+	for _, role := range expectedPhasesHappyPath {
+		if !ledgerHasRole(r.entries, role) {
+			missing = append(missing, role)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("the ledger misses roles %v; roles %v", missing, ledgerRoles(r.entries))
+	}
+	want := strings.Split(row.driver, "-")[0]
+	if len(r.calls) == 0 {
+		return fmt.Errorf("no stub CLI ran, so no seat ran on %s", row.family)
+	}
+	for _, c := range r.calls {
+		if c.binary != want {
+			return fmt.Errorf("a seat ran the %s binary; %s is the only route", c.binary, row.family)
+		}
+	}
+	return nil
+}
+
+func lastLineWith(out, marker string) string {
+	lines := strings.Split(out, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.Contains(lines[i], marker) {
+			return strings.TrimSpace(lines[i])
+		}
+	}
+	return "no line names the cause"
+}
+
+func (r matrixRun) indexMissing() error {
+	workspaces, err := filepath.Glob(filepath.Join(r.projRoot, ".evolve", "runs", "cycle-*"))
+	if err != nil || len(workspaces) == 0 {
+		return fmt.Errorf("inconclusive: the M1 run left no cycle workspace (%v)", err)
+	}
+	for _, ws := range workspaces {
+		raw, err := os.ReadFile(filepath.Join(ws, "inputs", "index.json"))
+		if err != nil {
+			continue
+		}
+		var idx struct {
+			Phase   string `json:"phase"`
+			Entries []struct {
+				Kind string `json:"kind"`
+				Path string `json:"path"`
+			} `json:"entries"`
+		}
+		if err := json.Unmarshal(raw, &idx); err != nil {
+			return fmt.Errorf("the inputs/index.json of %s is not JSON: %v", ws, err)
+		}
+		for _, e := range idx.Entries {
+			if strings.HasSuffix(e.Path, "-stdout.log") || strings.HasSuffix(e.Path, "-final-pane.txt") {
+				return fmt.Errorf("the index of the %s phase lists raw output %s", idx.Phase, e.Path)
+			}
+			if e.Kind == "scout-report" {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("no inputs/index.json in the %d cycle workspace(s) of the M1 run lists the scout report, so a later phase has no index to open its inputs through", len(workspaces))
+}
+
+func contextProbe(evolveBin, projRoot string) string {
+	return "ctx=skip\n" +
+		`if [ -n "${EVOLVE_DISPATCH_ID-}" ]; then` + "\n" +
+		`  ws="` + projRoot + `/.evolve/runs/cycle-$(printf '%s' "$EVOLVE_DISPATCH_ID" | cut -d/ -f2)"` + "\n" +
+		`  j=$("` + evolveBin + `" context index --required --json --workspace "$ws" 2>/dev/null); rc=$?` + "\n" +
+		`  id=$(printf '%s' "$j" | sed -n 's/.*"entries":\[{"id":"\([^"]*\)".*/\1/p')` + "\n" +
+		`  orc=none; if [ -n "$id" ]; then "` + evolveBin + `" context open "$id" --workspace "$ws" >/dev/null 2>&1; orc=$?; fi` + "\n" +
+		`  ctx="$rc:${id:-none}:$orc"` + "\n" +
+		"fi\n"
+}
+
+func (r matrixRun) contextNotOpened() error {
+	var seen []string
+	for _, c := range r.calls {
+		if parts := strings.Split(c.context, ":"); len(parts) == 3 && parts[0] == "0" && parts[1] != "none" && parts[2] == "0" {
+			return nil
+		}
+		seen = append(seen, c.binary+"="+c.context)
+	}
+	return fmt.Errorf("no seat of the M1 run listed its index and opened a required entry through evolve context; exit:id:open-exit per seat = %v", seen)
+}
+
+func (r matrixRun) envLeak() error {
+	for _, c := range r.calls {
+		for _, v := range []struct{ name, value string }{{"CLAUDECODE", c.claudeCode}, {"EVOLVE_SANDBOX", c.sandbox}, {"EVOLVE_BYPASS_SHIP_GATE", c.bypass}} {
+			if v.value != "unset" {
+				return fmt.Errorf("%s=%s of the parent reached the %s seat", v.name, v.value, c.binary)
+			}
+		}
+	}
+	return nil
+}
+
+func (r matrixRun) agentRunNotRefused() error {
+	for _, c := range r.calls {
+		if c.agentRun == "skip" {
+			continue
+		}
+		if c.agentRun != "3:yes" {
+			return fmt.Errorf("evolve agent run inside a %s phase pane (EVOLVE_DISPATCH_DEPTH=%s) was not refused: exit:named-refusal = %s, want 3:yes (%q)", c.binary, c.depth, c.agentRun, agentRunRefusal)
+		}
+		return nil
+	}
+	return fmt.Errorf("inconclusive: no stub of the M1 run probed evolve agent run")
+}
+
+func liveBinaryName(cli string) string {
+	switch cli {
+	case "claude-p", "claude-tmux":
+		return "claude"
+	case "codex", "codex-tmux":
+		return "codex"
+	case "agy", "agy-tmux":
+		return "agy"
+	default:
+		return cli
+	}
+}
+
+func buildBinary(t *testing.T, _ string, name, pkg, repoRoot string) string {
+	t.Helper()
+	out, err := builtBinaries.Build(gotooltest.Spec{Dir: filepath.Join(repoRoot, "go"), Pkg: pkg, Name: name})
+	if err != nil {
+		t.Fatalf("go build %s: %v", pkg, err)
+	}
+	return out
+}
+
+func mustRepoRoot(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	dir := filepath.Dir(thisFile)
+	for i := 0; i < 8; i++ {
+		if _, err := os.Stat(filepath.Join(dir, "go", "go.mod")); err == nil {
+			return dir
+		}
+		dir = filepath.Dir(dir)
+	}
+	t.Fatalf("could not locate repo root from %s", thisFile)
+	return ""
+}
+
+func setupTempProject(t *testing.T, repoRoot string) string {
+	t.Helper()
+	repo := gittest.Fixture(t)
+	root := repo.Dir
+	seedProjectAgents(t, root, repoRoot)
+
+	if err := os.MkdirAll(filepath.Join(root, ".evolve"), 0o755); err != nil {
+		t.Fatalf("mkdir .evolve: %v", err)
+	}
+	writeProjectPolicy(t, root, nil)
+
+	profilesDir := filepath.Join(root, ".evolve", "profiles")
+	if err := os.MkdirAll(profilesDir, 0o755); err != nil {
+		t.Fatalf("mkdir profiles: %v", err)
+	}
+	for _, name := range []string{"intent", "scout", "triage", "tdd-engineer", "builder", "auditor", "retrospective"} {
+		path := filepath.Join(profilesDir, name+".json")
+		body := fmt.Sprintf(`{"name":%q,"role":%q,"cli":"claude","model_tier_default":"sonnet","allowed_tools":["Read","Write","Bash"]}`, name, name)
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatalf("write profile %s: %v", name, err)
+		}
+	}
+
+	statePath := filepath.Join(root, ".evolve", "state.json")
+	seed := `{"lastUpdated":"2026-01-01T00:00:00Z","lastCycleNumber":0,"version":1,"currentBatch":{"cycleAccruedCostUSD":0}}`
+	if err := os.WriteFile(statePath, []byte(seed), 0o644); err != nil {
+		t.Fatalf("write state.json: %v", err)
+	}
+
+	for rel, body := range map[string]string{
+		"go/go.mod": "module e2e.local/fixture\n\ngo 1.23\n",
+		"go/acs/regression/auditfixture/predicate_test.go": `//go:build acs
+
+package auditfixture
+
+import (
+	"os"
+	"strings"
+	"testing"
+)
+
+func TestAuditFixture(t *testing.T) {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("FAKE_CLI_AUDIT_VERDICT")), "FAIL") {
+		t.Fatal("synthetic e2e failing predicate requested by the fixture")
+	}
+}
+`,
+	} {
+		path := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir predicate fixture: %v", err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatalf("write predicate fixture %s: %v", rel, err)
+		}
+	}
+
+	commitProjectSeed(t, repo)
+
+	return root
+}
+
+func writeProjectPolicy(t *testing.T, root string, extra map[string]any) {
+	t.Helper()
+	policy := map[string]any{
+		"catalog":    map[string]any{"auto_refresh": false},
+		"cli_health": map[string]any{"usage_evidence_timeout_s": 1},
+	}
+	for key, block := range extra {
+		policy[key] = block
+	}
+	body, err := json.Marshal(policy)
+	if err != nil {
+		t.Fatalf("marshal policy.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".evolve", "policy.json"), append(body, '\n'), 0o644); err != nil {
+		t.Fatalf("write policy.json: %v", err)
+	}
+}
+
+func seedProjectAgents(t *testing.T, root, repoRoot string) {
+	t.Helper()
+	if repoRoot == "" {
+		return
+	}
+	personas, err := filepath.Glob(filepath.Join(repoRoot, "agents", "*.md"))
+	if err != nil || len(personas) == 0 {
+		t.Fatalf("the project needs the personas of %s/agents: %v", repoRoot, err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "agents"), 0o755); err != nil {
+		t.Fatalf("mkdir agents: %v", err)
+	}
+	for _, src := range personas {
+		body, err := os.ReadFile(src)
+		if err != nil {
+			t.Fatalf("read persona %s: %v", src, err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "agents", filepath.Base(src)), withoutToolsLine(body), 0o644); err != nil {
+			t.Fatalf("write persona %s: %v", src, err)
+		}
+	}
+}
+
+func withoutToolsLine(persona []byte) []byte {
+	lines := strings.Split(string(persona), "\n")
+	kept := lines[:0]
+	for _, line := range lines {
+		if !strings.HasPrefix(line, "tools:") {
+			kept = append(kept, line)
+		}
+	}
+	return []byte(strings.Join(kept, "\n"))
+}
+
+func fakeCLIsFirstOnPath(t *testing.T, fakeBin string, clis ...string) string {
+	t.Helper()
+	binDir := t.TempDir()
+	for _, cli := range clis {
+		if err := os.Symlink(fakeBin, filepath.Join(binDir, cli)); err != nil {
+			t.Fatalf("link the fake %s: %v", cli, err)
+		}
+	}
+	return "PATH=" + binDir + string(os.PathListSeparator) + os.Getenv("PATH")
+}
+
+func commitProjectSeed(t *testing.T, repo *gittest.Repo) {
+	t.Helper()
+	repo.Git("config", "commit.gpgsign", "false")
+	if err := os.WriteFile(filepath.Join(repo.Dir, ".gitignore"),
+		[]byte("tools/\n.evolve/\ngo/bin/\n"), 0o644); err != nil {
+		t.Fatalf("write .gitignore: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo.Dir, "README.md"), []byte("# e2e\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	repo.Git("add", "-A")
+	repo.Git("commit", "-q", "-m", "initial")
+}
+
+func writeFakeShipScript(t *testing.T, projRoot string) string {
+	t.Helper()
+	path := filepath.Join(projRoot, "fake-ship.sh")
+	body := `#!/usr/bin/env bash
+set -euo pipefail
+class=""
+msg=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --class) class="$2"; shift 2 ;;
+    *) msg="$1"; shift ;;
+  esac
+done
+[[ -n "$msg" ]] || { echo "fake-ship: empty message" >&2; exit 1; }
+git add -A
+git commit --allow-empty -m "$msg" >/dev/null
+echo "fake-ship: committed class=$class msg=$msg"
+`
+	fakeclitest.Install(t, path, body)
+	return path
+}
+
+func runWithTimeout(cmd *exec.Cmd, d time.Duration) (string, error) {
+	type result struct {
+		out []byte
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		out, err := cmd.CombinedOutput()
+		done <- result{out: out, err: err}
+	}()
+	select {
+	case r := <-done:
+		return string(r.out), r.err
+	case <-time.After(d):
+		_ = cmd.Process.Kill()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+		}
+		return "", fmt.Errorf("timed out after %s", d)
+	}
+}
+
+type ledgerEntry struct {
+	Role    string  `json:"role"`
+	Kind    string  `json:"kind"`
+	CostUSD float64 `json:"cost_usd"`
+}
+
+func readLedger(t *testing.T, projRoot string) []ledgerEntry {
+	t.Helper()
+	path := filepath.Join(projRoot, ".evolve", "ledger.jsonl")
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open ledger: %v", err)
+	}
+	defer f.Close()
+	var out []ledgerEntry
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		var e ledgerEntry
+		line := sc.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		if err := json.Unmarshal(line, &e); err != nil {
+			t.Errorf("ledger line not JSON: %q (%v)", line, err)
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+func ledgerHasRole(entries []ledgerEntry, role string) bool {
+	for _, e := range entries {
+		if e.Role == role {
+			return true
+		}
+	}
+	return false
+}
+
+func ledgerRoles(entries []ledgerEntry) []string {
+	out := make([]string, len(entries))
+	for i, e := range entries {
+		out[i] = e.Role
+	}
+	return out
+}
+
+type stateFile struct {
+	LastCycleNumber int `json:"lastCycleNumber"`
+}
+
+func readState(t *testing.T, projRoot string) stateFile {
+	t.Helper()
+	path := filepath.Join(projRoot, ".evolve", "state.json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	var s stateFile
+	if err := json.Unmarshal(b, &s); err != nil {
+		t.Fatalf("parse state: %v", err)
+	}
+	return s
+}
+
+func dumpWorkspaceLogs(t *testing.T, projRoot string) {
+	runs := filepath.Join(projRoot, ".evolve", "runs")
+	_ = filepath.Walk(runs, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(path, ".log") {
+			return nil
+		}
+		b, _ := os.ReadFile(path)
+		t.Logf("--- %s ---\n%s", path, string(b))
+		return nil
+	})
+}

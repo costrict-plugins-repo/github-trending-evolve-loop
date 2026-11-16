@@ -1,0 +1,30 @@
+package core
+
+import (
+	"context"
+	"errors"
+	"sync/atomic"
+	"testing"
+)
+
+func TestOrchestrator_WithCatalogRefresher_CalledOnceBestEffort(t *testing.T) {
+	t.Parallel()
+	st := &fakeStorage{state: State{LastCycleNumber: 0}}
+	led := &fakeLedger{}
+	var calls int32
+	o := NewOrchestrator(st, led, buildRunners(nil), WithCatalogRefresher(func(context.Context) error {
+		atomic.AddInt32(&calls, 1)
+		return errors.New("refresh boom") // best-effort: must not abort the cycle
+	}))
+
+	res, err := o.RunCycle(context.Background(), CycleRequest{ProjectRoot: t.TempDir(), GoalHash: "g"})
+	if err != nil {
+		t.Fatalf("RunCycle must not fail on refresher error: %v", err)
+	}
+	if res.FinalVerdict != VerdictPASS {
+		t.Errorf("verdict=%s, want PASS", res.FinalVerdict)
+	}
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Fatalf("refresher called %d times, want exactly 1", n)
+	}
+}

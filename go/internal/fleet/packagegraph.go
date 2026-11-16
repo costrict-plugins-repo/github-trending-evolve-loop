@@ -1,0 +1,130 @@
+package fleet
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/sysexec"
+)
+
+const modulePrefix = "github.com/mickeyyaya/evolve-loop/go/"
+
+func TransitivePackageSet(files []string, repoRoot string) (map[string]bool, error) {
+	dirs := map[string]bool{}
+	for _, f := range files {
+		if _, err := os.Stat(filepath.Join(repoRoot, f)); err != nil {
+			return nil, fmt.Errorf("packagegraph: %s: %w", f, err)
+		}
+		dirs[filepath.Dir(f)] = true
+	}
+	set := map[string]bool{}
+	for dir := range dirs {
+		rel := "./" + filepath.ToSlash(dir)
+		out, err := sysexec.Output(context.Background(), sysexec.DefaultRunner, repoRoot, "go", "list", "-deps", rel)
+		if err != nil {
+			return nil, fmt.Errorf("packagegraph: go list -deps %s: %w", rel, err)
+		}
+		for _, line := range strings.Split(out, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, modulePrefix) {
+				set[line] = true
+			}
+		}
+	}
+	return set, nil
+}
+
+var globalZoneFiles = []string{
+	"go.mod",
+	"go.sum",
+	".evolve/policy.json",
+}
+
+func IsGlobalZone(file string) bool {
+	clean := filepath.Clean(file)
+	for _, gz := range globalZoneFiles {
+		if clean == filepath.Clean(gz) {
+			return true
+		}
+	}
+	return false
+}
+
+func GlobalZoneFiles() []string {
+	out := make([]string, len(globalZoneFiles))
+	copy(out, globalZoneFiles)
+	return out
+}
+
+func PartitionGraph(todos []Todo, n int, repoRoot string) (buckets [][]Todo, deferred []Todo, err error) {
+	if n < 1 {
+		n = 1
+	}
+	buckets = make([][]Todo, n)
+	owner := map[string]int{}
+	gzBucket := -1
+
+	for _, td := range todos {
+		gzFiles, pkgFiles := splitGlobalZone(td.Files)
+		isGZ := len(gzFiles) > 0
+
+		pkgs, perr := TransitivePackageSet(pkgFiles, repoRoot)
+		if perr != nil {
+			return nil, nil, fmt.Errorf("PartitionGraph: todo %s: %w", td.ID, perr)
+		}
+
+		owning := resolveOwningBuckets(pkgs, owner, buckets, isGZ, gzBucket)
+
+		var chosen int
+		switch len(owning) {
+		case 0:
+			chosen = leastLoaded(buckets)
+		case 1:
+			chosen = only(owning)
+		default:
+			deferred = append(deferred, td)
+			continue
+		}
+		buckets[chosen] = append(buckets[chosen], td)
+		for pkg := range pkgs {
+			owner[pkg] = chosen
+		}
+		if isGZ {
+			gzBucket = chosen
+		}
+	}
+	return buckets, deferred, nil
+}
+
+func resolveOwningBuckets(pkgs map[string]bool, owner map[string]int, buckets [][]Todo, isGZ bool, gzBucket int) map[int]bool {
+	owning := map[int]bool{}
+	for pkg := range pkgs {
+		if b, ok := owner[pkg]; ok {
+			owning[b] = true
+		}
+	}
+	if isGZ {
+		for i, b := range buckets {
+			if len(b) > 0 {
+				owning[i] = true
+			}
+		}
+	} else if gzBucket >= 0 {
+		owning[gzBucket] = true
+	}
+	return owning
+}
+
+func splitGlobalZone(files []string) (gzFiles, pkgFiles []string) {
+	for _, f := range files {
+		if IsGlobalZone(f) {
+			gzFiles = append(gzFiles, f)
+		} else {
+			pkgFiles = append(pkgFiles, f)
+		}
+	}
+	return gzFiles, pkgFiles
+}

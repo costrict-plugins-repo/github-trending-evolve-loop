@@ -1,0 +1,95 @@
+package core
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"path/filepath"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/auditledger"
+	"github.com/mickeyyaya/evolve-loop/go/internal/ciparity"
+	"github.com/mickeyyaya/evolve-loop/go/internal/treefence"
+)
+
+var identityPatchID = compositionPatchID
+
+const identicalRebaseMethod = "identical-rebase"
+
+func (o *Orchestrator) identityCarryForward(ctx context.Context, cycle int, cs CycleState, base0, projectRoot string) bool {
+	if !o.CompositionFastPathWired() || cs.ActiveWorktree == "" {
+		return false
+	}
+	decline := func(format string, args ...any) bool {
+		fmt.Fprintf(o.errOut(), "[orchestrator] cycle %d identity carry declined: %s; re-auditing\n", cycle, fmt.Sprintf(format, args...))
+		return false
+	}
+	worktree := cs.ActiveWorktree
+	audit, err := o.carriedAudit(ctx, cs.RunID, base0)
+	if err != nil {
+		return decline("%v", err)
+	}
+	tree0 := audit.WorktreeTreeSHA
+	base1, err := gitStdout(ctx, gitCapture, worktree, "rev-parse", "HEAD")
+	if err != nil {
+		return decline("HEAD: %v", err)
+	}
+	tree1, err := gitStdout(ctx, gitCapture, worktree, "write-tree")
+	if err != nil {
+		return decline("write-tree: %v", err)
+	}
+	audited, composed, identical, err := identicalChange(ctx, gitCapture, worktree, base0, tree0, base1, tree1)
+	if err != nil || !identical {
+		return decline("the pended change is not byte for byte the audited one (err=%v)", err)
+	}
+	gates, outcomes, ok := o.gatesOnIntactTree(ctx, worktree, tree1)
+	if !ok {
+		return decline("the composed-tree gates did not leave the tree as they found it")
+	}
+	if missing := ciparity.MissingComposedGates(gates); missing != nil {
+		o.declineComposedGates(cycle, cs, "Orchestrator.identityCarryForward", "identity carry", missing, outcomes)
+		return false
+	}
+	patchID, err := identityPatchID(audited)
+	if err != nil {
+		return decline("patch-id: %v", err)
+	}
+	in := CompositionVerdictInput{
+		Cycle: cycle, Method: identicalRebaseMethod, LaneAuditRef: audit.ArtifactSHA256, PatchID: patchID,
+		AuditedBase: base0, GitHead: base1, TreeStateSHA: tree1, AuditedTreeSHA: tree0, GateResults: gates,
+		AuditedDiff: audited, ComposedDiff: composed,
+	}
+	if err := o.compositionVerdictWriter(filepath.Join(projectRoot, ".evolve", "ledger.jsonl"), in); err != nil {
+		return decline("carry record: %v", err)
+	}
+	fmt.Fprintf(o.errOut(), "[orchestrator] cycle %d rebase is byte-identical: the audited verdict carries, shipping without a second audit (ADR-0105 B3)\n", cycle)
+	return true
+}
+
+func (o *Orchestrator) carriedAudit(ctx context.Context, runID, base0 string) (auditledger.Entry, error) {
+	audit, err := o.latestAuditEntry(ctx, runID)
+	if err != nil || audit.WorktreeTreeSHA == "" || audit.ArtifactSHA256 == "" {
+		return audit, fmt.Errorf("no auditor row names both the tree and the artifact (err=%v)", err)
+	}
+	switch bound := audit.AuditedBase(); bound {
+	case "":
+		return audit, errors.New("the audit row names no base")
+	case base0:
+		return audit, nil
+	default:
+		return audit, fmt.Errorf("the audited worktree stood on %s, not on the base %s the change was authored on", bound, base0)
+	}
+}
+
+func (o *Orchestrator) gatesOnIntactTree(ctx context.Context, worktree, tree string) (map[string]string, map[string]ciparity.GateOutcome, bool) {
+	fence := treefence.Begin(ctx, worktree, true)
+	gates, outcomes := o.runGateSet(ctx, worktree)
+	outcome := fence.End(ctx)
+	if outcome.TakeErr != nil || outcome.RestoreErr != nil || len(outcome.Restored) > 0 {
+		return nil, nil, false
+	}
+	after, err := gitStdout(ctx, gitCapture, worktree, "write-tree")
+	if err != nil || after != tree {
+		return nil, nil, false
+	}
+	return gates, outcomes, true
+}

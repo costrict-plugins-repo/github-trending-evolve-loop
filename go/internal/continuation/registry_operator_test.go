@@ -1,0 +1,118 @@
+package continuation
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestListRegistryEntries(t *testing.T) {
+	t.Run("absent registry is empty, not an error", func(t *testing.T) {
+		got, err := ListRegistryEntries(t.TempDir())
+		if err != nil {
+			t.Fatalf("ListRegistryEntries on a project with no registry: %v", err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("want no bindings, got %d: %v", len(got), got)
+		}
+	})
+
+	t.Run("returns every bound scope", func(t *testing.T) {
+		root := t.TempDir()
+		a := Continuation{SnapshotSHA: "aaa1", Branch: "cycle-1484", BaseSHA: "b1", Cycle: 1484}
+		b := Continuation{SnapshotSHA: "bbb2", Branch: "cycle-1490", BaseSHA: "b2", Cycle: 1490}
+		if err := WriteRegistryEntry(root, "scope-a", a); err != nil {
+			t.Fatalf("bind scope-a: %v", err)
+		}
+		if err := WriteRegistryEntry(root, "scope-b", b); err != nil {
+			t.Fatalf("bind scope-b: %v", err)
+		}
+		got, err := ListRegistryEntries(root)
+		if err != nil {
+			t.Fatalf("ListRegistryEntries: %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("want 2 bindings, got %d: %v", len(got), got)
+		}
+		if got["scope-a"].SnapshotSHA != a.SnapshotSHA || got["scope-a"].Cycle != a.Cycle {
+			t.Errorf("scope-a round-trip lost data: %+v", got["scope-a"])
+		}
+		if got["scope-b"].SnapshotSHA != b.SnapshotSHA {
+			t.Errorf("scope-b round-trip lost data: %+v", got["scope-b"])
+		}
+	})
+}
+
+func TestRedactHostPaths(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		t.Skipf("no resolvable home dir in this environment: %v", err)
+	}
+	in := Continuation{
+		Worktree:     filepath.Join(home, "ai", "claude", "evolve-loop-runtime", ".evolve", "worktrees", "cycle-1"),
+		FindingsPath: filepath.Join(home, "runs", "audit-fail-reason.json"),
+		Branch:       "cycle-1484",
+		SnapshotSHA:  "9813bc621fe4aa0d",
+		BaseSHA:      "d3c69cd2aa11bb22",
+		Cycle:        1484,
+	}
+	got := RedactHostPaths(in)
+
+	if strings.Contains(got.Worktree, home) {
+		t.Errorf("Worktree still carries the host home path %q: %q", home, got.Worktree)
+	}
+	if strings.Contains(got.FindingsPath, home) {
+		t.Errorf("FindingsPath still carries the host home path %q: %q", home, got.FindingsPath)
+	}
+	wantWorktree := "~" + string(filepath.Separator) + filepath.Join("ai", "claude", "evolve-loop-runtime", ".evolve", "worktrees", "cycle-1")
+	if got.Worktree != wantWorktree {
+		t.Errorf("Worktree = %q, want %q", got.Worktree, wantWorktree)
+	}
+	if got.SnapshotSHA != in.SnapshotSHA || got.BaseSHA != in.BaseSHA || got.Branch != in.Branch || got.Cycle != in.Cycle {
+		t.Errorf("redaction altered a salvage ref: %+v (want snapshot/base/branch/cycle from %+v)", got, in)
+	}
+
+	t.Run("a path outside the home dir is untouched", func(t *testing.T) {
+		out := RedactHostPaths(Continuation{Worktree: "/srv/shared/worktree", FindingsPath: "relative/findings.json"})
+		if out.Worktree != "/srv/shared/worktree" || out.FindingsPath != "relative/findings.json" {
+			t.Errorf("non-home paths were rewritten: %+v", out)
+		}
+	})
+}
+
+func TestExpandHostPaths_InvertsRedactionAndLeavesOtherPathsVerbatim(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	in := Continuation{
+		Worktree:     filepath.Join(home, "wt", "cycle-1"),
+		FindingsPath: filepath.Join(home, "runs", "audit-fail-reason.json"),
+		Branch:       "cycle-1",
+		SnapshotSHA:  "9813bc621fe4aa0d",
+		Cycle:        1,
+	}
+	if got := ExpandHostPaths(RedactHostPaths(in)); got != in {
+		t.Errorf("ExpandHostPaths(RedactHostPaths(c)) = %+v, want %+v", got, in)
+	}
+	other := Continuation{Worktree: "/srv/shared/worktree", FindingsPath: "relative/~/findings.json"}
+	if got := ExpandHostPaths(other); got != other {
+		t.Errorf("non-tilde paths were rewritten: %+v", got)
+	}
+}
+
+func TestReadManifest_RedactsHostPaths(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	ws := t.TempDir()
+	c := Continuation{Worktree: filepath.Join(home, "wt"), FindingsPath: filepath.Join(home, "f.json"), SnapshotSHA: "abc", Cycle: 2}
+	if err := WriteManifest(ws, c); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := ReadManifest(ws)
+	if err != nil || !ok {
+		t.Fatalf("ReadManifest: ok=%v err=%v", ok, err)
+	}
+	if want := RedactHostPaths(c); got != want {
+		t.Errorf("ReadManifest = %+v, want the redacted %+v", got, want)
+	}
+}

@@ -1,0 +1,40 @@
+{
+  "name": "incident-postmortem",
+  "catalog": "on-demand",
+  "archetype": "evaluate",
+  "optional": true,
+  "description": "Structured 4-section debrief to prevent incident recurrence when root causes go unrecorded.",
+  "when_to_use": "When an incident recurs because the root cause was previously unrecorded.",
+  "categories": [
+    "bugfix",
+    "security"
+  ],
+  "inputs": {},
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/incident-postmortem-report.md"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Impact",
+      "Timeline",
+      "Root Cause",
+      "Action Items"
+    ],
+    "verdict_on_pass": "PASS",
+    "require_failure_context": true
+  },
+  "routing": {
+    "insert_when": [],
+    "skip_when": [
+      {
+        "field": "deliverable_kind",
+        "op": "eq",
+        "value": "document"
+      }
+    ]
+  },
+  "gates": {},
+  "after": "build"
+}

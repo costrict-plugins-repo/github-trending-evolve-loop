@@ -1,0 +1,134 @@
+package audit
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/config"
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+	"github.com/mickeyyaya/evolve-loop/go/internal/deliverable"
+	"github.com/mickeyyaya/evolve-loop/go/internal/phases/runner"
+	"github.com/mickeyyaya/evolve-loop/go/internal/signalcenter"
+)
+
+func TestNewDefaultWithStage_NamedPhase(t *testing.T) {
+	t.Parallel()
+	br := &fakeBridge{}
+	prm := fakePromptsFS("# Auditor body")
+
+	var enforce *Phase = NewDefaultWithStage(br, prm, config.StageEnforce)
+	if enforce == nil {
+		t.Fatal("NewDefaultWithStage must return a non-nil *Phase")
+	}
+	var _ core.PhaseRunner = enforce
+	if got := enforce.Name(); got != string(core.PhaseAudit) {
+		t.Fatalf("Name() = %q, want %q", got, core.PhaseAudit)
+	}
+
+	off := NewDefaultWithStage(br, prm, config.StageOff)
+	if off == nil || off.Name() != string(core.PhaseAudit) {
+		t.Fatalf("StageOff NewDefaultWithStage Name() = %q, want audit", off.Name())
+	}
+
+	prose := "## Verdict\n**PASS**\n"
+	if v, found := extractAuditVerdict(prose, config.StageOff); !found || v != core.VerdictPASS {
+		t.Errorf("StageOff: prose verdict = (%q,%v), want (PASS,true)", v, found)
+	}
+	if v, found := extractAuditVerdict(prose, config.StageEnforce); found {
+		t.Errorf("StageEnforce: prose-only report must be unparseable (sentinel mandatory), got (%q,%v)", v, found)
+	}
+}
+
+func TestNewDefaultWithStageCompact_NamedPhase(t *testing.T) {
+	t.Parallel()
+	var compactPhase *Phase = NewDefaultWithStageCompact(&fakeBridge{}, fakePromptsFS("# Auditor body"), config.StageEnforce, true)
+	if compactPhase == nil {
+		t.Fatal("NewDefaultWithStageCompact must return a non-nil *Phase")
+	}
+	var _ core.PhaseRunner = compactPhase
+	if got := compactPhase.Name(); got != string(core.PhaseAudit) {
+		t.Fatalf("Name() = %q, want %q", got, core.PhaseAudit)
+	}
+
+	const body = "# Auditor body\n\n## Reference Index (Layer 3, on-demand)\n\n- tail-only reference content\n"
+	dispatchedPrompt := func(compact bool) string {
+		fb := &fakeBridge{writeArtifact: "## Verdict\n**PASS**\n"}
+		ph := New(Config{Bridge: fb, Prompts: fakePromptsFS(body), CompactPrompts: compact})
+		if _, err := ph.Run(context.Background(), core.PhaseRequest{
+			Cycle: 1, ProjectRoot: t.TempDir(), Worktree: t.TempDir(), Workspace: t.TempDir(),
+		}); err != nil {
+			t.Fatalf("Run(compact=%v): %v", compact, err)
+		}
+		return fb.gotReq.Prompt
+	}
+
+	full := dispatchedPrompt(false)
+	if !strings.Contains(full, "Auditor body") {
+		t.Fatalf("compact=false must keep the body; dispatched prompt=%q", full)
+	}
+	if !strings.Contains(full, "Reference Index") || !strings.Contains(full, "tail-only reference content") {
+		t.Fatalf("compact=false must keep the on-demand tail; dispatched prompt=%q", full)
+	}
+
+	stripped := dispatchedPrompt(true)
+	if !strings.Contains(stripped, "Auditor body") {
+		t.Fatalf("compact=true must keep the body above the tail; dispatched prompt=%q", stripped)
+	}
+	if strings.Contains(stripped, "Reference Index") || strings.Contains(stripped, "tail-only reference content") {
+		t.Fatalf("compact=true must strip the on-demand tail before dispatch; dispatched prompt=%q", stripped)
+	}
+}
+
+func TestWithSignals_NamedOptionReachesTheGates(t *testing.T) {
+	t.Parallel()
+	var opt Option = WithSignals(func() *signalcenter.Center { return signalcenter.New() })
+	var cfg Config
+	opt(&cfg)
+	if cfg.Signals == nil || cfg.Signals() == nil {
+		t.Fatal("WithSignals stores the accessor on the Config")
+	}
+	if !New(cfg).SignalsWired() {
+		t.Fatal("a Config with Signals builds a Phase whose gates reach the Center")
+	}
+	if NewDefaultWithStageCompactSpec(&fakeBridge{}, fakePromptsFS("body"), config.StageOff, false, nil).SignalsWired() {
+		t.Fatal("without the option the gates are the Null Object")
+	}
+}
+
+type noHostEffects struct{}
+
+func (noHostEffects) Perform(context.Context, core.ReviewInput) error { return nil }
+
+func TestWithHostEffects_NamedOptionReachesTheEngine(t *testing.T) {
+	t.Parallel()
+	var opt Option = WithHostEffects(func() core.HostEffects { return noHostEffects{} })
+	var cfg Config
+	opt(&cfg)
+	if cfg.HostEffects == nil || cfg.HostEffects() != (noHostEffects{}) {
+		t.Fatal("WithHostEffects stores the accessor on the Config")
+	}
+	if !New(cfg).HostEffectsWired() {
+		t.Fatal("a Config with HostEffects builds a Phase whose engine performs them")
+	}
+	if NewDefaultWithStageCompactSpec(&fakeBridge{}, fakePromptsFS("body"), config.StageOff, false, nil).HostEffectsWired() {
+		t.Fatal("without the option the engine performs no host effects")
+	}
+}
+
+func TestWithContractVerifier_NamedOptionReachesTheEngine(t *testing.T) {
+	t.Parallel()
+	verifier := deliverable.PlainVerifier{PhaseIO: config.StageOff}
+	var opt Option = WithContractVerifier(func() runner.ContractVerifier { return verifier })
+	var cfg Config
+	opt(&cfg)
+	if cfg.ContractVerifier == nil || cfg.ContractVerifier() != verifier {
+		t.Fatal("WithContractVerifier stores the accessor on the Config")
+	}
+	if !New(cfg).ContractVerifierWired() {
+		t.Fatal("a Config with ContractVerifier builds a Phase whose engine verifies through it")
+	}
+	if NewDefaultWithStageCompactSpec(&fakeBridge{}, fakePromptsFS("body"), config.StageOff, false, nil).ContractVerifierWired() {
+		t.Fatal("without the option the engine keeps its catalog-aware default")
+	}
+}

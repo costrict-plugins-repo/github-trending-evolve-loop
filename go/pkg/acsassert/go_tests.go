@@ -1,0 +1,214 @@
+package acsassert
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"regexp"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/ipcenv"
+	"github.com/mickeyyaya/evolve-loop/go/internal/sysexec"
+)
+
+type goTestEvent struct {
+	Action  string
+	Package string
+	Test    string
+}
+
+type GoTestSpec struct {
+	Dir, Package, Pattern string
+	Names                 []string
+	Race                  bool
+	Tags                  string
+}
+
+func GoTests(tb TB, spec GoTestSpec) bool {
+	tb.Helper()
+	if unlisted := unlistedExactNames(spec.Pattern, spec.Names); len(unlisted) > 0 {
+		tb.Errorf("go test pattern %q names %v, which Names does not list: a name outside Names is never checked for a pass", spec.Pattern, unlisted)
+		return false
+	}
+	args := append(append([]string{"test", "-json", "-count=1", "-v"}, buildFlags(spec)...), "-run", spec.Pattern, spec.Package)
+	ctx, cancel := callerDeadline(tb)
+	defer cancel()
+	importPath, err := resolveImportPath(ctx, spec)
+	if err != nil {
+		tb.Errorf("%v", err)
+		return false
+	}
+	out, stderr, code, err := sysexec.Capture(ctx, goTestRunner(), spec.Dir, "go", args...)
+	if err != nil || code != 0 {
+		tb.Errorf("go %v exited %d (err=%v)\nstdout:\n%s\nstderr:\n%s", args, code, err, out, stderr)
+		return false
+	}
+	if err := validateGoTests(out, importPath, spec.Names); err != nil {
+		tb.Errorf("go %v: %v\nstdout:\n%s\nstderr:\n%s", args, err, out, stderr)
+		return false
+	}
+	return true
+}
+
+func callerDeadline(tb TB) (context.Context, context.CancelFunc) {
+	if caller, ok := tb.(interface{ Deadline() (time.Time, bool) }); ok {
+		if deadline, set := caller.Deadline(); set {
+			return context.WithDeadline(context.Background(), deadline)
+		}
+	}
+	return context.WithCancel(context.Background())
+}
+
+func goTestRunner() sysexec.RunFunc {
+	return sysexec.WithEnv(sysexec.DefaultRunner, ipcenv.GoTestEnv())
+}
+
+func buildFlags(spec GoTestSpec) []string {
+	var flags []string
+	if spec.Race {
+		flags = append(flags, "-race")
+	}
+	if spec.Tags != "" {
+		flags = append(flags, "-tags", spec.Tags)
+	}
+	return flags
+}
+
+func resolveImportPath(ctx context.Context, spec GoTestSpec) (string, error) {
+	args := append(append([]string{"list", "-f", "{{.ImportPath}}"}, buildFlags(spec)...), spec.Package)
+	out, stderr, code, err := sysexec.Capture(ctx, goTestRunner(), spec.Dir, "go", args...)
+	path := strings.TrimSpace(out)
+	if err != nil || code != 0 || path == "" || strings.Contains(path, "\n") {
+		return "", fmt.Errorf("go list cannot resolve package %q to one import path: exit %d (err=%v)\nstdout:\n%s\nstderr:\n%s", spec.Package, code, err, out, stderr)
+	}
+	return path, nil
+}
+
+type goTestRun struct {
+	packageName       string
+	states            map[string]string
+	started, finished bool
+}
+
+func newGoTestRun(pkg string, names []string) (*goTestRun, error) {
+	if pkg == "" || len(names) == 0 {
+		return nil, fmt.Errorf("go test package and expected cases must be nonempty")
+	}
+	run := &goTestRun{packageName: pkg, states: make(map[string]string, len(names))}
+	for _, name := range names {
+		if _, duplicate := run.states[name]; name == "" || duplicate {
+			return nil, fmt.Errorf("empty or duplicate Go test identity %q", name)
+		}
+		run.states[name] = ""
+	}
+	return run, nil
+}
+
+func validateGoTests(output, pkg string, names []string) error {
+	run, err := newGoTestRun(pkg, names)
+	if err != nil {
+		return err
+	}
+	decoder := json.NewDecoder(strings.NewReader(output))
+	for {
+		var event goTestEvent
+		if err := decoder.Decode(&event); err == io.EOF {
+			break
+		} else if err != nil {
+			return fmt.Errorf("decode Go test event: %w", err)
+		}
+		if err := run.consume(event); err != nil {
+			return err
+		}
+	}
+	if !run.finished {
+		return fmt.Errorf("go package did not complete successfully: %s", pkg)
+	}
+	for _, name := range names {
+		if run.states[name] != "pass" {
+			return fmt.Errorf("required Go test did not execute and pass: %s", name)
+		}
+	}
+	return nil
+}
+
+func (r *goTestRun) consume(event goTestEvent) error {
+	if event.Package != r.packageName {
+		return nil
+	}
+	if event.Action == "fail" {
+		return fmt.Errorf("go test failure: %s/%s", event.Package, event.Test)
+	}
+	if r.finished {
+		return fmt.Errorf("go test event after package completion: %s", event.Action)
+	}
+	if event.Test == "" {
+		return r.packageEvent(event.Action)
+	}
+	state, required := r.states[event.Test]
+	if !required {
+		return nil
+	}
+	switch event.Action {
+	case "run":
+		if !r.started || state != "" {
+			return fmt.Errorf("unexpected Go test start: %s", event.Test)
+		}
+		r.states[event.Test] = "run"
+	case "pass":
+		if state != "run" {
+			return fmt.Errorf("go test passed without one active execution: %s", event.Test)
+		}
+		r.states[event.Test] = "pass"
+	case "skip":
+		return fmt.Errorf("required Go test skipped: %s", event.Test)
+	}
+	return nil
+}
+
+func (r *goTestRun) packageEvent(action string) error {
+	switch action {
+	case "start":
+		if r.started {
+			return fmt.Errorf("duplicate Go package start: %s", r.packageName)
+		}
+		r.started = true
+	case "pass":
+		if !r.started {
+			return fmt.Errorf("go package passed before starting: %s", r.packageName)
+		}
+		r.finished = true
+	case "skip":
+		return fmt.Errorf("go package skipped: %s", r.packageName)
+	}
+	return nil
+}
+
+var (
+	exactTermRE = regexp.MustCompile(`\^(?:\((\w+(?:\|\w+)*)\)|(\w+))\$`)
+	termListRE  = regexp.MustCompile(`^\x00(?:\|\x00)*$`)
+)
+
+func exactNames(pattern string) []string {
+	if !termListRE.MatchString(exactTermRE.ReplaceAllString(pattern, "\x00")) {
+		return nil
+	}
+	var names []string
+	for _, term := range exactTermRE.FindAllStringSubmatch(pattern, -1) {
+		names = append(names, strings.Split(term[1]+term[2], "|")...)
+	}
+	return names
+}
+
+func unlistedExactNames(pattern string, names []string) []string {
+	var unlisted []string
+	for _, name := range exactNames(pattern) {
+		if !slices.Contains(names, name) {
+			unlisted = append(unlisted, name)
+		}
+	}
+	return unlisted
+}

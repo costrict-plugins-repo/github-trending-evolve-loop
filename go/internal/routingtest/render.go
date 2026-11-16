@@ -1,0 +1,150 @@
+package routingtest
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/router"
+)
+
+func (s SignalSpec) scoutPresent() bool {
+	return s.CycleSize != "" || s.ScoutItemCount > 0 || s.ScoutCarryover > 0 || s.ScoutBacklog > 0 || s.ArtifactBytes > 0 || s.GoalType != "" || s.DeliverableKind != ""
+}
+func (s SignalSpec) triagePresent() bool { return s.TriageSize != "" || s.TriageDeliverableKind != "" }
+func (s SignalSpec) buildPresent() bool {
+	return s.BuildVerdict != "" || s.ACSRed > 0 || s.ACSGreen > 0 || s.ACSRegression > 0 ||
+		s.SeverityMax != "" || s.FilesTouched > 0 || s.DiffLOC > 0
+}
+func (s SignalSpec) auditPresent() bool {
+	return s.AuditVerdict != "" || s.AuditConf > 0 || s.AuditRedCount > 0
+}
+
+func (s SignalSpec) Signals() router.RoutingSignals {
+	var sig router.RoutingSignals
+	if s.scoutPresent() {
+		sig.Scout = router.ScoutSignals{
+			CycleSizeEstimate: s.CycleSize,
+			GoalType:          s.GoalType,
+			DeliverableKind:   s.DeliverableKind,
+			ItemCount:         s.ScoutItemCount,
+			CarryoverCount:    s.ScoutCarryover,
+			BacklogSize:       s.ScoutBacklog,
+			ArtifactBytes:     s.ArtifactBytes,
+			Present:           true,
+		}
+	}
+	if s.triagePresent() {
+		sig.Triage = router.TriageSignals{CycleSize: s.TriageSize, DeliverableKind: s.TriageDeliverableKind, Present: true}
+	}
+	if s.buildPresent() {
+		sig.Build = router.BuildSignals{
+			Verdict:       s.BuildVerdict,
+			ACSGreen:      s.ACSGreen,
+			ACSRed:        s.ACSRed,
+			ACSRegression: s.ACSRegression,
+			SeverityMax:   router.ParseSeverity(s.SeverityMax),
+			FilesTouched:  s.FilesTouched,
+			DiffLOC:       s.DiffLOC,
+			Present:       true,
+		}
+	}
+	if s.auditPresent() {
+		sig.Audit = router.AuditSignals{
+			Verdict:           s.AuditVerdict,
+			Confidence:        s.AuditConf,
+			RedCount:          s.AuditRedCount,
+			DefectsBySeverity: map[router.Severity]int{},
+			Present:           true,
+		}
+	}
+	return sig
+}
+
+func (s SignalSpec) HandoffFiles() map[string]string {
+	out := map[string]string{}
+	if s.scoutPresent() {
+		out["handoff-scout.json"] = mustJSON(s.scoutHandoff())
+	}
+	if s.triagePresent() {
+		tr := map[string]interface{}{"cycle_size": s.TriageSize}
+		if s.TriageDeliverableKind != "" {
+			tr["deliverable_kind"] = s.TriageDeliverableKind
+		}
+		out["handoff-triage.json"] = mustJSON(tr)
+	}
+	if s.buildPresent() {
+		acs := map[string]interface{}{
+			"green": s.ACSGreen, "red": s.ACSRed, "regression": s.ACSRegression,
+		}
+		m := map[string]interface{}{"verdict": s.BuildVerdict, "acs_result": acs}
+		if s.DiffLOC > 0 {
+			m["diff_loc"] = s.DiffLOC
+		}
+		if s.SeverityMax != "" || s.FilesTouched > 0 {
+			files := make([]string, 0, s.FilesTouched)
+			for i := 0; i < s.FilesTouched; i++ {
+				files = append(files, fmt.Sprintf("f%d.go", i))
+			}
+			m["thrusts"] = []map[string]interface{}{
+				{"severity": s.SeverityMax, "files_modified": files},
+			}
+		}
+		out["handoff-build.json"] = mustJSON(m)
+	}
+	if s.auditPresent() {
+		out["handoff-audit.json"] = mustJSON(map[string]interface{}{
+			"verdict": s.AuditVerdict, "confidence": s.AuditConf, "red_count": s.AuditRedCount,
+		})
+	}
+	return out
+}
+
+func (s SignalSpec) scoutHandoff() map[string]interface{} {
+	m := map[string]interface{}{}
+	if s.CycleSize != "" {
+		m["cycle_size_estimate"] = s.CycleSize
+	}
+	if s.ScoutCarryover > 0 {
+		m["carryover_count"] = s.ScoutCarryover
+	}
+	if s.ScoutBacklog > 0 {
+		m["backlog_size"] = s.ScoutBacklog
+	}
+	if s.ArtifactBytes > 0 {
+		m["run_dir.artifact_bytes"] = s.ArtifactBytes
+	}
+	if s.GoalType != "" {
+		m["goal_type"] = s.GoalType
+	}
+	if s.DeliverableKind != "" {
+		m["deliverable_kind"] = s.DeliverableKind
+	}
+	for i := 1; i <= s.ScoutItemCount; i++ {
+		m[fmt.Sprintf("item%d_scope", i)] = "x"
+	}
+	return m
+}
+
+func (s SignalSpec) WrappedHandoffFiles() map[string]string {
+	flat := s.HandoffFiles()
+	out := make(map[string]string, len(flat))
+	for name, body := range flat {
+		phase := strings.TrimSuffix(strings.TrimPrefix(name, "handoff-"), ".json")
+		out[name] = mustJSON(map[string]interface{}{
+			"schema_version": 2,
+			"phase":          phase,
+			"payload":        json.RawMessage(body),
+			"signals":        map[string]interface{}{},
+		})
+	}
+	return out
+}
+
+func mustJSON(v interface{}) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}

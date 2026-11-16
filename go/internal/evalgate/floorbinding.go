@@ -1,0 +1,130 @@
+package evalgate
+
+import (
+	"cmp"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+	"github.com/mickeyyaya/evolve-loop/go/internal/triagecap"
+)
+
+type floorBindingGate struct{}
+
+func (floorBindingGate) name() string                { return "floor-binding" }
+func (floorBindingGate) appliesTo(phase string) bool { return phase == string(core.PhaseTDD) }
+
+func (floorBindingGate) check(in core.ReviewInput) (string, bool) {
+	cycle := cycleNumFromWorkspace(in.Workspace)
+	if cycle <= 0 || in.Worktree == "" {
+		return "", false
+	}
+	predPath := filepath.Join(cyclePredicateDir(in.Worktree, cycle), "predicates_test.go")
+	targets := floorPredicateTargets(predPath)
+	if len(targets) == 0 {
+		return "", false
+	}
+	artifact, err := os.ReadFile(filepath.Join(in.Workspace, triagecap.TriageArtifactName()))
+	if err != nil {
+		return "", false
+	}
+	companionPath := filepath.Join(in.Workspace, triagecap.TriageDecisionName())
+	deferred := triagecap.DeferredFloorPackagesDecl(string(artifact), companionPath, targets)
+	_, deferredDeclared, deferredErr := triagecap.ReadDeferredFloors(companionPath)
+	_, committedDeclared, committedErr := triagecap.ReadDeclaredFloors(companionPath)
+	if err := cmp.Or(deferredErr, committedErr); err != nil {
+		return fmt.Sprintf(
+			"triage companion %s is unreadable or malformed (%v) — the floor-binding gate cannot tell committed floors from deferred ones; rewrite %s as valid JSON whose committed_floors/deferred_floors are string arrays",
+			companionPath, err, triagecap.TriageDecisionName()), true
+	}
+	if !deferredDeclared || committedDeclared {
+		if committed := triagecap.CommittedFloorPackages(string(artifact), companionPath, targets); len(committed) > 0 {
+			committedSet := map[string]bool{}
+			for _, pkg := range committed {
+				committedSet[pkg] = true
+			}
+			kept := deferred[:0:0]
+			for _, pkg := range deferred {
+				if !committedSet[pkg] {
+					kept = append(kept, pkg)
+				}
+			}
+			deferred = kept
+		}
+	}
+	if len(deferred) == 0 {
+		return "", false
+	}
+	return fmt.Sprintf(
+		"floor predicate(s) bind package(s) triage deferred/dropped this cycle: %s — EGPS floor predicates may bind ONLY committed (## top_n) floors; drop these predicates or re-commit the floors",
+		strings.Join(deferred, ", ")), true
+}
+
+var cycleDirRE = regexp.MustCompile(`^cycle-(\d+)$`)
+
+func cycleNumFromWorkspace(workspace string) int {
+	m := cycleDirRE.FindStringSubmatch(filepath.Base(workspace))
+	if m == nil {
+		return 0
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+var pkgPathLitRE = regexp.MustCompile(`^\.?/?(?:internal|cmd|go)(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)+/?$`)
+
+var floorNameRE = regexp.MustCompile(`(?i)coverage|floor`)
+
+func floorPredicateTargets(predPath string) []string {
+	src, err := os.ReadFile(predPath)
+	if err != nil {
+		return nil
+	}
+	f, err := parser.ParseFile(token.NewFileSet(), predPath, src, 0)
+	if err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	for _, decl := range f.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil || !strings.HasPrefix(fn.Name.Name, "Test") || !floorNameRE.MatchString(fn.Name.Name) {
+			continue
+		}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			lit, ok := n.(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				return true
+			}
+			s, uerr := strconv.Unquote(lit.Value)
+			if uerr != nil {
+				return true
+			}
+			s = strings.TrimSuffix(s, "/...")
+			if !pkgPathLitRE.MatchString(s) {
+				return true
+			}
+			seen[filepath.Base(strings.TrimRight(s, "/"))] = true
+			return true
+		})
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+	targets := make([]string, 0, len(seen))
+	for p := range seen {
+		targets = append(targets, p)
+	}
+	sort.Strings(targets)
+	return targets
+}

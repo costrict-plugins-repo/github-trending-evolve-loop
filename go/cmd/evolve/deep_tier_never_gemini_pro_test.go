@@ -1,0 +1,147 @@
+package main
+
+import (
+	"slices"
+	"strings"
+	"testing"
+
+	gobridge "github.com/mickeyyaya/evolve-loop/go/internal/bridge"
+	"github.com/mickeyyaya/evolve-loop/go/internal/cliroute"
+	"github.com/mickeyyaya/evolve-loop/go/internal/cliroute/cliroutetest"
+	"github.com/mickeyyaya/evolve-loop/go/internal/modelquery"
+	"github.com/mickeyyaya/evolve-loop/go/internal/profiles"
+)
+
+func isGeminiPro(model string) bool {
+	return modelquery.FamilyOf(model) == "gemini" && strings.Contains(strings.ToLower(model), " pro")
+}
+
+func everyBinaryInstalledRouter(t *testing.T) *cliroute.Router {
+	t.Helper()
+	pol, root := checkedInPolicy(t)
+	installed := []gobridge.DoctorResult{
+		doctorResult("claude-tmux", true, "ready"), doctorResult("codex-tmux", true, "ready"),
+		doctorResult("agy-tmux", true, "ready"), doctorResult("ollama-tmux", true, "ready"),
+	}
+	r, _, err := cliroute.Build(cliroute.Setup{
+		Policy: pol, Profiles: profiles.NewFromDir(root + "/.evolve/profiles"),
+		Host: cliroute.Host{LookPath: func(string) (string, error) { return "/fake", nil }, Discover: func() []string { return universalFallbackTail(installed) }},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	return r
+}
+
+func geminiProEntries(t *testing.T, chain []string, tier string) []string {
+	t.Helper()
+	var hits []string
+	for _, driver := range chain {
+		m, err := gobridge.LoadManifest(driver)
+		if err != nil {
+			t.Errorf("chain entry %s has no manifest: %v", driver, err)
+			continue
+		}
+		if model := m.ModelTierMap[tier]; isGeminiPro(model) {
+			hits = append(hits, driver+"="+model)
+		}
+	}
+	return hits
+}
+
+func modelFamilyAt(t *testing.T, driver, tier string) string {
+	t.Helper()
+	m, err := gobridge.LoadManifest(driver)
+	if err != nil {
+		t.Errorf("chain entry %s has no manifest: %v", driver, err)
+		return ""
+	}
+	return modelquery.FamilyOf(m.ModelTierMap[tier])
+}
+
+func resolvedChain(t *testing.T, r *cliroute.Router, req cliroute.Request) []string {
+	t.Helper()
+	d, err := r.Resolve(req)
+	if err != nil {
+		t.Fatalf("Resolve(%s, launch %q): %v", req.Agent, req.Launch, err)
+	}
+	return d.Plan.Candidates
+}
+
+func permittedChain(t *testing.T, r *cliroute.Router, req cliroute.Request, tier string) []string {
+	t.Helper()
+	d, err := r.Resolve(req)
+	if err != nil {
+		t.Fatalf("Resolve(%s): %v", req.Agent, err)
+	}
+	var permitted []string
+	for _, cli := range d.Plan.Candidates {
+		if d.Plan.Permits(cli, tier) {
+			permitted = append(permitted, cli)
+		}
+	}
+	return permitted
+}
+
+func TestDeepAndTopProfiles_NoChainEntryResolvesTheirTierToAGeminiProModel(t *testing.T) {
+	t.Setenv("EVOLVE_PROJECT_ROOT", t.TempDir())
+	profileDir, agents := cliroutetest.TrackedProfiles(t)
+	loader := profiles.NewFromDir(profileDir)
+	r := everyBinaryInstalledRouter(t)
+	checked := 0
+	for _, name := range agents {
+		p, err := loader.Get(name)
+		if err != nil || (p.ModelTierDefault != "deep" && p.ModelTierDefault != "top") {
+			continue
+		}
+		checked++
+		if hits := geminiProEntries(t, slices.Concat([]string{p.CLI}, p.CLIFallback), p.ModelTierDefault); len(hits) > 0 {
+			t.Errorf("%s's own chain runs %v at %s: deep and top work never runs a Gemini Pro model (operator rule 2026-10-06; Gemini 4 Argon allowed since 2026-10-16)", name, hits, p.ModelTierDefault)
+		}
+		chain := permittedChain(t, r, cliroute.Request{Agent: name, Phase: cliroutetest.PhaseOf(name), ProjectRoot: t.TempDir()}, p.ModelTierDefault)
+		if hits := geminiProEntries(t, chain, p.ModelTierDefault); len(hits) > 0 {
+			t.Errorf("%s resolves to %v at %s, which reaches %v: the cli_routing tiers.%s ceiling must keep Gemini Pro models off deep and top work (Gemini 4 Argon is allowed)", name, chain, p.ModelTierDefault, hits, p.ModelTierDefault)
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no deep or top profile was checked: the guard lost its corpus")
+	}
+}
+
+func TestRouter_EveryLaunchOfTheAdvisorStaysOnClaudeModels(t *testing.T) {
+	t.Setenv("EVOLVE_PROJECT_ROOT", t.TempDir())
+	r := everyBinaryInstalledRouter(t)
+	const tier = "deep"
+	for _, req := range []cliroute.Request{
+		{Agent: "router", Phase: cliroutetest.PhaseOf("router"), ProjectRoot: t.TempDir()},
+		{Agent: "router", Launch: cliroute.LaunchAdvisor, ProjectRoot: t.TempDir()},
+	} {
+		chain := resolvedChain(t, r, req)
+		if len(chain) == 0 {
+			t.Errorf("router (launch %q) resolves to no CLI: the advisor must keep a Claude seat", req.Launch)
+		}
+		for _, driver := range chain {
+			if family := modelFamilyAt(t, driver, tier); family != "claude" {
+				t.Errorf("router (launch %q) resolves to %v, and %s runs a %q model at %s: every advisor seat runs a Claude model, with no codex and no Gemini tail", req.Launch, chain, driver, family, tier)
+			}
+		}
+	}
+}
+
+func TestModelFamilyAt_ReadsTheFamilyOfEachDriversTierModel(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ driver, want string }{
+		{"claude-tmux", "claude"}, {"agy-claude-tmux", "claude"}, {"agy-tmux", "gemini"}, {"codex-tmux", "gpt"},
+	} {
+		if got := modelFamilyAt(t, tc.driver, "deep"); got != tc.want {
+			t.Errorf("modelFamilyAt(%s, deep) = %q, want %q", tc.driver, got, tc.want)
+		}
+	}
+}
+
+func TestIsGeminiPro_TellsTheAgyDisplayNamesApart(t *testing.T) {
+	t.Parallel()
+	if !isGeminiPro("Gemini 3.1 Pro (High)") || isGeminiPro("Gemini 3.8 Flash (High)") || isGeminiPro("Claude Opus 5.5 (High)") {
+		t.Fatal("isGeminiPro misreads the agy display names it must tell apart")
+	}
+}

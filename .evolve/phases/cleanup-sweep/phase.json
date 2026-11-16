@@ -1,0 +1,39 @@
+{
+  "name": "cleanup-sweep",
+  "archetype": "evaluate",
+  "agent": "evolve-cleanup-sweep",
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/build-report.md"
+    ],
+    "signals": [
+      "scout.goal_type"
+    ]
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/cleanup-sweep-report.md"
+    ],
+    "signals": [
+      "deadcode.symbols",
+      "deadcode.unused_deps"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Dead Code Analysis",
+      "Unused Dependencies",
+      "Verdict"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "refactor"
+      }
+    ]
+  },
+  "after": "mutation-gate"
+}

@@ -1,0 +1,28 @@
+package ipcenv_test
+
+import (
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/ipcenv"
+)
+
+func TestIpcenv_ConstValues(t *testing.T) {
+	if ipcenv.FleetKey != "EVOLVE_FLEET" {
+		t.Errorf("FleetKey = %q, want %q", ipcenv.FleetKey, "EVOLVE_FLEET")
+	}
+	if ipcenv.FleetWidthKey != "EVOLVE_FLEET_WIDTH" {
+		t.Errorf("FleetWidthKey = %q, want %q", ipcenv.FleetWidthKey, "EVOLVE_FLEET_WIDTH")
+	}
+	if ipcenv.FleetScopeKey != "EVOLVE_FLEET_SCOPE" {
+		t.Errorf("FleetScopeKey = %q, want %q", ipcenv.FleetScopeKey, "EVOLVE_FLEET_SCOPE")
+	}
+	if ipcenv.WorktreeRootKey != "EVOLVE_WORKTREE_ROOT" {
+		t.Errorf("WorktreeRootKey = %q, want %q", ipcenv.WorktreeRootKey, "EVOLVE_WORKTREE_ROOT")
+	}
+	if ipcenv.FleetReachHolderKey != "EVOLVE_FLEET_REACH_HOLDER" {
+		t.Errorf("FleetReachHolderKey = %q, want %q", ipcenv.FleetReachHolderKey, "EVOLVE_FLEET_REACH_HOLDER")
+	}
+	if ipcenv.CycleStateFileKey != "EVOLVE_CYCLE_STATE_FILE" {
+		t.Errorf("CycleStateFileKey = %q, want %q", ipcenv.CycleStateFileKey, "EVOLVE_CYCLE_STATE_FILE")
+	}
+}

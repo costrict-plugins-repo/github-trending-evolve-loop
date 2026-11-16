@@ -1,0 +1,38 @@
+{
+  "name": "account-reconcile",
+  "catalog": "on-demand",
+  "archetype": "evaluate",
+  "agent": "evolve-account-reconcile",
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/scout-report.md"
+    ],
+    "signals": []
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/account-reconcile-report.md"
+    ],
+    "signals": [
+      "reconcile.unexplained_count"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "GL vs Source Balance",
+      "Reconciling Items",
+      "Adjustments",
+      "Sign-off"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "accounting-close"
+      }
+    ]
+  },
+  "after": "triage"
+}

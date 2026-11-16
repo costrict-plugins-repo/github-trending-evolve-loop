@@ -1,0 +1,229 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+
+# Node (if any tooling is added later)
+node_modules/
+
+# Smart Web Search cache (per-project, generated at runtime)
+.smart-search-cache/
+
+# Antigravity CLI (agy) per-project tracking — runtime state, created when agy
+# touches the project. Symlinks into ~/.gemini/config/projects/<UUID>.json.
+.antigravitycli/
+
+# Commit-gate review attestation (per-project runtime state). Written by the
+# /commit skill's gate (`evolve commit-gate run`, go/internal/commitgate/) and
+# verified at the commit chokepoint (`evolve ship --class manual`). Never
+# committed — it binds to the local tree SHA.
+.commit-gate/
+
+# Evolve Loop runtime state (generated per-project, not part of the plugin)
+# Ignore every direct child of .evolve/ ...
+# v8.21.0+: per-cycle git worktrees live at .evolve/worktrees/cycle-N — also
+# implicitly ignored by this rule. Worktrees are created by run-cycle.sh
+# and removed via its EXIT trap; they should never appear in commits.
+.evolve/*
+# Nested .evolve dirs only (e.g. runtime state created inside per-cycle
+# worktrees). v16.6 operator fix: was `**/.evolve/`, which also matched the
+# ROOT .evolve/ directory and dead-lettered every whitelist below (a directory
+# exclusion forbids re-including descendants) — new phase.json/agent.md/
+# profile files could only be staged with `git add -f`. Root .evolve/ is
+# governed by the `.evolve/*` ladder above + the explicit re-includes below.
+*/**/.evolve/
+# ... except the agent permission profiles, which ship with the plugin and are
+# required by scripts/subagent-run.sh for least-privilege subagent invocation.
+!.evolve/profiles/
+.evolve/profiles/*
+!.evolve/profiles/*.json
+!.evolve/profiles/*.md
+# ... but runtime-minted profile STUBS (empty cli, no persona pairing) must NOT ride
+# into tracking: TestSmoke_RealProfiles + TestRepoPersonaProfilePairing validate every
+# tracked profile, and the v22.13.0 release burned on exactly this (2026-08-04; same
+# class as the gate-wiring-proof stubs below). Dispatch reads them from DISK — leave
+# the files in place, just never track them until they satisfy the repo contracts.
+.evolve/profiles/ship-stage-hygiene-check.json
+.evolve/profiles/regression-predicate-precheck.json
+.evolve/profiles/ci-parity-preflight.json
+.evolve/profiles/defect-disposition-ledger.json
+.evolve/profiles/pre-audit-evidence-check.json
+# ... and except the directory marker for failure-lessons. Generated lesson
+# YAMLs (inst-L*.yaml) are per-project runtime state and remain ignored, but
+# the .keep marker ships so the directory exists in fresh installs.
+!.evolve/instincts/
+.evolve/instincts/*
+!.evolve/instincts/lessons/
+.evolve/instincts/lessons/*
+!.evolve/instincts/lessons/.keep
+# ... and except the inbox API directory. Operator-injected task files in the root
+# of inbox/ are tracked; processed/, processing/ and rejected/ are runtime subdirs
+# (gitignored).
+!.evolve/inbox/
+.evolve/inbox/processed/
+.evolve/inbox/processing/
+.evolve/inbox/rejected/
+# ... and except the subagent-skills plugin directory. Loaded by Builder/Auditor
+# subagents via --plugin-dir to make review skills (code-review-simplify,
+# security-review-scored) resolvable under --setting-sources project. Manifest
+# is tracked; skills/ entries are symlinks to .agents/skills/ (also tracked).
+!.evolve/plugin/
+!.evolve/plugin/.claude-plugin/
+!.evolve/plugin/.claude-plugin/plugin.json
+!.evolve/plugin/skills/
+!.evolve/plugin/skills/*
+# ... and except the Layer 1 (ADR-0012) commit-prefix manifest. Defines what
+# commit prefixes (docs:, feat(guards):, etc.) require which diff paths.
+# Operator-extensible but ships with sensible defaults; must be tracked so the
+# scripts/guards/commit-prefix-gate.sh hook applies consistently across clones.
+!.evolve/commit-prefix-scope.json
+# ... and except the operator policy file (ADR-0055 D3). Defines floor gates
+# (e.g. dossier-closeout) that must pass before a cycle can ship. Operator-
+# extensible; must be tracked so the gate applies consistently across clones.
+!.evolve/policy.json
+# ... and except the standing wave goal. `evolve wave next` puts it first in
+# each wave goal (policy key wave.standing_goal). It is tracked so that the
+# boundary sync brings each change to the plane.
+!.evolve/wave-goal.md
+# ... and except the naming-guard manifest (SSOT for the legacynames acs gate,
+# `evolve release` preflight, and `evolve names`). Lists the dead naming tokens a
+# rename leaves behind; must be tracked so the guard applies across all clones.
+!.evolve/naming.json
+# ... and except user-defined phase specs. Operators drop a phase.json under
+# .evolve/phases/<name>/phase.json to extend the pipeline declaratively.
+# Analogous to .evolve/profiles/ — must be tracked so new phases ship with the
+# project and survive clone. (recoverBuildLeak already skips .evolve/ paths, so
+# tracking these files does not re-introduce the cycle-176 incident.)
+!.evolve/phases/
+.evolve/phases/*
+!.evolve/phases/*/
+.evolve/phases/*/*
+!.evolve/phases/*/phase.json
+# v16.6 (cycle-217 operator fix): agent personas authored beside the spec
+# (ADR-0035 authoring path: .evolve/phases/<name>/agent.md) must ship too —
+# without this line, ship's plain `git add -A` silently drops them.
+!.evolve/phases/*/agent.md
+# ... and except the EGPS eval definitions. The tracked eval corpus has existed
+# since 2026-06-01 and eval-materialization lanes DELIVER new evals — but this
+# re-include was missing, so every new eval was born ignored: check-ignore could
+# not flag the pathspec (tracked content exempts the dir), ship staging kept it,
+# and `git add` refused the whole .evolve/evals pathspec (rc=1) — the
+# cycle-1345/1346/1348 identical-fingerprint batch HALT (2026-08-05). Scoped to
+# *.md, mirroring the phases/profiles ladder idiom.
+!.evolve/evals/
+.evolve/evals/*
+!.evolve/evals/*.md
+# NOTE (issue-#11 / cycle-176, updated 2026-08-05): a self-evolve cycle (ee77067)
+# un-ignored .evolve/ WHOLESALE (`!.evolve/`) to "track evals". That broke a
+# then-LOAD-BEARING invariant — recoverBuildLeak and the audit assumed .evolve/
+# fully gitignored — and was reverted, with the note that versioning evals needs
+# a deliberate redesign, not a blanket un-ignore. That redesign has since
+# happened piecemeal: leak recovery gives .evolve/evals and .evolve/phases
+# DELIBERATE per-prefix handling (core/leak_recovery.go evolveDeliverablePrefixes)
+# while the generic .evolve/ skip covers the rest; ship staging drops ignored
+# declared paths (dropIgnoredPaths); and eval-quality gates validate eval
+# content. The scoped `.evolve/evals/*.md` ladder above is the missing final
+# piece — the tracked corpus the revert left in place is now consistent with
+# the ignore rules. Blanket `!.evolve/` remains forbidden; the birth-coherence
+# pin (go/internal/phasecoherence/gitignore_birth_test.go) now enforces
+# corpus↔ladder consistency both ways.
+.claude/evolve/
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+# Campaign/dev git worktrees (e.g. .worktrees/modularize-unify-phaseio) — isolated
+# checkouts of this repo created via `git worktree add .worktrees/<name>`. Never
+# part of the tracked tree; ignored so the parent worktree's `git status` stays clean.
+.worktrees/
+.clone/
+.ruff_cache/
+*.pyc
+
+# Cycle 65 incident: prevent stderr-redirected warnings from being committed.
+# role-context-builder.sh anchor-validation can emit a stderr WARN that
+# Orchestrator captures as `warn.txt` at repo root. ship.sh `git add -A`
+# would then sweep it into the cycle commit (causes audit-bound tree-SHA
+# drift; see docs/incidents/cycle-65-warn-txt.md if/when authored).
+/warn.txt
+*.warn
+parity-audit-report.md
+
+# Phase-report runtime artifacts. Agents write these to their cwd (a per-cycle
+# worktree = a checkout of this repo), and the builder's `git add -A` + worktree
+# commit will sweep them into the repo root if they aren't ignored — that is how
+# a stale `build-report.md` (Cycle 65, 27bee92) ended up tracked and got
+# relocated into cycle-145 by artifactReady's worktree search (audit FAIL on a
+# wrong challenge token). These belong only under .evolve/runs/cycle-N/.
+build-report.md
+scout-report.md
+audit-report.md
+triage-report.md
+test-report.md
+build-plan.md
+*-reflection.yaml
+
+# Go coverage artifacts (`go test -coverprofile`). Never commit: left untracked
+# they get swept into cycle commits by `git add -A` and drift the committed tree
+# from the audit-bound tree (INTEGRITY_TREE_DRIFT, cycle-152).
+cover.out
+coverage.out
+*.coverprofile
+
+# Boot-smoke / bridge log dropped in the repo root by `evolve release` preflight.
+# Never commit: it was swept into the v18.3.0 release commit by the broad stage.
+evolve*.log
+release-*.log
+routing-plan.json
+
+# campaign run logs (per-run runtime artifact)
+campaign.log
+
+# goreleaser local snapshot output (release runs in CI)
+/dist/
+
+# Stray compiled `evolve` executables an ACS predicate's `go build <main pkg>`
+# left in its package dir (tracked-binary-in-acs-dir: an 18MB go/acs/cycle536/evolve
+# was committed this way). The build predicates now use `-o os.DevNull`; this is
+# belt-and-suspenders so a regression can never be `git add`ed again.
+go/acs/**/evolve
+
+# Runtime-minted per-host phase stubs (ADR-0074 wired no-op): dispatch reads them
+# from DISK; tracking them fails phasecoherence (profile with no persona) and
+# phasespec (no SELECT metadata). Ship's staging sweep must never re-add them.
+.evolve/phases/gate-wiring-proof/
+.evolve/profiles/gate-wiring-proof.json
+.evolve/phases/production-path-wiring-proof/
+.evolve/profiles/production-path-wiring-proof.json
+.evolve/profiles/defect-disposition-preflight.json
+.evolve/profiles/disposition-preflight.json
+.evolve/profiles/inherited-defect-reconcile.json
+
+# Coverage artifacts the ACS predicate suite writes into go/ — e.g.
+# go/acs/cycle476/predicates_test.go runs `go test -coverprofile=coverage.core476.txt`
+# then `go tool cover -func=... > coverage.core476.func.txt`. Regenerated on every
+# `-tags acs` run; an evolve-cycle broad stage committed 10 of them (918da262). The
+# cover.out / coverage.out / *.coverprofile rules above do not match the per-cycle
+# names, which is exactly how these walked past them.
+coverage.*.txt
+
+# Agent-workspace runtime records that leak to the REPO ROOT whenever the resolved
+# workspace IS the project root (console run, nested sandbox, a lane whose worktree
+# is the project dir). Each is written workspace-relative by production code —
+# sessionrecord.FileName, bridge/tmux_inject.go, cmd_models_live.go — and each was
+# committed that way (20 tracked artifacts found 2026-08-27, oldest from cycle-104).
+# Root-anchored where the class only leaks at the root, so genuine nested content
+# (go/internal/logfilter/testdata/streamjson-input.log) is untouched.
+# Enforced for ALREADY-tracked files by phasecoherence/tracked_artifact_hygiene_test.go
+# — an ignore rule governs new births only, and every file below predated its rule.
+/*.log
+/tmux-sessions.jsonl
+/model-classifier-*
+/lint-baseline.txt
+.bridge-inbox/

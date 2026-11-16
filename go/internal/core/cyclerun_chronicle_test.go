@@ -1,0 +1,182 @@
+package core_test
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+	"github.com/mickeyyaya/evolve-loop/go/internal/policy"
+)
+
+type ctxCaptureRunner struct {
+	name string
+	mu   sync.Mutex
+	reqs []core.PhaseRequest
+}
+
+func (r *ctxCaptureRunner) Name() string { return r.name }
+func (r *ctxCaptureRunner) Run(_ context.Context, req core.PhaseRequest) (core.PhaseResponse, error) {
+	r.mu.Lock()
+	r.reqs = append(r.reqs, req)
+	r.mu.Unlock()
+	return core.PhaseResponse{Phase: r.name, Verdict: core.VerdictPASS, ArtifactsDir: req.Workspace}, nil
+}
+
+func (r *ctxCaptureRunner) lastContext(key string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.reqs) == 0 {
+		return ""
+	}
+	return r.reqs[len(r.reqs)-1].Context[key]
+}
+
+func seedChronicleDossier(t *testing.T, projectRoot string, cycle int, goal, verdict string) {
+	t.Helper()
+	dir := filepath.Join(projectRoot, "knowledge-base", "cycles")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir dossier dir: %v", err)
+	}
+	doc := fmt.Sprintf(`{"cycle": %d, "goal": %q, "final_verdict": %q, "phases": []}`, cycle, goal, verdict)
+	path := filepath.Join(dir, fmt.Sprintf("cycle-%d.json", cycle))
+	if err := os.WriteFile(path, []byte(doc), 0o644); err != nil {
+		t.Fatalf("write dossier %s: %v", path, err)
+	}
+}
+
+func runChronicleCycle(t *testing.T, projectRoot string, disableGuard bool, opts ...core.Option) (core.CycleResult, error, *ctxCaptureRunner) {
+	t.Helper()
+	scout := &ctxCaptureRunner{name: string(core.PhaseScout)}
+	orch, _, _ := newTestOrchestratorOpts(t, newRunners(map[core.Phase]core.PhaseRunner{core.PhaseScout: scout}), opts...)
+	res, err := orch.RunCycle(context.Background(), core.CycleRequest{
+		ProjectRoot:           projectRoot,
+		GoalHash:              "chronicle-s3-test-goal",
+		Context:               map[string]string{"commit_message": "test commit"},
+		DisableWorkspaceGuard: disableGuard,
+	})
+	return res, err, scout
+}
+
+func newTestOrchestratorOpts(t *testing.T, runners map[core.Phase]core.PhaseRunner, opts ...core.Option) (*core.Orchestrator, *recStorage, *fakeLedger) {
+	t.Helper()
+	st := &recStorage{}
+	ld := &fakeLedger{}
+	return core.NewOrchestrator(st, ld, runners, explanationHarnessOptions(opts...)...), st, ld
+}
+
+func chronicleDigestPath(projectRoot string, cycle int) string {
+	return filepath.Join(core.RunWorkspacePath(projectRoot, cycle), "recent-outcomes.md")
+}
+
+func TestNewCycleRun_SeedsRecentOutcomesDigestAtShadow(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	seedChronicleDossier(t, root, 42, "harden the flux capacitor", "PASS")
+
+	res, err, scout := runChronicleCycle(t, root, false)
+	if err != nil {
+		t.Fatalf("RunCycle: %v", err)
+	}
+	data, rerr := os.ReadFile(chronicleDigestPath(root, res.Cycle))
+	if rerr != nil {
+		t.Fatalf("shadow stage must seed recent-outcomes.md into the run workspace at cycle start: %v", rerr)
+	}
+	if !strings.Contains(string(data), "cycle 42") || !strings.Contains(string(data), "harden the flux capacitor") {
+		t.Errorf("digest does not render the seeded dossier (want cycle 42 + goal line):\n%s", data)
+	}
+	if got := scout.lastContext("recent_outcomes"); got != "" {
+		t.Errorf("shadow stage must NOT inject Context[\"recent_outcomes\"], got %q", got)
+	}
+}
+
+func TestNewCycleRun_OffStageWritesNoDigest(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	seedChronicleDossier(t, root, 42, "harden the flux capacitor", "PASS")
+
+	res, err, scout := runChronicleCycle(t, root, false,
+		core.WithChronicleConfig(policy.ChronicleConfig{Digest: "off"}))
+	if err != nil {
+		t.Fatalf("RunCycle: %v", err)
+	}
+	if _, serr := os.Stat(chronicleDigestPath(root, res.Cycle)); serr == nil {
+		t.Errorf("off stage must not write recent-outcomes.md")
+	}
+	if got := scout.lastContext("recent_outcomes"); got != "" {
+		t.Errorf("off stage must NOT inject Context[\"recent_outcomes\"], got %q", got)
+	}
+}
+
+func TestNewCycleRun_EnforceInjectsRecentOutcomesContext(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	seedChronicleDossier(t, root, 42, "harden the flux capacitor", "PASS")
+
+	res, err, scout := runChronicleCycle(t, root, false,
+		core.WithChronicleConfig(policy.ChronicleConfig{Digest: "enforce", DigestTokens: 1200, DigestCycles: 10}))
+	if err != nil {
+		t.Fatalf("RunCycle: %v", err)
+	}
+	if _, serr := os.Stat(chronicleDigestPath(root, res.Cycle)); serr != nil {
+		t.Fatalf("enforce stage must still write recent-outcomes.md: %v", serr)
+	}
+	got := scout.lastContext("recent_outcomes")
+	if got == "" {
+		t.Fatalf("enforce stage must inject Context[\"recent_outcomes\"] into phase requests")
+	}
+	if !strings.Contains(got, "cycle 42") {
+		t.Errorf("injected recent_outcomes does not carry the digest content, got %q", got)
+	}
+}
+
+func TestNewCycleRun_DigestFailureWarnsNotAborts(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	seedChronicleDossier(t, root, 42, "harden the flux capacitor", "PASS")
+	ws := core.RunWorkspacePath(root, 1)
+	if err := os.MkdirAll(filepath.Join(ws, "recent-outcomes.md"), 0o755); err != nil {
+		t.Fatalf("pre-create digest collision dir: %v", err)
+	}
+
+	var sink chronicleStderr
+	res, runErr, _ := runChronicleCycle(t, root, true, core.WithStderr(&sink))
+	stderr := sink.String()
+	if runErr != nil {
+		t.Fatalf("digest failure must never abort the cycle, got: %v", runErr)
+	}
+	if res.Cycle != 1 {
+		t.Fatalf("harness assumption broken: fresh state minted cycle %d, want 1 (collision seeded at cycle-1)", res.Cycle)
+	}
+	if res.FinalVerdict != core.VerdictPASS {
+		t.Errorf("cycle verdict = %q, want PASS despite digest failure", res.FinalVerdict)
+	}
+	if !strings.Contains(stderr, "WARN") || !strings.Contains(stderr, "digest") {
+		t.Errorf("digest failure must WARN loudly on stderr (want WARN + \"digest\"), got:\n%s", stderr)
+	}
+}
+
+type chronicleStderr struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (c *chronicleStderr) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.Write(p)
+}
+
+func (c *chronicleStderr) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.String()
+}

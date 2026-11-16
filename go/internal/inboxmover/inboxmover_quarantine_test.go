@@ -1,0 +1,169 @@
+package inboxmover
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func failDrain(opts Options, cycle, ceiling int, systemLevel bool) (OutcomeResult, error) {
+	return ApplyCycleOutcome(opts, CycleOutcome{
+		Cycle:       cycle,
+		Passed:      false,
+		Reason:      "cycle-failure-release",
+		Ceiling:     ceiling,
+		SystemLevel: systemLevel,
+	})
+}
+
+func writeProcItem(t *testing.T, inbox, cycle, id string) {
+	t.Helper()
+	dir := filepath.Join(inbox, "processing", "cycle-"+cycle)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"id":"` + id + `","title":"` + id + `"}`)
+	if err := os.WriteFile(filepath.Join(dir, id+".json"), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func itemFailureCount(t *testing.T, path string) int {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	var m struct {
+		FailureCount int `json:"failure_count"`
+	}
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("unmarshal %s: %v", path, err)
+	}
+	return m.FailureCount
+}
+
+func TestReleaseWithQuarantine_BelowCeilingReleasesAndCounts(t *testing.T) {
+	root := t.TempDir()
+	inbox := filepath.Join(root, ".evolve", "inbox")
+	writeProcItem(t, inbox, "5", "task-a")
+
+	opts := Options{ProjectRoot: root}
+	res, err := failDrain(opts, 5, 2, false)
+	if err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if len(res.Released) != 1 {
+		t.Fatalf("Released = %v; want exactly 1 item back at the inbox root", res.Released)
+	}
+	rootItem := filepath.Join(inbox, "task-a.json")
+	if _, err := os.Stat(rootItem); err != nil {
+		t.Fatalf("item not at inbox root: %v", err)
+	}
+	if got := itemFailureCount(t, rootItem); got != 1 {
+		t.Errorf("failure_count = %d; want 1 after one failure below ceiling", got)
+	}
+	if _, err := os.Stat(filepath.Join(inbox, "quarantine", "task-a.json")); err == nil {
+		t.Error("item was quarantined below the ceiling")
+	}
+}
+
+func TestReleaseWithQuarantine_AtCeilingQuarantines(t *testing.T) {
+	root := t.TempDir()
+	inbox := filepath.Join(root, ".evolve", "inbox")
+	opts := Options{ProjectRoot: root}
+
+	writeProcItem(t, inbox, "5", "poison")
+	if _, err := failDrain(opts, 5, 2, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(inbox, "processing", "cycle-6"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(inbox, "poison.json"), filepath.Join(inbox, "processing", "cycle-6", "poison.json")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := failDrain(opts, 6, 2, false); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(filepath.Join(inbox, "poison.json")); err == nil {
+		t.Error("poison still at inbox root — should be quarantined at the ceiling")
+	}
+	qItem := filepath.Join(inbox, "quarantine", "poison.json")
+	if _, err := os.Stat(qItem); err != nil {
+		t.Fatalf("poison not in quarantine: %v", err)
+	}
+	if got := itemFailureCount(t, qItem); got != 2 {
+		t.Errorf("quarantined failure_count = %d; want 2 (the diagnostic count)", got)
+	}
+}
+
+func TestReleaseWithQuarantine_SystemLevelNeverQuarantines(t *testing.T) {
+	root := t.TempDir()
+	inbox := filepath.Join(root, ".evolve", "inbox")
+	writeProcItem(t, inbox, "5", "sys-task")
+	p := filepath.Join(inbox, "processing", "cycle-5", "sys-task.json")
+	if err := os.WriteFile(p, []byte(`{"id":"sys-task","failure_count":9}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	opts := Options{ProjectRoot: root}
+	if _, err := failDrain(opts, 5, 2, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(inbox, "sys-task.json")); err != nil {
+		t.Errorf("system-level failure was quarantined — S3 halt must take precedence: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(inbox, "quarantine", "sys-task.json")); err == nil {
+		t.Error("system-level item landed in quarantine/")
+	}
+}
+
+func TestReleaseFromQuarantine_RoundTrips(t *testing.T) {
+	root := t.TempDir()
+	inbox := filepath.Join(root, ".evolve", "inbox")
+	qPath := filepath.Join(inbox, "quarantine", "freed.json")
+	if err := os.MkdirAll(filepath.Dir(qPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(qPath, []byte(`{"id":"freed","failure_count":5}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	opts := Options{ProjectRoot: root}
+	res, err := ReleaseFromQuarantine(opts, "freed")
+	if err != nil {
+		t.Fatalf("release-from-quarantine: %v", err)
+	}
+	if res.DestPath != filepath.Join(inbox, "freed.json") {
+		t.Errorf("DestPath = %q; want inbox root", res.DestPath)
+	}
+	if _, err := os.Stat(qPath); err == nil {
+		t.Error("item still in quarantine/ after release")
+	}
+	if got := itemFailureCount(t, res.DestPath); got != 0 {
+		t.Errorf("failure_count = %d; want 0 (reset on release)", got)
+	}
+	if _, err := ReleaseFromQuarantine(opts, "nope"); err == nil {
+		t.Error("expected ErrNotFound for absent id")
+	}
+}
+
+func TestShouldQuarantine_NamesThePredicate(t *testing.T) {
+	cases := []struct {
+		count, ceiling int
+		system         bool
+		want           bool
+	}{
+		{2, 3, false, false},
+		{3, 3, false, true},
+		{9, 3, false, true},
+		{9, 3, true, false},
+		{9, 0, false, false},
+	}
+	for _, tc := range cases {
+		if got := ShouldQuarantine(tc.count, tc.ceiling, tc.system); got != tc.want {
+			t.Errorf("ShouldQuarantine(%d,%d,%v)=%v, want %v", tc.count, tc.ceiling, tc.system, got, tc.want)
+		}
+	}
+}

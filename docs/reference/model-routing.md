@@ -1,0 +1,106 @@
+# Model Routing — Tier Definitions, Provider Mappings & Dynamic Routing
+
+This page describes the routing of v22.27.0. The bash-era tier abstraction (`tier-1`, `tier-2`, `tier-3` and `.evolve/models.json`) is removed, and no code reads `.evolve/models.json`. The full reference is the "CLI routing table" row of [runtime-reference.md](../operations/runtime-reference.md).
+
+## Tier Definitions
+
+Each profile in `.evolve/profiles/` names a default tier and an envelope (`model_tier_default`, `model_tier_envelope`). The tier ladder has four steps: `fast`, `balanced`, `deep` and `top`. The manifest of each CLI family maps a tier to a model (`model_tier_map` in `go/internal/bridge/manifests/<driver>.json`).
+
+## Models for each tier
+
+| Tier | `claude-tmux` | `agy-tmux` | `agy-claude-tmux` | `codex-tmux` |
+|---|---|---|---|---|
+| `fast` | haiku | Gemini 3.8 Flash (Low) | Claude Sonnet 5.5 (Low) | gpt-5.6-luna |
+| `balanced` | sonnet | Gemini 3.8 Flash (High) | Claude Sonnet 5.5 (Medium) | gpt-5.6-terra |
+| `deep` | opus | Gemini 4 Argon (Medium) | Claude Opus 5.5 (Medium) | gpt-5.6-sol |
+| `top` | opus | Gemini 4 Argon (Medium) | Claude Opus 5.5 (Medium) | gpt-5.6-sol |
+
+In Claude Code 2.1.293, the `haiku` alias of the `fast` tier resolves to Haiku 5.5 (checked on 2026-10-08). agy has no Haiku model, so the `fast` tier of `agy-claude-tmux` is Claude Sonnet 5.5 (Low).
+
+## Effort for each tier
+
+Every launch on a CLI with an effort channel carries an effort (2026-10-08). The effort lives in `.evolve/policy.json` `cli_routing`, beside the chain. The order of precedence is:
+
+1. `cli_routing.agents.<agent>.effort`;
+2. `cli_routing.tiers.<tier>.effort`;
+3. the compiled default.
+
+The operator directive of 2026-10-08 is: "Based on the opus 5.5, the effort should be configured starting with medium effort". Thus every tier starts at `medium`, except fast.
+
+| Tier | Compiled default | `claude-tmux` | `agy-claude-tmux` |
+|---|---|---|---|
+| `fast` | `low` | `--effort low` | `(Low)` |
+| `balanced` | `medium` | `--effort medium` | `(Medium)` |
+| `deep` | `medium` | `--effort medium` | `(Medium)` |
+| `top` | `medium` | `--effort medium` | `(Medium)` |
+
+The checked-in table sets `low` for `scout`, `triage` and `reflector` (`agents.<agent>.effort`).
+
+To change an effort, use the routing writer at a wave boundary:
+
+- `evolve cli-routing set tiers.deep --effort high` (the chain stays);
+- `evolve cli-routing set agents.auditor --effort high`;
+- `evolve cli-routing unset tiers.deep.effort`;
+- `evolve cli-routing explain <agent>` prints each tier with its effort and the source of the effort.
+
+On `agy-claude-tmux`, the effort selects the variant suffix of the model name, because agy offers each Claude model at `(Low)`, `(Medium)` and `(High)` only. When `xhigh` or `max` is capped to `(High)`, the launch writes one `effort=<level> is capped` line. A launch with a model id, not a tier word, gets no tier default, but an agent effort still applies. `agy-tmux` (Gemini) and `ollama-tmux` have no effort channel.
+
+`evolve models refresh` refreshes the live model catalog. The resolution order is: a policy pin, then the live catalog, then the manifest baseline.
+
+## The tier policy
+
+This section is the spec of record for what each tier is for and in which order its chain walks. The research is [model-tier-policy-2026-10](../research/model-tier-policy-2026-10.md), the plan is [model-tier-policy-2026-10](../plans/model-tier-policy-2026-10.md), and the decision is [ADR-0136](../architecture/adr/0136-each-model-tier-walks-separate-quota-pools-and-agy-runs-argon-medium-at-deep-and-top.md).
+
+**Why a policy.** A provider counts its quota in pools. On 2026-10-17, agy's Gemini 4 Argon pool was empty for 148 h, while its Gemini 3.8 Flash pool still answered. A chain that knows the pools moves to the next pool when one is empty.
+
+**The pools.** agy's `/usage` screen names its pools (agy 1.4.0, 2026-10-17): `GEMINI MODELS` (Flash and Pro), `CLAUDE AND GPT MODELS` (Opus, Sonnet and GPT-OSS) and `GEMINI 4 ARGON` (Argon only). Each pool has its own limits. The plan's §6a says how the bridge reads them.
+
+**The chain rule.** A chain walks from the pool with the most headroom to Claude Code. No chain puts two models of one quota pool next to each other. Claude Code goes last, because the floor seats can run nowhere else.
+
+| Tier | Use it when the phase… | Target chain | Model on each family |
+|---|---|---|---|
+| `fast` | does a mechanical transform that a later step checks. No profile uses it today. | `agy` → `agy-claude` → `claude` | Flash (Low); Sonnet 5.5 (Low); haiku |
+| `balanced` | reads and writes code or reports that a reviewer checks. | `agy` → `agy-claude` → `claude` | Flash (High); Sonnet 5.5 (Medium); sonnet |
+| `deep` | reasons about correctness, failure or design, without a floor seat at the same depth. | `agy-claude` → `agy` → `claude` | Opus 5.5 (Medium); Gemini 4 Argon (Medium); opus |
+| `top` | decides a dispute, or a decision that is expensive to undo. No profile uses it today. | `agy-claude` → `agy` → `claude` | Opus 5.5 (Medium); Gemini 4 Argon (Medium); opus |
+| floor seats | review the work of another phase. | `claude` only | opus or sonnet, per profile |
+
+**How Argon stays at Medium.** agy has no effort flag; the effort is part of the model name. The live catalog picks a model for each tier and overrides the manifest. So a catalog tier pin in `.evolve/policy.json` holds `Gemini 4 Argon (Medium)` for agy `deep` and `top`:
+
+```json
+"catalog": { "tier_pins": { "agy": { "deep": "Gemini 4 Argon (Medium)", "top": "Gemini 4 Argon (Medium)" } } }
+```
+
+The pin wins over the classifier, also for a cached catalog. A pin to a model that agy does not offer makes `evolve models refresh` fail; it does not fall back. Check the result with `evolve models list`.
+
+**State on 2026-10-17.** The table shows the target. `agy` is not yet in the `deep` and `top` chains. It returns there after the per-model bench fix (inbox `agy-model-429-benches-whole-family`). Until then, one Argon wall benches all of agy. Today agy-claude is also at 100% of its week, so `deep` and `top` run on Claude Code in effect.
+
+## The CLI routing table
+
+Since v22.27.0, one table in `.evolve/policy.json` (`cli_routing`) decides which CLI runs each dispatch ([ADR-0119](../architecture/adr/0119-one-routing-table-one-resolver.md)). The table of this repository has these rules:
+
+- A phase below the deep tier runs agy first, at the `balanced` tier (see the table above). Then it runs agy-owned Claude (`agy-claude`), then Claude Code. `evolve cli-routing explain <agent>` prints the chain and the model at the tier of the agent.
+- A phase at the deep or the top tier runs agy-owned Claude first, then Claude Code. Gemini 4 Argon, the successor of Gemini 3.1 Pro, is agy's deep model. It was in the chain on 2026-10-16 and is out again from 2026-10-17. A quota wall on Argon benched all of agy, Flash included (inbox `agy-model-429-benches-whole-family`).
+- The Claude-family floor agents (the auditor, the adversarial review, the tdd engineer, the code reviewer and the spec verifiers) run Claude Code only.
+- Codex runs only under `--bypass-policy`.
+- `agents.<agent>.model` is the base rung of the retry ladder ([retry-ladder](../architecture/retry-ladder.md)). The first try runs at that tier, and an advisor tier does not change it. A ladder rung raises the tier and the effort up to `max_tier` (default `deep`) and `max_effort` (default `high`). The ladder never reaches `top` or `xhigh` unless the rule names it.
+- An agent rule with `order: headroom` sorts its chain at each dispatch (W4, 2026-10-19). A family at or above `headroom_pct` (default 60) of its week window leaves the head. The other families go in the order of their lane time to a PASS. With no measure, the order is claude, agy, agy-claude. This repository's table does not set it yet. See [model-routing-policy.md](../architecture/model-routing-policy.md#family-order-by-quota-headroom).
+
+A project without a table uses the chain of each profile (`cli`, then `cli_fallback`). Then the loop probes each CLI, skips a benched CLI and falls back to an installed CLI.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `evolve cli-routing init --clis a,b,c` | Writes `clis` and `default`, and moves the legacy keys into the table |
+| `evolve cli-routing set <key> <a,b>` | Sets one key: `clis`, `default`, `after_chain`, `tiers.<tier>`, `work.<role>` or `agents.<agent>` |
+| `evolve cli-routing set agents.<agent> [--max-tier T] [--max-effort E]` | Sets the bounds of the retry ladder for one agent. It refuses a tier or an effort that does not exist |
+| `evolve cli-routing unset <key>` | Removes one key |
+| `evolve cli-routing migrate [--dry-run]` | Moves `pins`, `workflow.universal_fallback` and `router.cli/model` into the table. It refuses a non-empty `workflow.universal_fallback_exclude` |
+| `evolve cli-routing show`, `check`, `explain <agent>` | Prints the table, checks it, or prints the chain of one agent |
+
+These verbs are the only writers of the table. Each write compiles the merged file first. A write is refused inside a phase and while a cycle holds a live lease. `evolve setup recommend` and `evolve setup apply` refuse when the policy file has a `cli_routing` key.
+
+## Dynamic Model Routing
+
+The advisor chooses the tier of each phase inside the envelope of its profile. This is the default (`EVOLVE_DYNAMIC_ROUTING=advisory`). `EVOLVE_DYNAMIC_ROUTING=off` keeps the static profile tiers. The advisor uses the chain of the table, from the first CLI that is not benched.

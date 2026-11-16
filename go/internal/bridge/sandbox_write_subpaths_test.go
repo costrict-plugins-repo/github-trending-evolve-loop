@@ -1,0 +1,435 @@
+package bridge
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+func realProfilesDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.Abs(filepath.Join("..", "..", "..", ".evolve", "profiles"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "triage.json")); err != nil {
+		t.Skipf("real profiles not reachable from the test cwd: %v", err)
+	}
+	return dir
+}
+
+func renderSBPL(t *testing.T, req SandboxWrapRequest) string {
+	t.Helper()
+	wrap := defaultSandboxWrapWithProbe(Deps{}, fakeProbe("darwin", true))
+	prefix, ok := wrap(req)
+	if !ok {
+		t.Fatalf("wrapper refused the launch for phase %q (request %+v)", req.Phase, req)
+	}
+	raw, err := os.ReadFile(prefix[2])
+	if err != nil {
+		t.Fatalf("read SBPL: %v", err)
+	}
+	return string(raw)
+}
+
+func allowWriteLine(path string) string {
+	return "(allow file-write* (subpath " + strconv.Quote(path) + "))"
+}
+
+func TestDefaultSandboxWrap_GrantsTriagesDeclaredInboxClaimDir(t *testing.T) {
+	t.Parallel()
+	prof, err := LoadProfile(filepath.Join(realProfilesDir(t), "triage.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prof.Sandbox == nil || len(prof.Sandbox.WriteSubpaths) == 0 {
+		t.Fatal("precondition: the triage profile must declare sandbox.write_subpaths")
+	}
+	root := t.TempDir()
+	canonicalRoot, err := canonicalSandboxPath(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".evolve", "inbox", "processing"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	sbpl := renderSBPL(t, SandboxWrapRequest{
+		Phase: "triage", RepoRoot: root, Worktree: t.TempDir(), Workspace: t.TempDir(),
+		WriteSubpaths: prof.Sandbox.WriteSubpaths,
+	})
+
+	claimDir := filepath.Join(canonicalRoot, ".evolve", "inbox", "processing", "cycle-1623")
+	var granted []string
+	for _, m := range subpathArgRe.FindAllStringSubmatch(sbpl, -1) {
+		granted = append(granted, m[1])
+	}
+	if !coveredByAGrant(claimDir, granted) {
+		t.Fatalf("the triage profile declares write_subpaths %v but the rendered sandbox never grants the inbox claim dir — "+
+			"`evolve inbox-mover claim` fails at mkdir and the cycle runs its whole spine against an empty commitment (cycle 1623).\nclaim dir: %s\nprofile:\n%s",
+			prof.Sandbox.WriteSubpaths, claimDir, sbpl)
+	}
+}
+
+func realSandboxProfiles(t *testing.T) map[string]Profile {
+	t.Helper()
+	dir := realProfilesDir(t)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]Profile{}
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var peek struct {
+			Sandbox *ProfileSandbox `json:"sandbox"`
+		}
+		if err := json.Unmarshal(raw, &peek); err != nil || peek.Sandbox == nil || !peek.Sandbox.Enabled {
+			continue
+		}
+		prof, err := LoadProfile(path)
+		if err != nil {
+			t.Fatalf("load %s: %v", e.Name(), err)
+		}
+		out[e.Name()] = prof
+	}
+	if len(out) < 50 {
+		t.Fatalf("only %d sandbox-enabled profiles found under %s — the real profile set is not being read", len(out), dir)
+	}
+	return out
+}
+
+func TestLaunchArgs_ProjectsProfileWriteSubpathsToTheWrapper(t *testing.T) {
+	t.Parallel()
+	declared := []string{".evolve/inbox/processing", "{worktree_path}/tests"}
+	fx := newFixture(t, "claude-p", "")
+	body := `{
+  "name": "test-claude-p",
+  "model": "haiku",
+  "allowed_tools": ["Read", "Write"],
+  "auto_respond": {"destructive_ops": false, "timeout_s": 60},
+  "prompt_overrides": [],
+  "sandbox": {"enabled": true, "read_only_repo": true, "write_subpaths": ["` + strings.Join(declared, `", "`) + `"]}
+}
+`
+	if err := os.WriteFile(fx.profile, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var captured []SandboxWrapRequest
+	capture := func(req SandboxWrapRequest) ([]string, bool) {
+		captured = append(captured, req)
+		return []string{"sandbox-exec", "-f", "/tmp/x.sb"}, true
+	}
+	fr := &fakeRunner{writeArtifactPath: fx.artifact, writeArtifactBody: "ok"}
+	code, stderr := runWithSandbox(t, fr, capture, fx.args("claude-p", "--worktree="+t.TempDir()))
+	if code != ExitOK {
+		t.Fatalf("launch exit=%d: %s", code, stderr)
+	}
+	if len(captured) != 1 {
+		t.Fatalf("sandbox wrapper consulted %d times, want 1", len(captured))
+	}
+	if got := captured[0].WriteSubpaths; !slices.Equal(got, declared) {
+		t.Fatalf("the launch path handed the wrapper write_subpaths %v, but the profile declares %v — a declared write that is not granted is the cycle-1623 defect class", got, declared)
+	}
+}
+
+func TestDefaultSandboxWrap_RendersEveryDeclaredWriteSubpath(t *testing.T) {
+	t.Parallel()
+	for name, prof := range realSandboxProfiles(t) {
+		t.Run(strings.TrimSuffix(name, ".json"), func(t *testing.T) {
+			root, worktree, workspace := t.TempDir(), t.TempDir(), t.TempDir()
+			sbpl := renderSBPL(t, SandboxWrapRequest{
+				Phase: strings.TrimSuffix(name, ".json"), RepoRoot: root, Worktree: worktree, Workspace: workspace,
+				WriteSubpaths: prof.Sandbox.WriteSubpaths,
+			})
+			grants, err := resolveSandboxWriteGrants(prof.Sandbox.WriteSubpaths, root, worktree, workspace)
+			if err != nil {
+				t.Fatalf("resolver refused the profile's own declarations: %v", err)
+			}
+			if len(grants) == 0 {
+				t.Fatalf("profile declares %v but nothing resolved — every profile declares at least its run dir", prof.Sandbox.WriteSubpaths)
+			}
+			for _, m := range subpathArgRe.FindAllStringSubmatch(sbpl, -1) {
+				if strings.ContainsAny(m[1], "*?[") {
+					t.Errorf("a glob reached the sandbox generator, which cannot interpret it: subpath %q", m[1])
+				}
+			}
+			for _, g := range grants {
+				if !strings.Contains(sbpl, allowWriteLine(g)) {
+					t.Errorf("declared write %q (resolved %q) is absent from the rendered sandbox — the persona may instruct a write the kernel will refuse\nprofile:\n%s", prof.Sandbox.WriteSubpaths, g, sbpl)
+				}
+			}
+		})
+	}
+}
+
+func TestResolveSandboxWriteGrants(t *testing.T) {
+	t.Parallel()
+	root, wt := t.TempDir(), t.TempDir()
+	canonicalRoot, err := canonicalSandboxPath(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalWT, err := canonicalSandboxPath(wt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws := filepath.Join(canonicalRoot, ".evolve", "runs", "cycle-7")
+	if err := os.MkdirAll(ws, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	abs := filepath.Join(t.TempDir(), "elsewhere")
+	if err := os.MkdirAll(abs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	canonicalAbs, err := canonicalSandboxPath(abs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	join := func(base string, rel ...string) string { return filepath.Join(append([]string{base}, rel...)...) }
+	for _, tc := range []struct {
+		name      string
+		declared  []string
+		worktree  string
+		workspace string
+		want      []string
+		wantErr   string
+	}{
+		{"repo-relative", []string{".evolve/inbox/processing"}, wt, ws, []string{join(canonicalRoot, ".evolve", "inbox", "processing")}, ""},
+		{"worktree template alone grants the worktree", []string{"{worktree_path}"}, wt, ws, []string{canonicalWT}, ""},
+		{"worktree template with subpath", []string{"{worktree_path}/tests"}, wt, ws, []string{join(canonicalWT, "tests")}, ""},
+		{"worktree template without a worktree is skipped", []string{"{worktree_path}/tests"}, "", ws, nil, ""},
+		{"absolute is granted as declared, cleaned", []string{abs + "/./"}, wt, ws, []string{canonicalAbs}, ""},
+		{"the run-dir glob grants only the dispatch's own run dir", []string{".evolve/runs/cycle-*"}, wt, ws, []string{ws}, ""},
+		{"a subpath of the run-dir glob stays inside the own run dir", []string{".evolve/runs/cycle-*/learn"}, wt, ws, []string{join(ws, "learn")}, ""},
+		{"the run-dir glob without a workspace is skipped", []string{".evolve/runs/cycle-*"}, wt, "", nil, ""},
+		{"a glob in a file name widens to its parent", []string{".evolve/inbox/claim-*"}, wt, ws, []string{join(canonicalRoot, ".evolve", "inbox")}, ""},
+		{"a dot-prefixed run-dir glob is the same template", []string{"./.evolve/runs/cycle-*"}, wt, ws, []string{ws}, ""},
+		{"a run-dir glob with a doubled separator is the same template", []string{".evolve//runs/cycle-*/learn"}, wt, ws, []string{join(ws, "learn")}, ""},
+		{"a run-dir glob with a trailing separator is the same template", []string{".evolve/runs/cycle-*/"}, wt, ws, []string{ws}, ""},
+		{"a bare runs glob is refused", []string{".evolve/runs/*"}, wt, ws, nil, "covers the run directories of other cycles"},
+		{"a near-miss run-dir glob is refused", []string{".evolve/runs/cycle-*x"}, wt, ws, nil, "covers the run directories of other cycles"},
+		{"a literal sibling run dir is refused", []string{".evolve/runs/cycle-8"}, wt, ws, nil, "covers the run directories of other cycles"},
+		{"a sibling run dir spelt through dot-dot is refused", []string{".evolve/runs/x/../cycle-8/a"}, wt, ws, nil, "covers the run directories of other cycles"},
+		{"a case variant of the runs directory is refused", []string{".EVOLVE/Runs/CYCLE-*"}, wt, ws, nil, "covers the run directories of other cycles"},
+		{"the runs directory itself is refused", []string{".evolve/runs"}, wt, ws, nil, "covers the run directories of other cycles"},
+		{"an ancestor of the runs directory is refused", []string{".evolve/cycle-state*"}, wt, ws, nil, "covers the run directories of other cycles"},
+		{"an absolute runs directory is refused", []string{join(canonicalRoot, ".evolve", "runs")}, wt, ws, nil, "covers the run directories of other cycles"},
+		{"a workspace that is the runs directory is refused", []string{".evolve/runs/cycle-*"}, wt, join(canonicalRoot, ".evolve", "runs"), nil, "covers the run directories of other cycles"},
+		{"the access log directory is refused", []string{".evolve/context-access"}, wt, ws, nil, "covers the access log of the cell context index"},
+		{"a file of the access log is refused", []string{".evolve/context-access/cycle-7.jsonl"}, wt, ws, nil, "covers the access log of the cell context index"},
+		{"a case variant of the access log is refused", []string{".EVOLVE/Context-Access/x"}, wt, ws, nil, "covers the access log of the cell context index"},
+		{"the lineage directory is refused", []string{".evolve/lineage"}, wt, ws, nil, "covers the lineage records of the pipeline"},
+		{"a record of the lineage is refused", []string{".evolve/lineage/cycle-7.json"}, wt, ws, nil, "covers the lineage records of the pipeline"},
+		{"a request record of the lineage is refused", []string{".evolve/lineage/requests/cycle-7"}, wt, ws, nil, "covers the lineage records of the pipeline"},
+		{"a case variant of the lineage is refused", []string{".EVOLVE/Lineage/x"}, wt, ws, nil, "covers the lineage records of the pipeline"},
+		{"an absolute lineage directory is refused", []string{join(canonicalRoot, ".evolve", "lineage")}, wt, ws, nil, "covers the lineage records of the pipeline"},
+		{"a sibling of the lineage stays granted", []string{".evolve/lineages"}, wt, ws, []string{join(canonicalRoot, ".evolve", "lineages")}, ""},
+		{"a sibling of the access log stays granted", []string{".evolve/context-accessed"}, wt, ws, []string{join(canonicalRoot, ".evolve", "context-accessed")}, ""},
+		{"worktree glob widens inside the worktree", []string{"{worktree_path}/scripts/*-test.sh"}, wt, ws, []string{join(canonicalWT, "scripts")}, ""},
+		{"duplicates collapse", []string{".evolve/runs/cycle-*", ".evolve/runs/cycle-*"}, wt, ws, []string{ws}, ""},
+		{"climb above the root is refused", []string{"../x"}, wt, ws, nil, "escapes its base"},
+		{"climb above the worktree is refused", []string{"{worktree_path}/../x"}, wt, ws, nil, "escapes its base"},
+		{"climb above the own run dir is refused", []string{".evolve/runs/cycle-*/../cycle-8"}, wt, ws, nil, "escapes its base"},
+		{"empty entry is refused", []string{""}, wt, ws, nil, "must be a path"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveSandboxWriteGrants(tc.declared, root, tc.worktree, tc.workspace)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("want error containing %q, got %v (grants %v)", tc.wantErr, err, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("grants = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolveSandboxWriteGrants_RefusesABaseItCannotResolve(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	blocker := filepath.Join(root, "blocker")
+	if err := os.WriteFile(blocker, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name      string
+		declared  string
+		workspace string
+		wantErr   string
+	}{
+		{"a relative workspace", ".evolve/runs/cycle-*", "runs/cycle-7", "needs an absolute project root, worktree or workspace"},
+		{"a workspace below a file", ".evolve/runs/cycle-*", filepath.Join(blocker, "cycle-7"), "resolve sandbox path"},
+		{"a grant below a file", "blocker/x", filepath.Join(root, "ws"), "resolve sandbox path"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveSandboxWriteGrants([]string{tc.declared}, root, "", tc.workspace)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("want error containing %q, got %v (grants %v)", tc.wantErr, err, got)
+			}
+		})
+	}
+}
+
+func TestResolveSandboxWriteGrants_TheRunDirCheckNeedsAResolvableRoot(t *testing.T) {
+	t.Parallel()
+	abs, err := canonicalSandboxPath(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := resolveSandboxWriteGrants([]string{abs}, "", "", ""); err != nil || !slices.Equal(got, []string{abs}) {
+		t.Fatalf("with no project root an absolute grant has no run directories to reach: grants %v, err %v", got, err)
+	}
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := resolveSandboxWriteGrants([]string{abs}, filepath.Join(blocker, "root"), "", ""); err == nil || !strings.Contains(err.Error(), "resolve sandbox path") {
+		t.Fatalf("a project root the resolver cannot read must refuse the grant, got %v (grants %v)", err, got)
+	}
+}
+
+func TestEveryProfileWritesOnlyItsOwnCycleRunDir(t *testing.T) {
+	t.Parallel()
+	var unlaunchable []string
+	for name, prof := range realSandboxProfiles(t) {
+		root := t.TempDir()
+		canonicalRoot, err := canonicalSandboxPath(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ws := filepath.Join(canonicalRoot, ".evolve", "runs", "cycle-7")
+		if err := os.MkdirAll(ws, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		grants, err := resolveSandboxWriteGrants(prof.Sandbox.WriteSubpaths, root, t.TempDir(), ws)
+		if err != nil {
+			t.Fatalf("%s: the resolver refused the profile's own declarations: %v", name, err)
+		}
+		denies, err := resolveSandboxDenials(prof.Sandbox.DenySubpaths, root, "", true)
+		if err != nil {
+			unlaunchable = append(unlaunchable, name)
+			continue
+		}
+		writable := func(p string) bool { return coveredByAGrant(p, grants) && !coveredByAGrant(p, denies) }
+		if other := filepath.Join(canonicalRoot, ".evolve", "runs", "cycle-8", "forged"); writable(other) {
+			t.Errorf("%s can write another cycle's run dir %s (write_subpaths %v, grants %v)", name, other, prof.Sandbox.WriteSubpaths, grants)
+		}
+		for _, declared := range prof.Sandbox.WriteSubpaths {
+			if rest, ok := strings.CutPrefix(declared, runDirGlob); ok && !writable(filepath.Join(ws, rest, "artifact")) {
+				t.Errorf("%s declares %q but cannot write it in its own run dir (grants %v)", name, declared, grants)
+			}
+		}
+	}
+	slices.Sort(unlaunchable)
+	if !slices.Equal(unlaunchable, []string{"orchestrator.json"}) {
+		t.Fatalf("profiles whose denials do not resolve, so the launcher refuses them: %v; each other profile must pass the isolation check", unlaunchable)
+	}
+}
+
+func TestResolveSandboxWriteGrants_RefusesASymlinkRetargetBelowTheBase(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	target := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".evolve", "inbox"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(root, ".evolve", "inbox", "processing")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := resolveSandboxWriteGrants([]string{".evolve/inbox/processing"}, root, t.TempDir(), ""); err == nil {
+		t.Fatalf("a retargeted grant was accepted: %v — honoring it would hand the phase write access to %s", got, target)
+	}
+}
+
+var subpathArgRe = regexp.MustCompile(`\(subpath "([^"]*)"\)`)
+
+func TestTriageProfile_GrantsTheClaimMove(t *testing.T) {
+	t.Parallel()
+	prof, err := LoadProfile(filepath.Join(realProfilesDir(t), "triage.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	grants, err := resolveSandboxWriteGrants(prof.Sandbox.WriteSubpaths, root, t.TempDir(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalRoot, err := canonicalSandboxPath(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbox := filepath.Join(canonicalRoot, ".evolve", "inbox")
+	for _, dir := range []string{inbox, filepath.Join(inbox, "processing", "cycle-1630")} {
+		if !coveredByAGrant(dir, grants) {
+			t.Fatalf("the claim writes %s, which no triage grant covers (grants %v) — the rename is refused at the source directory, exactly cycle 1630's EPERM", dir, grants)
+		}
+	}
+}
+
+func coveredByAGrant(dir string, grants []string) bool {
+	for _, g := range grants {
+		if dir == g || strings.HasPrefix(dir, g+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestTriageProfile_DeniesTheInboxAuditTrail(t *testing.T) {
+	t.Parallel()
+	prof, err := LoadProfile(filepath.Join(realProfilesDir(t), "triage.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	for _, d := range []string{"consumed", "processed", "retry"} {
+		if err := os.MkdirAll(filepath.Join(root, ".evolve", "inbox", d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	denies, err := resolveSandboxDenials(prof.Sandbox.DenySubpaths, root, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sbpl := renderSBPL(t, SandboxWrapRequest{
+		Phase: "triage", RepoRoot: root, Worktree: t.TempDir(), Workspace: t.TempDir(),
+		WriteSubpaths: prof.Sandbox.WriteSubpaths, DenyPaths: denies,
+	})
+	canonicalRoot, err := canonicalSandboxPath(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowAt := strings.Index(sbpl, allowWriteLine(filepath.Join(canonicalRoot, ".evolve", "inbox")))
+	if allowAt < 0 {
+		t.Fatalf("the inbox grant is missing:\n%s", sbpl)
+	}
+	for _, d := range []string{"consumed", "processed", "retry"} {
+		deny := "(deny file-write* (subpath " + strconv.Quote(filepath.Join(canonicalRoot, ".evolve", "inbox", d)) + "))"
+		at := strings.Index(sbpl, deny)
+		if at < 0 {
+			t.Fatalf("triage can write %s/ — the inbox grant is recursive and nothing carves the audit trail back out:\n%s", d, sbpl)
+		}
+		if at < allowAt {
+			t.Fatalf("the %s/ deny precedes the inbox grant; SBPL applies the LAST matching rule, so the grant would win", d)
+		}
+	}
+}

@@ -1,0 +1,288 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strconv"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/adapters/ledger"
+	"github.com/mickeyyaya/evolve-loop/go/internal/paths"
+)
+
+func runLedger(args []string, _ io.Reader, stdout, stderr io.Writer) int {
+	if len(args) < 1 {
+		fmt.Fprintln(stderr, "evolve ledger: missing subcommand (try: verify | seal | tail | anchor | rebaseline | evidence)")
+		return 10
+	}
+	switch args[0] {
+	case "verify":
+		return runLedgerVerify(args[1:], stdout, stderr)
+	case "seal":
+		return runLedgerSeal(args[1:], stderr)
+	case "tail":
+		return runLedgerTail(args[1:], stdout, stderr)
+	case "anchor":
+		return runLedgerAnchor(args[1:], stderr)
+	case "rebaseline":
+		return runLedgerRebaseline(args[1:], stderr)
+	case "evidence":
+		return runLedgerEvidence(args[1:], stdout, stderr)
+	default:
+		fmt.Fprintf(stderr, "evolve ledger: unknown subcommand %q\n", args[0])
+		return 10
+	}
+}
+
+type ledgerVerifyResult struct {
+	Ledger            string `json:"ledger"`
+	Deep              bool   `json:"deep"`
+	Scope             string `json:"scope"`
+	AnchorSeq         int    `json:"anchor_seq,omitempty"`
+	AnchorLineSHA     string `json:"anchor_line_sha,omitempty"`
+	FromSealedSegment bool   `json:"from_sealed_segment"`
+	VerifiedFrom      string `json:"verified_from"`
+}
+
+func runLedgerVerify(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("evolve ledger verify", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var evolveDir, projectRoot string
+	var deep, asJSON bool
+	fs.StringVar(&evolveDir, "evolve-dir", "", "path to .evolve/ state directory (default: <project root>/.evolve)")
+	fs.StringVar(&projectRoot, "project-root", "", "project root (default: $EVOLVE_PROJECT_ROOT or cwd)")
+	fs.BoolVar(&deep, "deep", false, "reconstruct sealed segments + live tail and verify end-to-end")
+	fs.BoolVar(&asJSON, "json", false, "print the result as JSON")
+	if err := fs.Parse(args); err != nil {
+		return cliExitUsage
+	}
+	if evolveDir == "" {
+		root, err := loopStopRoot(projectRoot, stderr)
+		if err != nil {
+			fmt.Fprintf(stderr, "[ledger] cwd: %v\n", err)
+			return cliExitIO
+		}
+		if rc := checkRootHasEvolve("ledger verify", root, stderr); rc != 0 {
+			return rc
+		}
+		evolveDir = paths.EvolveDirOf(root)
+	}
+	l := ledger.New(evolveDir)
+	verify, scope := l.VerifyScope, "chain intact"
+	if deep {
+		verify, scope = l.VerifyDeepScope, "chain intact incl. sealed segments"
+	}
+	verified, err := verify(context.Background())
+	if err != nil {
+		fmt.Fprintf(stderr, "[ledger] BROKEN: %v\n", err)
+		return cliExitIO
+	}
+	result := ledgerVerifyResult{Ledger: filepath.Join(evolveDir, "ledger.jsonl"), Deep: deep, Scope: scope,
+		AnchorSeq: verified.AnchorSeq, AnchorLineSHA: verified.AnchorLineSHA, FromSealedSegment: verified.FromSealedSegment, VerifiedFrom: verifiedFrom(verified)}
+	if _, err := os.Stat(result.Ledger); errors.Is(err, os.ErrNotExist) {
+		result.VerifiedFrom = "no ledger file exists; nothing was verified"
+	}
+	if asJSON {
+		return printVerbJSON("ledger verify", result, stdout, stderr)
+	}
+	fmt.Fprintf(stderr, "[ledger] OK: %s (%s/ledger.jsonl) — %s\n", scope, evolveDir, result.VerifiedFrom)
+	return 0
+}
+
+func verifiedFrom(s ledger.VerifiedScope) string {
+	if s.AnchorLineSHA == "" {
+		return "verified strictly from genesis (no epoch anchor)"
+	}
+	if s.FromSealedSegment {
+		return fmt.Sprintf("live tail verified strictly from the newest sealed segment's last line entry_seq=%d line-sha %s; --deep verifies the sealed segments",
+			s.AnchorSeq, s.AnchorLineSHA)
+	}
+	return fmt.Sprintf("verified strictly from epoch anchor entry_seq=%d line-sha %s; the preserved prefix before it is operator-adjudicated, NOT chain-validated",
+		s.AnchorSeq, s.AnchorLineSHA)
+}
+
+func runLedgerSeal(args []string, stderr io.Writer) int {
+	fs := flag.NewFlagSet("evolve ledger seal", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var evolveDir string
+	var keep int
+	fs.StringVar(&evolveDir, "evolve-dir", ".evolve", "path to .evolve/ state directory")
+	fs.IntVar(&keep, "keep", 500, "live-tail lines to keep unsealed (min 1)")
+	if err := fs.Parse(args); err != nil {
+		return 10
+	}
+	l := ledger.New(evolveDir)
+	if err := l.Seal(context.Background(), keep); err != nil {
+		fmt.Fprintf(stderr, "[ledger] seal failed: %v\n", err)
+		return 1
+	}
+	if err := l.VerifyDeep(context.Background()); err != nil {
+		fmt.Fprintf(stderr, "[ledger] seal completed but deep verify FAILED: %v\n", err)
+		return 2
+	}
+	fmt.Fprintf(stderr, "[ledger] OK: sealed (keep=%d) and deep-verified (%s)\n", keep, evolveDir)
+	return 0
+}
+
+func runLedgerAnchor(args []string, stderr io.Writer) int {
+	if len(args) < 1 {
+		fmt.Fprintln(stderr, "evolve ledger anchor: usage: evolve ledger anchor <entry_seq> [--note S] [--line-sha SHA] [--evolve-dir DIR]")
+		return 10
+	}
+	seq, err := strconv.Atoi(args[0])
+	if err != nil {
+		fmt.Fprintf(stderr, "evolve ledger anchor: <entry_seq> must be an integer: %v\n", err)
+		return 10
+	}
+	fs := flag.NewFlagSet("evolve ledger anchor", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var evolveDir, note, lineSHA string
+	fs.StringVar(&evolveDir, "evolve-dir", ".evolve", "path to .evolve/ state directory")
+	fs.StringVar(&note, "note", "", "operator note recorded with the anchor (why this epoch is trusted)")
+	fs.StringVar(&lineSHA, "line-sha", "", "sha256 of the exact line to anchor; required when >1 line carries <entry_seq>")
+	if err := fs.Parse(args[1:]); err != nil {
+		return 10
+	}
+	l := ledger.New(evolveDir)
+	if err := l.AnchorLine(context.Background(), seq, lineSHA, note); err != nil {
+		fmt.Fprintf(stderr, "[ledger] anchor failed: %v\n", err)
+		if errors.Is(err, ledger.ErrAmbiguousAnchorSeq) {
+			fmt.Fprintf(stderr, "[ledger] disambiguate with: evolve ledger anchor %d --line-sha <sha256-from-the-list-above>\n", seq)
+		}
+		return 1
+	}
+	if err := l.Verify(context.Background()); err != nil {
+		fmt.Fprintf(stderr, "[ledger] anchor recorded at entry_seq=%d but the chain still does NOT verify forward: %v\n", seq, err)
+		return 2
+	}
+	fmt.Fprintf(stderr, "[ledger] OK: epoch-anchored at entry_seq=%d (%s/ledger-anchor.json). "+
+		"Pre-anchor history is PRESERVED and no longer chain-validated — trusted by this operator action; the chain verifies strictly forward from here.\n", seq, evolveDir)
+	return 0
+}
+
+func runLedgerRebaseline(args []string, stderr io.Writer) int {
+	fs := flag.NewFlagSet("evolve ledger rebaseline", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var evolveDir, note string
+	fs.StringVar(&evolveDir, "evolve-dir", ".evolve", "path to .evolve/ state directory")
+	fs.StringVar(&note, "note", "", "REQUIRED operator sign-off: why this damaged prefix is accepted")
+	if err := fs.Parse(args); err != nil {
+		return 10
+	}
+	l := ledger.New(evolveDir)
+	if err := l.Rebaseline(context.Background(), note); err != nil {
+		fmt.Fprintf(stderr, "[ledger] rebaseline failed: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stderr, "[ledger] OK: rebaselined (%s/ledger.jsonl). The prior chain is PRESERVED on disk and no longer "+
+		"chain-validated — trusted by this operator action; the chain verifies strictly forward from the seal.\n", evolveDir)
+	return 0
+}
+
+func runLedgerEvidence(args []string, stdout, stderr io.Writer) int {
+	if len(args) < 1 || args[0] != "restore" {
+		fmt.Fprintln(stderr, "evolve ledger evidence: usage: evolve ledger evidence restore [--evolve-dir DIR] [--repo DIR] [--dry-run]")
+		return 10
+	}
+	fs := flag.NewFlagSet("evolve ledger evidence restore", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var evolveDir, repo string
+	var dryRun bool
+	fs.StringVar(&evolveDir, "evolve-dir", ".evolve", "path to .evolve/ state directory")
+	fs.StringVar(&repo, "repo", "", "git work tree whose objects the composition lines name (default: the evolve dir's parent)")
+	fs.BoolVar(&dryRun, "dry-run", false, "report what would be stored or rebuilt and write nothing")
+	if err := fs.Parse(args[1:]); err != nil {
+		return 10
+	}
+	if repo == "" {
+		repo = filepath.Dir(evolveDir)
+	}
+	l := ledger.New(evolveDir)
+	walk, pending := l.RestoreCompositionEvidence, ""
+	if dryRun {
+		walk, pending = l.PreviewCompositionEvidence, "would be "
+	}
+	results, err := walk(context.Background(), repo)
+	if err != nil {
+		fmt.Fprintf(stderr, "[ledger] evidence restore failed: %v\n", err)
+		return 1
+	}
+	if refused := reportEvidence(stdout, results, pending); refused > 0 {
+		fmt.Fprintf(stderr, "[ledger] evidence restore: %d composition line(s) could not be restored and were left as they were\n", refused)
+		return 1
+	}
+	if dryRun {
+		fmt.Fprintf(stderr, "[ledger] evidence restore --dry-run: %d composition line(s) checked, nothing written\n", len(results))
+		return 0
+	}
+	if err := l.Verify(context.Background()); err != nil {
+		fmt.Fprintf(stderr, "[ledger] evidence restored but the chain still does NOT verify: %v\n", err)
+		return 2
+	}
+	fmt.Fprintf(stderr, "[ledger] OK: the evidence of %d composition line(s) is in the store and the chain verifies (%s/ledger.jsonl)\n", len(results), evolveDir)
+	return 0
+}
+
+func reportEvidence(w io.Writer, results []ledger.EvidenceRestoration, pending string) (refused int) {
+	for _, r := range results {
+		outcome := string(r.Action)
+		switch r.Action {
+		case ledger.EvidenceUnrestorable:
+			refused++
+			outcome += ": " + r.Reason
+		case ledger.EvidenceStored, ledger.EvidenceRebuilt:
+			outcome = pending + outcome
+		}
+		fmt.Fprintf(w, "line %d cycle %d %s: %s\n", r.Line, r.Cycle, r.Method, outcome)
+	}
+	return refused
+}
+
+func runLedgerTail(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("evolve ledger tail", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var evolveDir string
+	var n int
+	fs.StringVar(&evolveDir, "evolve-dir", ".evolve", "path to .evolve/ state directory")
+	fs.IntVar(&n, "n", 10, "number of entries to print (0 = all)")
+	if err := fs.Parse(args); err != nil {
+		return 10
+	}
+	l := ledger.New(evolveDir)
+	it, err := l.Iter(context.Background())
+	if err != nil {
+		fmt.Fprintf(stderr, "[ledger] tail: %v\n", err)
+		return 1
+	}
+	defer func() { _ = it.Close() }()
+	var collected []any
+	for {
+		entry, ok, err := it.Next()
+		if err != nil {
+			fmt.Fprintf(stderr, "[ledger] tail: %v\n", err)
+			return 1
+		}
+		if !ok {
+			break
+		}
+		collected = append(collected, entry)
+	}
+	start := 0
+	if n > 0 && len(collected) > n {
+		start = len(collected) - n
+	}
+	for _, e := range collected[start:] {
+		buf, err := json.Marshal(e)
+		if err != nil {
+			fmt.Fprintf(stderr, "[ledger] tail: marshal: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "%s\n", buf)
+	}
+	return 0
+}

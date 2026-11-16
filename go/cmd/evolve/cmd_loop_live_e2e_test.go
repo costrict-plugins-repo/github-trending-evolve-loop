@@ -1,0 +1,192 @@
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/adapters/bridge"
+	"github.com/mickeyyaya/evolve-loop/go/internal/adapters/ledger"
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+	"github.com/mickeyyaya/evolve-loop/go/internal/cycleclassify"
+	"github.com/mickeyyaya/evolve-loop/go/internal/dispatchevents"
+	"github.com/mickeyyaya/evolve-loop/go/internal/ledgerverify"
+)
+
+func minimalProfileJSON(artifact string) []byte {
+	p := map[string]any{
+		"name":               "scout",
+		"role":               "scout",
+		"cli":                "claude-p",
+		"model_tier_default": "haiku",
+		"allowed_tools":      []string{"Bash", "Write", "Edit"},
+		"output_artifact":    artifact,
+		"max_turns":          3,
+		"parallel_eligible":  false,
+		"permission_mode":    "acceptEdits",
+	}
+	b, _ := json.MarshalIndent(p, "", "  ")
+	return b
+}
+
+func randHex(n int) string {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func TestE2E_M4PipelineAgainstLiveLedger(t *testing.T) {
+	t.Parallel()
+	if os.Getenv("EVOLVE_E2E_LIVE_LLM") != "1" {
+		t.Skip("EVOLVE_E2E_LIVE_LLM!=1 — set to 1 to run live LLM e2e (~$0.05)")
+	}
+	if _, err := exec.LookPath("claude"); err != nil {
+		t.Skip("claude binary not on PATH")
+	}
+	if os.Getenv("ANTHROPIC_API_KEY") != "" {
+		t.Skip("ANTHROPIC_API_KEY is set — bridge refuses API-key auth path")
+	}
+	projectRoot := t.TempDir()
+	evolveDir := filepath.Join(projectRoot, ".evolve")
+	runsDir := filepath.Join(evolveDir, "runs", "cycle-1")
+	if err := os.MkdirAll(runsDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	br := bridge.New()
+	ld := ledger.New(evolveDir)
+
+	artifactPath := filepath.Join(runsDir, "scout-report.md")
+	profilePath := filepath.Join(t.TempDir(), "scout.json")
+	if err := os.WriteFile(profilePath, minimalProfileJSON(artifactPath), 0o644); err != nil {
+		t.Fatalf("write profile: %v", err)
+	}
+
+	challengeToken := randHex(8)
+	prompt := fmt.Sprintf(`You are a probe agent. Write exactly one file to %s with this content (first line MUST be the challenge token):
+
+%s
+
+# Scout report (e2e probe)
+Verdict: PASS
+
+Do nothing else. No further tool calls.
+`, artifactPath, challengeToken)
+
+	resp, err := br.Launch(context.Background(), core.BridgeRequest{
+		CLI:          "claude-p",
+		Profile:      profilePath,
+		Model:        "haiku",
+		Prompt:       prompt,
+		Workspace:    runsDir,
+		Agent:        "scout",
+		Cycle:        1,
+		ArtifactPath: artifactPath,
+	})
+	if err != nil {
+		for _, name := range []string{"scout-stderr.log", "scout-stdout.log", "scout-prompt.txt"} {
+			if b, rerr := os.ReadFile(filepath.Join(runsDir, name)); rerr == nil {
+				t.Logf("--- %s ---\n%s", name, b)
+			}
+		}
+		t.Fatalf("bridge.Launch: %v (resp=%+v)", err, resp)
+	}
+	t.Logf("bridge ran: exit=%d cost=$%.4f duration=%dms", resp.ExitCode, resp.CostUSD, resp.DurationMS)
+
+	if _, err := os.Stat(artifactPath); err != nil {
+		for _, name := range []string{"scout-stderr.log", "scout-stdout.log"} {
+			if b, rerr := os.ReadFile(filepath.Join(runsDir, name)); rerr == nil {
+				t.Logf("--- %s ---\n%s", name, b)
+			}
+		}
+		t.Fatalf("artifact missing at %s — claude refused or wrote elsewhere; stdout=%q", artifactPath, resp.Stdout)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	if err := ld.Append(context.Background(), core.LedgerEntry{
+		TS:             now,
+		Cycle:          1,
+		Role:           "scout",
+		Kind:           "agent_subprocess",
+		Model:          "haiku",
+		ExitCode:       0,
+		ArtifactPath:   artifactPath,
+		ChallengeToken: challengeToken,
+	}); err != nil {
+		t.Fatalf("ledger append: %v", err)
+	}
+
+	vr, err := ledgerverify.VerifyCycle(
+		context.Background(), ld, 1, ledgerverify.Options{},
+	)
+	if err != nil {
+		t.Fatalf("VerifyCycle: %v", err)
+	}
+	if vr.Scout < 1 {
+		t.Fatalf("VerifyCycle: scout count=0 want >=1")
+	}
+	if vr.OK {
+		t.Fatalf("VerifyCycle: OK=true but only scout ran — should flag missing builder+auditor")
+	}
+	if len(vr.Missing) < 2 {
+		t.Fatalf("missing=%v want at least [builder auditor]", vr.Missing)
+	}
+	t.Logf("verify: scout=%d missing=%v", vr.Scout, vr.Missing)
+
+	report := fmt.Sprintf(`# Cycle 1 orchestrator report
+
+Scout artifact: %s (challenge_token=%s)
+
+Build status: FAIL — 2/8 tests RED
+
+Verdict: FAIL
+`, artifactPath, challengeToken)
+	if err := os.WriteFile(filepath.Join(runsDir, "orchestrator-report.md"), []byte(report), 0o644); err != nil {
+		t.Fatalf("write report: %v", err)
+	}
+	class := cycleclassify.Classify(runsDir)
+	if class.Class != cycleclassify.ClassAuditFail && class.Class != cycleclassify.ClassBuildFail {
+		t.Fatalf("classify: got %s want audit-fail or build-fail (marker=%q)", class.Class, class.Marker)
+	}
+	t.Logf("classify: %s (marker=%q source=%q)", class.Class, class.Marker, class.Source)
+
+	dw := dispatchevents.NewWriter(runsDir)
+	if err := dw.EmitVerifyFailed(1, vr.Missing); err != nil {
+		t.Fatalf("EmitVerifyFailed: %v", err)
+	}
+	if err := dw.EmitClassification(1, string(class.Class)); err != nil {
+		t.Fatalf("EmitClassification: %v", err)
+	}
+	events, err := os.ReadFile(filepath.Join(runsDir, "abnormal-events.jsonl"))
+	if err != nil {
+		t.Fatalf("read events: %v", err)
+	}
+	if !strings.Contains(string(events), "verify-failed") {
+		t.Fatalf("events should contain verify-failed: %s", events)
+	}
+	if !strings.Contains(string(events), "classification") {
+		t.Fatalf("events should contain classification: %s", events)
+	}
+
+	ledgerBytes, err := os.ReadFile(filepath.Join(evolveDir, "ledger.jsonl"))
+	if err != nil {
+		t.Fatalf("read ledger: %v", err)
+	}
+	t.Logf("ledger.jsonl produced end-to-end:\n%s", ledgerBytes)
+}
+
+func TestE2E_M4LedgerEntryShapeMatch(t *testing.T) {
+	t.Parallel()
+	if os.Getenv("EVOLVE_E2E_LIVE_LLM") != "1" {
+		t.Skip("EVOLVE_E2E_LIVE_LLM!=1")
+	}
+	t.Skip("covered by TestE2E_M4PipelineAgainstLiveLedger — kept as named entrypoint for selective runs")
+}

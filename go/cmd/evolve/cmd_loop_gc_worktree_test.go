@@ -1,0 +1,201 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/fakeclitest"
+	"github.com/mickeyyaya/evolve-loop/go/internal/gc"
+	"github.com/mickeyyaya/evolve-loop/go/internal/gittest"
+	"github.com/mickeyyaya/evolve-loop/go/internal/proctree"
+	"github.com/mickeyyaya/evolve-loop/go/internal/swarm"
+)
+
+const workspaceGCManifestName = "workspace-gc-manifest.json"
+
+const gcOrphanBranch = "cycle-777"
+
+func gcGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null",
+		"GIT_AUTHOR_NAME=evolve-test", "GIT_AUTHOR_EMAIL=test@evolve.local",
+		"GIT_COMMITTER_NAME=evolve-test", "GIT_COMMITTER_EMAIL=test@evolve.local",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return string(out)
+}
+
+func gcWorktreeEnv(t *testing.T, mode string) (projectRoot, evolveDir, workspace string) {
+	t.Helper()
+	t.Setenv("TMUX_TMPDIR", t.TempDir())
+	t.Setenv("GOCACHE", t.TempDir())
+	prevReapers := gcInjectedReapers
+	gcInjectedReapers = &gcReapers{
+		sessions: func(context.Context) swarm.OrphanReapReport { return swarm.OrphanReapReport{} },
+		sockets:  func(context.Context) swarm.OrphanSocketReport { return swarm.OrphanSocketReport{} },
+	}
+	prevHost := gcInjectedProcessHost
+	gcInjectedProcessHost = &gcProcessHost{
+		list:   func(context.Context) ([]proctree.Process, error) { return nil, nil },
+		signal: func(int, syscall.Signal) error { return nil },
+		sleep:  func(time.Duration) {},
+		alive:  func(int) bool { return false },
+	}
+	t.Cleanup(func() {
+		gcInjectedReapers = prevReapers
+		gcInjectedProcessHost = prevHost
+	})
+	binDir := t.TempDir()
+	fakeclitest.Install(t, filepath.Join(binDir, "lsof"), "#!/bin/sh\nprintf 'p1\\nR0\\nn/\\n'\n")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	projectRoot = gittest.FromTemplate(t, "cmd-evolve-gc-worktree", func(r *gittest.Repo) error {
+		r.Git("init", "-q", "-b", "main")
+		r.Write("seed.txt", "seed\n")
+		r.Git("add", "seed.txt")
+		r.Git("commit", "-m", "seed")
+		r.Git("branch", gcOrphanBranch)
+		return nil
+	}).Dir
+	workspace = t.TempDir()
+
+	evolveDir = filepath.Join(projectRoot, ".evolve")
+	if err := os.MkdirAll(filepath.Join(evolveDir, "runs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pol := `{"gc":{"runs":{"keep_full":1,"delete_after_days":1}}}`
+	if mode != "" {
+		pol = `{"gc":{"mode":"` + mode + `","runs":{"keep_full":1,"delete_after_days":1}}}`
+	}
+	if err := os.WriteFile(filepath.Join(evolveDir, "policy.json"), []byte(pol), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return projectRoot, evolveDir, workspace
+}
+
+func gcReadWorktreeManifest(t *testing.T, workspace string) (gc.WorktreeManifest, bool) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(workspace, workspaceGCManifestName))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return gc.WorktreeManifest{}, false
+		}
+		t.Fatal(err)
+	}
+	var m gc.WorktreeManifest
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("%s is not a valid gc.WorktreeManifest: %v (raw=%s)", workspaceGCManifestName, err, raw)
+	}
+	return m, true
+}
+
+func gcBranchExists(t *testing.T, projectRoot, branch string) bool {
+	t.Helper()
+	return strings.TrimSpace(gcGit(t, projectRoot, "branch", "--list", branch)) != ""
+}
+
+func gcManifestPlansBranchDelete(m gc.WorktreeManifest, branch string) bool {
+	for _, it := range m.Items {
+		if it.Branch == branch && it.Action == gc.WorktreeActionDeleteBranch {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRunGCHook_DefaultModeIsShadow(t *testing.T) {
+	projectRoot, evolveDir, workspace := gcWorktreeEnv(t, "")
+
+	var buf bytes.Buffer
+	runGCHook(loopConfig{EvolveDir: evolveDir, ProjectRoot: projectRoot}, workspace, &buf)
+
+	if _, ok := gcReadManifest(t, workspace); !ok {
+		t.Errorf("absent gc.mode must default to shadow and write %s; stderr=%q", gcManifestName, buf.String())
+	}
+	if _, ok := gcReadWorktreeManifest(t, workspace); !ok {
+		t.Errorf("absent gc.mode must default to shadow and write %s; stderr=%q", workspaceGCManifestName, buf.String())
+	}
+	if !gcBranchExists(t, projectRoot, gcOrphanBranch) {
+		t.Errorf("shadow default must NOT mutate: branch %s was deleted", gcOrphanBranch)
+	}
+}
+
+func TestRunGCHook_ShadowWritesWorkspaceManifest(t *testing.T) {
+	projectRoot, evolveDir, workspace := gcWorktreeEnv(t, "shadow")
+
+	var buf bytes.Buffer
+	runGCHook(loopConfig{EvolveDir: evolveDir, ProjectRoot: projectRoot}, workspace, &buf)
+
+	m, ok := gcReadWorktreeManifest(t, workspace)
+	if !ok {
+		t.Fatalf("shadow mode must write %s; stderr=%q", workspaceGCManifestName, buf.String())
+	}
+	if !gcManifestPlansBranchDelete(m, gcOrphanBranch) {
+		t.Errorf("manifest must plan delete-branch for merged orphan %s; items=%+v", gcOrphanBranch, m.Items)
+	}
+	if !gcBranchExists(t, projectRoot, gcOrphanBranch) {
+		t.Errorf("shadow mode must NOT mutate: branch %s was deleted", gcOrphanBranch)
+	}
+}
+
+func TestRunGCHook_EnforceAppliesWorktreeSweep(t *testing.T) {
+	projectRoot, evolveDir, workspace := gcWorktreeEnv(t, "enforce")
+
+	var buf bytes.Buffer
+	runGCHook(loopConfig{EvolveDir: evolveDir, ProjectRoot: projectRoot}, workspace, &buf)
+
+	if _, ok := gcReadWorktreeManifest(t, workspace); !ok {
+		t.Errorf("enforce mode must also write %s; stderr=%q", workspaceGCManifestName, buf.String())
+	}
+	if gcBranchExists(t, projectRoot, gcOrphanBranch) {
+		t.Errorf("enforce mode must DELETE merged orphan branch %s; stderr=%q", gcOrphanBranch, buf.String())
+	}
+}
+
+func TestRunGCHook_ExplicitOffSkipsWorktreeSweep(t *testing.T) {
+	projectRoot, evolveDir, workspace := gcWorktreeEnv(t, "off")
+
+	var buf bytes.Buffer
+	runGCHook(loopConfig{EvolveDir: evolveDir, ProjectRoot: projectRoot}, workspace, &buf)
+
+	if _, ok := gcReadWorktreeManifest(t, workspace); ok {
+		t.Errorf("explicit gc.mode=off must NOT write %s", workspaceGCManifestName)
+	}
+	if _, ok := gcReadManifest(t, workspace); ok {
+		t.Errorf("explicit gc.mode=off must NOT write %s", gcManifestName)
+	}
+	if !gcBranchExists(t, projectRoot, gcOrphanBranch) {
+		t.Errorf("explicit gc.mode=off must not mutate: branch %s was deleted", gcOrphanBranch)
+	}
+}
+
+func TestRunGCHook_NonGitProjectRootIsFailOpen(t *testing.T) {
+	t.Parallel()
+	evolveDir, workspace, keptPath, targetPath := gcEnv(t)
+	gcSetMode(t, evolveDir, "shadow")
+
+	var buf bytes.Buffer
+	runGCHook(loopConfig{EvolveDir: evolveDir, ProjectRoot: filepath.Dir(evolveDir)}, workspace, &buf)
+
+	if _, ok := gcReadManifest(t, workspace); !ok {
+		t.Errorf("run-dir GC must still publish %s when the worktree sweep cannot run; stderr=%q", gcManifestName, buf.String())
+	}
+	for _, p := range []string{keptPath, targetPath} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("shadow mode must not mutate the tree, but %q is gone: %v", p, err)
+		}
+	}
+}

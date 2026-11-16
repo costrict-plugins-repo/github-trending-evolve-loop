@@ -1,0 +1,159 @@
+package quotareset_test
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/quotareset"
+)
+
+func refNow() time.Time { return time.Date(2026, 6, 20, 14, 0, 0, 0, time.UTC) }
+
+func fixedClock() func() time.Time { return func() time.Time { return refNow() } }
+
+func hintWorkspace(t *testing.T, body string) string {
+	t.Helper()
+	ws := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ws, "quota-reset-hint.txt"), []byte(body), 0o644); err != nil {
+		t.Fatalf("write hint: %v", err)
+	}
+	return ws
+}
+
+func TestCompute_Source1_ResetAt(t *testing.T) {
+	valid := "2026-06-21T09:00:00Z"
+	cases := []struct {
+		name       string
+		resetAt    string
+		wantSource string
+		wantISO    string
+		wantWake   time.Time
+	}{
+		{"valid-rfc3339", valid, "operator-override", valid, time.Date(2026, 6, 21, 9, 0, 0, 0, time.UTC)},
+		{"unparseable-nonempty", "not-a-time", "operator-override", "not-a-time", refNow()},
+		{"empty-falls-through", "", "unknown", "", time.Time{}},
+		{"whitespace-only-trimmed-falls-through", "   \t ", "unknown", "", time.Time{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := quotareset.Compute("", quotareset.Options{ResetAt: tc.resetAt, Now: fixedClock()})
+			if err != nil {
+				t.Fatalf("Compute never errors on this path, got %v", err)
+			}
+			if r.Source != tc.wantSource {
+				t.Errorf("Source = %q, want %q", r.Source, tc.wantSource)
+			}
+			if tc.wantSource == "operator-override" {
+				if r.ISO != tc.wantISO {
+					t.Errorf("ISO = %q, want %q", r.ISO, tc.wantISO)
+				}
+				if !r.WakeAt.Equal(tc.wantWake) {
+					t.Errorf("WakeAt = %v, want %v", r.WakeAt, tc.wantWake)
+				}
+			}
+		})
+	}
+}
+
+func TestCompute_SourcePrecedence(t *testing.T) {
+	ws := hintWorkspace(t, "resets 8:30pm")
+	override := "2026-06-21T09:00:00Z"
+	cases := []struct {
+		name       string
+		workspace  string
+		opts       quotareset.Options
+		wantSource string
+	}{
+		{"resetAt-beats-hint", ws, quotareset.Options{ResetAt: override, Now: fixedClock()}, "operator-override"},
+		{"resetAt-beats-defaulthours", "", quotareset.Options{ResetAt: override, DefaultHours: 3, Now: fixedClock()}, "operator-override"},
+		{"hint-beats-defaulthours", ws, quotareset.Options{DefaultHours: 3, Now: fixedClock()}, "parsed"},
+		{"defaulthours-when-alone", "", quotareset.Options{DefaultHours: 3, Now: fixedClock()}, "default"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, _ := quotareset.Compute(tc.workspace, tc.opts)
+			if r.Source != tc.wantSource {
+				t.Errorf("Source = %q, want %q", r.Source, tc.wantSource)
+			}
+		})
+	}
+}
+
+func TestCompute_Source2_HintParsing(t *testing.T) {
+	cases := []struct {
+		name       string
+		hint       string
+		wantSource string
+		wantDay    int
+		wantHour   int
+		wantMin    int
+	}{
+		{"future-today-8:30pm", "resets 8:30pm", "parsed", 20, 20, 30},
+		{"past-today-rolls-tomorrow-5:20am", "resets 5:20am", "parsed", 21, 5, 20},
+		{"noon-12:00pm", "back at 12:00pm", "parsed", 21, 12, 0},
+		{"midnight-12:00am", "back at 12:00am", "parsed", 21, 0, 0},
+		{"midnight-00:00am", "back at 00:00am", "parsed", 21, 0, 0},
+		{"unparseable-garbage", "garbage no time here", "unknown", 0, 0, 0},
+		{"out-of-range-99:99am", "resets 99:99am", "unknown", 0, 0, 0},
+		{"missing-ampm", "resets 8:30", "unknown", 0, 0, 0},
+		{"empty-hint-file", "", "unknown", 0, 0, 0},
+		{"truncated-past-32-drops-time", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx8:30pm", "unknown", 0, 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ws := hintWorkspace(t, tc.hint)
+			r, _ := quotareset.Compute(ws, quotareset.Options{Now: fixedClock()})
+			if r.Source != tc.wantSource {
+				t.Fatalf("Source = %q, want %q", r.Source, tc.wantSource)
+			}
+			if tc.wantSource == "parsed" {
+				if r.WakeAt.Day() != tc.wantDay || r.WakeAt.Hour() != tc.wantHour || r.WakeAt.Minute() != tc.wantMin {
+					t.Errorf("WakeAt = %v, want day=%d hour=%d min=%d", r.WakeAt, tc.wantDay, tc.wantHour, tc.wantMin)
+				}
+			}
+		})
+	}
+}
+
+func TestCompute_Source2_SkippedWhenNoWorkspace(t *testing.T) {
+	r, _ := quotareset.Compute("", quotareset.Options{Now: fixedClock()})
+	if r.Source != "unknown" {
+		t.Errorf("Source = %q, want unknown (source 2 skipped when workspace empty)", r.Source)
+	}
+}
+
+func TestCompute_Source3_DefaultHours(t *testing.T) {
+	cases := []struct {
+		name       string
+		hours      float64
+		wantHours  float64
+		wantSource string
+	}{
+		{"zero-is-unknown-now", 0, 0, "unknown"},
+		{"positive-used", 3, 3, "default"},
+		{"negative-is-unknown-now", -5, 0, "unknown"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, _ := quotareset.Compute("", quotareset.Options{DefaultHours: tc.hours, Now: fixedClock()})
+			want := refNow().Add(time.Duration(tc.wantHours * float64(time.Hour)))
+			if r.Source != tc.wantSource {
+				t.Fatalf("Source = %q, want %q", r.Source, tc.wantSource)
+			}
+			if !r.WakeAt.Equal(want) {
+				t.Errorf("WakeAt = %v, want %v (hours=%v)", r.WakeAt, want, tc.wantHours)
+			}
+		})
+	}
+}
+
+func TestResult_Format(t *testing.T) {
+	r := quotareset.Result{ISO: "2026-06-21T09:00:00Z", Source: "operator-override"}
+	got := r.Format()
+	want := "2026-06-21T09:00:00Z\nsource=operator-override\n"
+	if got != want {
+		t.Errorf("Format() = %q, want %q", got, want)
+	}
+}

@@ -1,0 +1,466 @@
+package core
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/phasecontract"
+	"github.com/mickeyyaya/evolve-loop/go/internal/phasespec"
+	"github.com/mickeyyaya/evolve-loop/go/internal/router"
+)
+
+func judgmentLessonTodos(cr *cycleRun, phase Phase) []CarryoverTodo {
+	var out []CarryoverTodo
+	for _, td := range cr.state.CarryoverTodos {
+		if strings.Contains(td.Action, string(phase)) || strings.Contains(td.ID, string(phase)) {
+			out = append(out, td)
+		}
+	}
+	return out
+}
+
+func renderPersistedPlannerContext(t *testing.T, cr *cycleRun) (string, State) {
+	t.Helper()
+	persisted, err := cr.o.storage.ReadState(context.Background())
+	if err != nil {
+		t.Fatalf("ReadState: %v", err)
+	}
+	in := cr.o.advisorPlanInput(context.Background(), string(PhaseScout), router.RoutingSignals{},
+		cr.req, persisted, cr.cs, cr.cycle+1, cr.envSnap, nil)
+	var b strings.Builder
+	writeRoutingContext(&b, in)
+	return b.String(), persisted
+}
+
+func TestJudgmentLessonFullPath_PremiseChallengeSentinelFAILTeachesWithoutHalting(t *testing.T) {
+	t.Parallel()
+
+	const objection = "the proposed premise contradicts the recorded evidence"
+	artifact := strings.Join([]string{
+		"## Stated Premise\nThe implementation is safe.",
+		"## Falsification Attempts\nThe evidence contradicts that premise.",
+		"## Verdict\nFAIL",
+		phasecontract.RenderVerdictSentinelWithFailure("premise-challenge", VerdictFAIL,
+			&phasecontract.FailureBlock{Class: "premise-rejected", Defects: []string{objection}}),
+	}, "\n\n")
+	parsed, ok := phasecontract.ParseVerdictSentinelFull(artifact)
+	if !ok {
+		t.Fatal("ParseVerdictSentinelFull rejected the rendered premise-challenge sentinel")
+	}
+	if parsed.Failure == nil || len(parsed.Failure.Defects) != 1 {
+		t.Fatalf("parsed failure = %+v, want one defect", parsed.Failure)
+	}
+
+	t.Run("real_sentinel_parse_produces_the_FAIL", func(t *testing.T) {
+		if parsed.Phase != "premise-challenge" || parsed.Verdict != VerdictFAIL {
+			t.Errorf("parsed sentinel = phase %q verdict %q, want premise-challenge FAIL", parsed.Phase, parsed.Verdict)
+		}
+		if parsed.Failure.Defects[0] != objection {
+			t.Errorf("parsed defect = %q, want %q", parsed.Failure.Defects[0], objection)
+		}
+	})
+
+	cr := retroGateHarness(t, phasespec.Catalog{})
+	if err := os.WriteFile(cr.cs.WorkspacePath+"/premise-challenge-report.md", []byte(artifact), 0o644); err != nil {
+		t.Fatalf("write premise-challenge report: %v", err)
+	}
+	failedBefore := append([]FailedRecord(nil), cr.state.FailedAt...)
+	action, err := cr.recordAndBranch(Phase(parsed.Phase), dispatchResult{resp: PhaseResponse{
+		Verdict: parsed.Verdict,
+	}, attemptCount: 1})
+	prompt, persisted := renderPersistedPlannerContext(t, cr)
+
+	t.Run("objection_reaches_next_cycle_planner_context", func(t *testing.T) {
+		lessons := judgmentLessonTodos(cr, Phase(parsed.Phase))
+		if len(lessons) != 1 {
+			t.Fatalf("persisted premise-challenge lessons = %d, want 1: %+v", len(lessons), persisted.CarryoverTodos)
+		}
+		if got := strings.Count(lessons[0].Action, objection); got != 1 {
+			t.Errorf("persisted lesson contains objection %d times, want 1: %+v", got, lessons[0])
+		}
+		if got := strings.Count(prompt, objection); got != 1 {
+			t.Errorf("next-cycle planner context contains objection %d times, want 1\n%s", got, prompt)
+		}
+	})
+
+	t.Run("failed_at_unchanged_and_continuation_non_halting", func(t *testing.T) {
+		if err != nil {
+			t.Errorf("recordAndBranch returned error: %v", err)
+		}
+		if action == loopAbort {
+			t.Error("premise-challenge lesson aborted the loop")
+		}
+		if !reflect.DeepEqual(persisted.FailedAt, failedBefore) {
+			t.Errorf("FailedAt changed after judgment lesson: got %+v, want %+v", persisted.FailedAt, failedBefore)
+		}
+	})
+}
+
+func TestJudgmentLessonFullPath_NoLessonWithoutAWellFormedSentinelFAIL(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		artifact string
+	}{
+		{name: "stated_PASS", artifact: phasecontract.RenderVerdictSentinelWithFailure("premise-challenge", VerdictPASS, nil)},
+		{name: "malformed_sentinel", artifact: `<!-- evolve-verdict: {"phase":"premise-challenge","verdict":} -->`},
+		{name: "absent_sentinel", artifact: "premise challenge completed without a verdict sentinel"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cr := retroGateHarness(t, phasespec.Catalog{})
+			verdict := VerdictPASS
+			parsed, ok := phasecontract.ParseVerdictSentinelFull(tt.artifact)
+			if ok {
+				verdict = parsed.Verdict
+			}
+			if _, err := cr.recordAndBranch(Phase("premise-challenge"), dispatchResult{
+				resp: PhaseResponse{Verdict: verdict}, attemptCount: 1,
+			}); err != nil {
+				t.Fatalf("recordAndBranch: %v", err)
+			}
+			_, persisted := renderPersistedPlannerContext(t, cr)
+			if got := judgmentLessonTodos(cr, Phase("premise-challenge")); len(got) != 0 {
+				t.Errorf("%s persisted %d premise-challenge lessons, want 0: %+v (all todos: %+v)",
+					tt.name, len(got), got, persisted.CarryoverTodos)
+			}
+		})
+	}
+}
+
+func TestJudgmentLessonEndToEnd_ReachesNextCyclePlannerPrompt(t *testing.T) {
+	t.Parallel()
+
+	const objection = "planner-visible premise objection"
+	cr := retroGateHarness(t, phasespec.Catalog{})
+	dr := dispatchResult{resp: PhaseResponse{
+		Verdict:     VerdictFAIL,
+		Diagnostics: []Diagnostic{{Severity: "error", Message: objection}},
+	}, attemptCount: 1}
+
+	if _, err := cr.recordAndBranch(Phase("premise-challenge"), dr); err != nil {
+		t.Fatalf("recordAndBranch: %v", err)
+	}
+	prompt, persisted := renderPersistedPlannerContext(t, cr)
+
+	lessons := 0
+	for _, td := range persisted.CarryoverTodos {
+		if strings.Contains(td.ID, "premise-challenge") {
+			lessons++
+			if td.Priority != carryoverPriorityLesson {
+				t.Errorf("persisted lesson priority = %q, want %q", td.Priority, carryoverPriorityLesson)
+			}
+		}
+	}
+	if lessons != 1 {
+		t.Fatalf("persisted premise-challenge lessons = %d, want 1", lessons)
+	}
+	if got := strings.Count(prompt, objection); got != 1 {
+		t.Errorf("next-cycle planner prompt contains objection %d times, want 1\n%s", got, prompt)
+	}
+}
+
+func TestJudgmentLessonEndToEnd_SurvivesPlannerPromptCapUnderCrowdedCarryover(t *testing.T) {
+	t.Parallel()
+
+	const objection = "new P1 judgment lesson survives the cap"
+	cr := retroGateHarness(t, phasespec.Catalog{})
+	for i := 0; i < maxCarryoverTodosInPrompt+5; i++ {
+		cr.state.CarryoverTodos = append(cr.state.CarryoverTodos, CarryoverTodo{
+			ID:             fmt.Sprintf("older-p2-%02d", i),
+			Action:         "lower-priority historical carryover",
+			Priority:       "P2",
+			FirstSeenCycle: i,
+		})
+	}
+	dr := dispatchResult{resp: PhaseResponse{
+		Verdict:     VerdictFAIL,
+		Diagnostics: []Diagnostic{{Severity: "error", Message: objection}},
+	}, attemptCount: 1}
+
+	if _, err := cr.recordAndBranch(Phase("premise-challenge"), dr); err != nil {
+		t.Fatalf("recordAndBranch: %v", err)
+	}
+	prompt, _ := renderPersistedPlannerContext(t, cr)
+
+	if !strings.Contains(prompt, objection) {
+		t.Errorf("P1 judgment lesson was omitted from the capped planner prompt\n%s", prompt)
+	}
+	if got := strings.Count(prompt, "- ["); got != maxCarryoverTodosInPrompt {
+		t.Errorf("rendered carryover count = %d, want cap %d", got, maxCarryoverTodosInPrompt)
+	}
+}
+
+func TestJudgmentLessonEndToEnd_ControlPhaseFAILReachesNoPlannerPrompt(t *testing.T) {
+	t.Parallel()
+
+	for _, phase := range []Phase{PhaseRetro, PhaseDebugger} {
+		t.Run(string(phase), func(t *testing.T) {
+			objection := "control-only-" + string(phase) + "-must-not-teach"
+			cr := retroGateHarness(t, phasespec.Catalog{})
+			dr := dispatchResult{resp: PhaseResponse{
+				Verdict:     VerdictFAIL,
+				Diagnostics: []Diagnostic{{Severity: "error", Message: objection}},
+			}, attemptCount: 1}
+
+			if _, err := cr.recordAndBranch(phase, dr); err != nil {
+				t.Fatalf("recordAndBranch: %v", err)
+			}
+			prompt, persisted := renderPersistedPlannerContext(t, cr)
+
+			if strings.Contains(prompt, objection) {
+				t.Errorf("control-phase FAIL reached planner prompt\n%s", prompt)
+			}
+			if got := len(persisted.CarryoverTodos); got != 0 {
+				t.Errorf("control-phase FAIL persisted %d carryover todos, want 0: %+v", got, persisted.CarryoverTodos)
+			}
+		})
+	}
+}
+
+func TestArtifactTimeoutEndToEnd_DiagnosticNeverMutatesRetryOrFailureLearning(t *testing.T) {
+	t.Parallel()
+
+	cr := retroGateHarness(t, phasespec.Catalog{})
+	timeout := fmt.Errorf("bridge dispatch: %w", ErrArtifactTimeout)
+
+	cr.recordFailureLearning(PhaseBuild, timeout, 1)
+	if code := bridgeExitCode(timeout); code != 81 {
+		t.Fatalf("artifact-timeout exit code = %d, want 81", code)
+	}
+	if isTransientBridgeError(timeout) {
+		t.Fatal("artifact timeout became a transient bridge failure")
+	}
+	failedBeforeJudgment := append([]FailedRecord(nil), cr.state.FailedAt...)
+
+	const objection = "judgment lesson composed with artifact timeout"
+	dr := dispatchResult{resp: PhaseResponse{
+		Verdict:     VerdictFAIL,
+		Diagnostics: []Diagnostic{{Severity: "error", Message: objection}},
+	}, attemptCount: 1}
+	if _, err := cr.recordAndBranch(Phase("premise-challenge"), dr); err != nil {
+		t.Fatalf("recordAndBranch: %v", err)
+	}
+	prompt, persisted := renderPersistedPlannerContext(t, cr)
+
+	if !reflect.DeepEqual(persisted.FailedAt, failedBeforeJudgment) {
+		t.Errorf("judgment lesson mutated timeout failure history\n got: %+v\nwant: %+v",
+			persisted.FailedAt, failedBeforeJudgment)
+	}
+	if got := strings.Count(prompt, objection); got != 1 {
+		t.Errorf("planner prompt contains composed judgment lesson %d times, want 1\n%s", got, prompt)
+	}
+}
+
+func TestRecordAndBranch_PremiseChallengeFAILTeaches(t *testing.T) {
+	t.Parallel()
+
+	cr := retroGateHarness(t, phasespec.Catalog{})
+	dr := dispatchResult{resp: PhaseResponse{
+		Verdict: VerdictFAIL,
+		Diagnostics: []Diagnostic{{Severity: "error",
+			Message: "premise falsified: the stderr buffer never contains provider error text"}},
+	}, attemptCount: 1}
+
+	if _, err := cr.recordAndBranch(Phase("premise-challenge"), dr); err != nil {
+		t.Fatalf("recordAndBranch: %v", err)
+	}
+
+	todos := judgmentLessonTodos(cr, Phase("premise-challenge"))
+	if len(todos) != 1 {
+		t.Fatalf("a premise-challenge FAIL must leave exactly ONE carryover todo so Scout cannot "+
+			"re-derive the falsified premise; got %d (all todos: %+v)", len(todos), cr.state.CarryoverTodos)
+	}
+	if !strings.Contains(todos[0].Action, "stderr buffer never contains") {
+		t.Errorf("the todo must carry the OBJECTION, not merely the fact of failure — a todo that says "+
+			"'premise-challenge failed' teaches nothing\n  got: %q", todos[0].Action)
+	}
+}
+
+func TestRecordAndBranch_PremiseChallengeFAILDoesNotRecordFailedApproach(t *testing.T) {
+	t.Parallel()
+
+	cr := retroGateHarness(t, phasespec.Catalog{})
+	dr := dispatchResult{resp: PhaseResponse{
+		Verdict:     VerdictFAIL,
+		Diagnostics: []Diagnostic{{Severity: "error", Message: "premise falsified"}},
+	}, attemptCount: 1}
+
+	if _, err := cr.recordAndBranch(Phase("premise-challenge"), dr); err != nil {
+		t.Fatalf("recordAndBranch: %v", err)
+	}
+
+	if len(cr.state.FailedAt) != 0 {
+		t.Errorf("a judgment phase must TEACH without HALTING: appending to state.FailedAt feeds the "+
+			"failure adapter (sameClassStreak / tailInfraTransientStreak), so a phase whose whole job is "+
+			"to object could halt the batch by objecting; got %d record(s): %+v",
+			len(cr.state.FailedAt), cr.state.FailedAt)
+	}
+}
+
+func TestJudgmentLesson_PriorityIsNotP0(t *testing.T) {
+	t.Parallel()
+
+	cr := retroGateHarness(t, phasespec.Catalog{})
+	dr := dispatchResult{resp: PhaseResponse{
+		Verdict:     VerdictFAIL,
+		Diagnostics: []Diagnostic{{Severity: "error", Message: "premise falsified"}},
+	}, attemptCount: 1}
+	if _, err := cr.recordAndBranch(Phase("premise-challenge"), dr); err != nil {
+		t.Fatalf("recordAndBranch: %v", err)
+	}
+	todos := judgmentLessonTodos(cr, Phase("premise-challenge"))
+	if len(todos) != 1 {
+		t.Fatalf("want 1 lesson todo, got %d", len(todos))
+	}
+	if todos[0].Priority == "P0" {
+		t.Errorf("a judgment lesson must not be filed P0 — it would outrank the cycle's actual blocking "+
+			"work in the next planner pass; got %q", todos[0].Priority)
+	}
+	if todos[0].Priority == "" {
+		t.Errorf("lesson todo has no priority — the planner cannot rank it")
+	}
+}
+
+func TestJudgmentLesson_ControlPhasesDoNotTeach(t *testing.T) {
+	t.Parallel()
+
+	for _, phase := range []Phase{PhaseRetro, PhaseDebugger} {
+		t.Run(string(phase), func(t *testing.T) {
+			cr := retroGateHarness(t, phasespec.Catalog{})
+			dr := dispatchResult{resp: PhaseResponse{
+				Verdict:     VerdictFAIL,
+				Diagnostics: []Diagnostic{{Severity: "error", Message: "boom"}},
+			}, attemptCount: 1}
+			if _, err := cr.recordAndBranch(phase, dr); err != nil {
+				t.Fatalf("recordAndBranch: %v", err)
+			}
+			if got := judgmentLessonTodos(cr, phase); len(got) != 0 {
+				t.Errorf("%s is a CONTROL phase, not a judgment phase — it must not file a judgment "+
+					"lesson (a derived remediationDenied set sweeps it in silently); got %+v", phase, got)
+			}
+		})
+	}
+}
+
+func TestJudgmentLesson_PersistedToStorage(t *testing.T) {
+	t.Parallel()
+
+	cr := retroGateHarness(t, phasespec.Catalog{})
+	dr := dispatchResult{resp: PhaseResponse{
+		Verdict:     VerdictFAIL,
+		Diagnostics: []Diagnostic{{Severity: "error", Message: "premise falsified"}},
+	}, attemptCount: 1}
+	if _, err := cr.recordAndBranch(Phase("premise-challenge"), dr); err != nil {
+		t.Fatalf("recordAndBranch: %v", err)
+	}
+	persisted, err := cr.o.storage.ReadState(context.Background())
+	if err != nil {
+		t.Fatalf("ReadState: %v", err)
+	}
+	found := 0
+	for _, td := range persisted.CarryoverTodos {
+		if strings.Contains(td.ID, "premise-challenge") {
+			found++
+		}
+	}
+	if found != 1 {
+		t.Errorf("the lesson must be PERSISTED, not only in-memory — the abort branches that make this "+
+			"fix necessary return before finalizeCycle; got %d on disk", found)
+	}
+}
+
+func TestJudgmentLesson_DedupedByID(t *testing.T) {
+	t.Parallel()
+
+	cr := retroGateHarness(t, phasespec.Catalog{})
+	dr := dispatchResult{resp: PhaseResponse{
+		Verdict:     VerdictFAIL,
+		Diagnostics: []Diagnostic{{Severity: "error", Message: "premise falsified"}},
+	}, attemptCount: 1}
+	for i := 0; i < 2; i++ {
+		if _, err := cr.recordAndBranch(Phase("premise-challenge"), dr); err != nil {
+			t.Fatalf("recordAndBranch #%d: %v", i+1, err)
+		}
+	}
+	if got := judgmentLessonTodos(cr, Phase("premise-challenge")); len(got) != 1 {
+		t.Errorf("lesson todo must dedupe by id across re-dispatch within a cycle; got %d", len(got))
+	}
+}
+
+func TestJudgmentLesson_WiredInLockstepWithFloorRecorder(t *testing.T) {
+	t.Parallel()
+
+	shared, err := os.ReadFile("phase_completion.go")
+	if err != nil {
+		t.Fatalf("read shared phase completion: %v", err)
+	}
+	body := string(shared)
+	for _, call := range []string{"recordJudgmentLesson(", "recordFloorVerdictFailure(", "recordReviewFindings("} {
+		if !strings.Contains(body, call) {
+			t.Errorf("shared phase completion does not call %s", call)
+		}
+	}
+	for _, path := range []string{"cyclerun_record.go", "resume_execution.go"} {
+		src, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if !strings.Contains(string(src), "phaseCompletionRecord{") {
+			t.Errorf("%s bypasses the shared phase-completion boundary", path)
+		}
+	}
+}
+
+func TestJudgmentLesson_ExpiresAtSurvivesALoopPause(t *testing.T) {
+	t.Parallel()
+
+	cr := retroGateHarness(t, phasespec.Catalog{})
+	dr := dispatchResult{resp: PhaseResponse{
+		Verdict:     VerdictFAIL,
+		Diagnostics: []Diagnostic{{Severity: "error", Message: "premise falsified"}},
+	}, attemptCount: 1}
+	if _, err := cr.recordAndBranch(Phase("premise-challenge"), dr); err != nil {
+		t.Fatalf("recordAndBranch: %v", err)
+	}
+	todos := judgmentLessonTodos(cr, Phase("premise-challenge"))
+	if len(todos) != 1 {
+		t.Fatalf("want 1 lesson todo, got %d", len(todos))
+	}
+	if todos[0].ExpiresAt == "" {
+		t.Fatalf("lesson todo has no ExpiresAt — the boot prune (PruneExpiredCarryoverTodos) keys on it")
+	}
+	got, err := time.Parse(time.RFC3339, todos[0].ExpiresAt)
+	if err != nil {
+		t.Fatalf("ExpiresAt %q is not RFC3339: %v", todos[0].ExpiresAt, err)
+	}
+	if minWanted := cr.o.now().UTC().Add(7 * 24 * time.Hour); got.Before(minWanted) {
+		t.Errorf("lesson expires at %s, less than a week out — a multi-day loop pause would drop it "+
+			"before Scout ever reads it (the 1-day unknown-classification fallback bucket)", got)
+	}
+}
+
+func TestJudgmentLesson_AuthoritativePhaseYieldsToFloorRecorder(t *testing.T) {
+	t.Parallel()
+
+	cr := retroGateHarness(t, phasespec.Catalog{})
+	cr.o.shipFloor = []string{"premise-challenge"}
+	if !cr.o.isAuthoritativePhase(Phase("premise-challenge")) {
+		t.Skip("ship_floor override did not take effect through this harness; guard is untestable here")
+	}
+	cr.o.recordJudgmentLesson(context.Background(), 5, cr.cs.WorkspacePath, Phase("premise-challenge"), &cr.state,
+		[]Diagnostic{{Severity: "error", Message: "premise falsified"}})
+
+	for _, td := range cr.state.CarryoverTodos {
+		if td.Priority == carryoverPriorityLesson {
+			t.Errorf("an AUTHORITATIVE judgment phase must yield to recordFloorVerdictFailure — a P1 "+
+				"advice todo would shadow a halt-capable FailedRecord for the same FAIL; got %+v", td)
+		}
+	}
+}

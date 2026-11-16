@@ -1,0 +1,69 @@
+{
+  "name": "scope-baseline",
+  "catalog": "on-demand",
+  "archetype": "plan",
+  "agent": "evolve-scope-baseline",
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/scout-report.md"
+    ],
+    "signals": []
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/scope-baseline-report.md"
+    ],
+    "signals": [
+      "scope.deliverables_count"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Deliverables",
+      "Acceptance Criteria",
+      "Exclusions",
+      "Constraints and Assumptions"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "project-management"
+      },
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "accessibility"
+      },
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "i18n"
+      },
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "data-pipeline"
+      },
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "strategy-options"
+      },
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "business-plan"
+      },
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "partnership-deal"
+      }
+    ]
+  },
+  "after": "triage",
+  "optional": true
+}

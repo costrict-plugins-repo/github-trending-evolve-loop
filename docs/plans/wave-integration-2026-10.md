@@ -1,0 +1,312 @@
+# Plan: the wave orchestrator owns the integration of its deliverables
+
+- **Status:** proposed, 2026-10-20. The operator decided the questions of §7 on 2026-10-27. Each component of §6 has an inbox item since 2026-10-27.
+- **Research:** [wave-integration-2026-10](../research/wave-integration-2026-10.md). **Decision:** [ADR-0147](../architecture/adr/0147-the-wave-orchestrator-owns-integration-and-decides-when-the-wave-reaches-main.md). **Design:** [wave-orchestrator §15](../architecture/wave-orchestrator.md#15-integration).
+- **Amended:** 2026-11-04, [§10](#10-amendment-of-2026-11-04-console-prs-enter-the-train). 2026-11-05, [§11](#11-amendment-of-2026-11-05-the-lane-side-gets-a-driver-i14).
+- **Amends:** [ADR-0139](../architecture/adr/0139-a-wave-orchestrator-supplies-admits-and-backfills-every-lane.md) (the orchestrator now owns landing), [ADR-0128](../architecture/adr/0128-landing-queue-tiered-reverification.md) and [ADR-0134](../architecture/adr/0134-fleet-landings-scale-through-content-keyed-verification-and-group-commit.md) (their composition, proof, tiers and conflict-graph order become parts of the integration engine).
+
+## Table of contents
+
+- [1. The problem](#1-the-problem)
+- [2. A worked example](#2-a-worked-example)
+- [3. Candidate designs](#3-candidate-designs)
+- [4. The winner and what it takes from the others](#4-the-winner-and-what-it-takes-from-the-others)
+- [5. Decisions](#5-decisions)
+- [6. Components and order](#6-components-and-order)
+- [7. Open questions for the operator](#7-open-questions-for-the-operator)
+- [8. Verification](#8-verification)
+- [9. Limits](#9-limits)
+- [10. Amendment of 2026-11-04: console PRs enter the train](#10-amendment-of-2026-11-04-console-prs-enter-the-train)
+- [11. Amendment of 2026-11-05: the lane side gets a driver (I14)](#11-amendment-of-2026-11-05-the-lane-side-gets-a-driver-i14)
+
+## 1. The problem
+
+Each lane of a wave lands its own deliverable on `main`. The landings race, and about one lane in four needs a rebase recovery of about 24 minutes (research F2.4). `main` moves often, from lanes and from console PRs, and each move can make every lane in flight rebase (F2.5). A console PR that merges during a wave strands the next lane (F2.6). A patch to the per-lane landing cannot remove the race, because the plane's `main` holds local commits that origin does not hold (F2.7).
+
+No part of the design owns the order of the landings or the decision to push (F2.1). The landing queue of ADR-0128 and ADR-0134 has the parts of an integration engine. But each lane still lands itself, and the queue is not in use (F2.2, F2.3).
+
+## 2. A worked example
+
+Wave 133 had four lanes in flight. Under the design of this plan:
+
+| Time | Event | Integration action |
+|---|---|---|
+| 11:40 | lane L2 (`retry-ladder-l2-decider`) delivers | compose L2 onto the integration tip; its proof is T1, because no peer touches its packages; the prefix check passes |
+| 12:24 | lane H7 (`handoff-h7-cli`) delivers | compose H7; T1; prefix check passes; the batch holds 2 deliverables |
+| 12:30 | lane G (`go-test-env-projection-pinned-lane`) fails its audit | no delivery; nothing to compose |
+| 12:32 | the batch reaches `max_age_minutes` | flush: push `integration/w133-b1`, open one PR with 2 commits |
+| 12:50 | CI of the PR is green, and `main` did not move | fast-forward `main` to the tested tip; `main` moves one time for both lanes |
+
+Under today's per-lane landing, the same wave moved `main` once for each lane, and each move can make the other lanes rebase.
+
+## 3. Candidate designs
+
+| Design | Summary |
+|---|---|
+| A. Finish the per-lane queue | Build ADR-0128 and ADR-0134 as designed. Each lane composes its candidate and lands it on `main` at its turn. |
+| B. A native merge queue | Each deliverable becomes its own PR. The GitHub merge queue orders and tests the PRs. The orchestrator only sets the settings. |
+| C. An orchestrator train | The orchestrator orders the deliverables and composes each one onto an integration branch as one commit. It checks each prefix, and pushes a batch as one PR when it decides. |
+| D. Parallel trains by partition | As C, but the conflict graph splits the wave into one to three independent batches, each with its own PR and CI. |
+| E. Avoidance only | Admission by cell keeps conflicting work apart, and each lane still lands itself. |
+
+Each criterion scores 1 (poor) to 5 (good). "Removes the landing race" counts twice, because it is the purpose of the change.
+
+| Criterion | A | B | C | D | E |
+|---|---|---|---|---|---|
+| Removes the landing race (×2) | 3 (6) | 4 (8) | 5 (10) | 5 (10) | 2 (4) |
+| One owner decides order and timing | 2 | 2 | 5 | 5 | 1 |
+| CI runs per wave | 2 | 2 | 5 | 3 | 2 |
+| Culprit found cheaply | 4 | 3 | 5 | 4 | 2 |
+| Change size | 3 | 4 | 2 | 1 | 5 |
+| Fits the audit trail and the ADRs | 4 | 2 | 5 | 4 | 4 |
+| **Total (of 35)** | 21 | 21 | **32** | 27 | 18 |
+
+**C wins.**
+
+- A keeps a lane as the writer of `main`, so it keeps the race with the console PRs and the local plane commits (F2.6, F2.7).
+- B gives each deliverable its own PR and CI run, and its ordering control is coarse (research M2).
+- D costs up to three CI runs for each wave, and its benefit appears only when batch failures are frequent.
+- E lowers the conflict rate but leaves each lane to land itself.
+
+Every surveyed merge system has one owner of the composed result (research M1 to M4). C gives that owner to the orchestrator, which already owns the supply, the admission and the pool.
+
+## 4. The winner and what it takes from the others
+
+| From | What C takes | Why |
+|---|---|---|
+| A | The composition of the audited tree, the overlap proof and the tiers T1 to T4 of ADR-0128. Also the content-keyed verification of ADR-0134. The tiers T1 to T4 are the tiers of a compose, not the test layers L1 to L4. | They decide what each compose must check again, at the lowest cost. |
+| B | The ejection rule: a failed deliverable leaves the batch, and the deliverables behind it compose again without it | The rule of GitLab, GitHub and Zuul (M1 to M3). |
+| D | Partitions as a later stage: when the batch failure rate passes a bound, the orchestrator splits a batch by the conflict graph | It pays only when failures are frequent (M6, M7). |
+| E | Admission by cell stays in front of integration | It keeps conflicts out of the wave in the first place (M15). |
+
+## 5. Decisions
+
+| Id | Decision | Because | Rejected options and why |
+|---|---|---|---|
+| D1 | The orchestrator owns integration. A fleet lane delivers its audited change and does not push `main`. | F2.1, F2.6, M1 to M4 | Each lane lands itself: F2.4 to F2.7. |
+| D2 | A deliverable is a record. It holds the cycle commits, the audit binding, the declared scope and the deps. It also holds the inbox rank, the risk class, the `base_sha` and the patch-id of each commit. The landed identity is the cycle trailer plus the patch-id, not a SHA. | ADR-0128 §11, review HIGH-1 | A bare branch: the order needs the facts. A SHA identity: each compose makes a new SHA. |
+| D3 | The order is a deterministic score. The first key is the deps: a producer before its consumer. Then the conflict graph, the inbox rank and the count of items it unblocks. Then low risk, low verification cost and the time of delivery. | M4, M15 | An LLM decides the order: the inputs are facts. FIFO: it ignores deps and rank. |
+| D4 | Each deliverable composes onto the integration tip as one commit, with trailers for the cycle and its audit binding. | M10 | One squash commit for each wave: it forces a whole-wave revert. |
+| D5 | Each compose runs the overlap proof and the gates of its tier, scoped and cached (ADR-0128, ADR-0134). The prefix check after each compose names the culprit before CI runs. | M3, ADR-0128 | One check of the whole batch: the culprit is unknown. |
+| D6 | A textual conflict, a failed gate or a tier-T4 proof ejects the deliverable to its lane, with the diff of the change it met. The retry ladder of ADR-0142 takes the lane. No LLM resolves the conflict by default. | M14, M16 | An LLM merges: fewer than 60% are correct (M16). |
+| D7 | A batch flushes as one PR on the first of these triggers. The wave ends. The batch reaches its cap. Its oldest deliverable reaches `max_age_minutes`. A deliverable unblocks queued work. | M5 to M7 | A flush only at wave end: a long wave holds every deliverable. A rank trigger: it needs a threshold that no measure supports yet. |
+| D8 | The cap adapts like Zuul's window. It starts at 4 and stays between 1 and 4. It halves on a red batch CI that the re-run confirms, and grows by 1 on a green batch. | M3, M7 | A fixed cap: it does not react to failures. A halve on the first red: a flake shrinks the cap. |
+| D9 | A risky deliverable flushes alone: one that touches the protected surface or the global zone (the "iffy" class of ADR-0128). | M5 | Risky changes in a batch: one failure blocks the rest. |
+| D10 | On a red CI, the orchestrator runs the PR once more to screen a flake. On a second red, it splits the batch in halves until each part has at most 2 deliverables, then tests each one alone. | M6, M8, M9 | Eject the whole batch: good work waits. |
+| D11 | When the batch CI is green and `origin/main` still equals the batch base, the orchestrator fast-forwards `main` to the tested tip. GitHub then marks the PR merged. If `main` moved, it composes again (D13) and tests again. | D1, M10, review HIGH-2 | A rebase merge: it rewrites each SHA, and after a move of `main` it lands a tree that no CI tested. A squash merge: one commit for each wave. |
+| D12 | The loop's own commits (dossier closeouts, inbox stamps) go to a bookkeeping batch of their own. It holds no code, skips L2, and flushes alone at each code flush and at wave end. So the plane's `main` holds no local-only commit. At shadow, they stay as today. | F2.7, review M-5 | Keep them on the plane's `main`: the race of F2.7 stays. Ride the code batch: a red code batch holds them. |
+| D13 | A console PR that merges into `main` makes the orchestrator compose the open batch again on the new `main`. It cancels a CI run of the old tip. The patch-ids show which deliverables `main` already holds. | F2.5, review HIGH-2 | Each lane rebases: the cost of F2.4. |
+| D14 | `fleet.integration.stage` starts at `shadow`. At shadow, lanes land as today. The orchestrator runs a textual compose only, and records its order, its composes and its flush decisions. It runs no test gate, so the host load stays as today. It is a second stage key, against ADR-0139 decision 16, because integration can only start after the pool is at `enforce`. | the stage pattern of ADR-0139, review HIGH-6 | Enforce at once: the engine is unproven. Real gates at shadow: they double the test load of a host that saturates at width 4. |
+| D15 | The merge window of the PR-latency plan (P2) no longer waits for a fix to the per-lane ship. It waits for `fleet.integration.stage: enforce`, because then no lane writes `main`. | D1, F2.7 | Fix the per-lane ship first: F2.7 shows that the fix cannot be complete. |
+
+### The test strategy for the integrated batch
+
+Each lane passed its own tests on its own base. The integration branch holds a tree that no lane tested: the deliverables together. Four layers test that tree, from cheap and early to complete and late: L1 prefix, L2 batch, L3 PR and L4 after merge. The spec of record holds the table of layers and the rules ([wave-orchestrator §15](../architecture/wave-orchestrator.md#15-integration)).
+
+| Id | Decision | Because | Rejected options and why |
+|---|---|---|---|
+| D16 | Four test layers: prefix, batch, PR and after merge, with the content of the table above. | M3, M10, ADR-0128 §9 | One full suite on the PR only: the culprit is unknown, and each red costs a CI run. |
+| D17 | Each deliverable's acceptance predicates run on the combined tree in L2. | M14 | Only each lane's own run: it cannot see interference. |
+| D18 | A red after the merge first goes through `evolve ci classify` and one re-run. A confirmed red bisects by cycle commit, and the orchestrator reverts the culprit's commit alone. A confirmed L4 red after a green L3 is a system failure of ADR-0072: it halts the integration and files a P0 item. | D4, M10, M12, ADR-0072 | Revert the batch: good work leaves `main` with the bad. Revert on the first red: a flake reverts good work. |
+| D19 | The orchestrator holds an integration record, `.evolve/waves/integration-<wave>.json`: the branch, the tip, the open PR, the members and the loop lease epoch. Each branch write uses `--force-with-lease` on the recorded tip. On a resume, the new lease holder adopts the branch or discards it, and closes a PR of an older epoch. | loop lease fencing, review HIGH-4 | No record: a crash leaves a branch and a PR with no owner. |
+| D20 | The orchestrator releases the cells of a deliverable at the merge, not at the delivery. An ejected deliverable goes back to its lane, so its cells stay held until it lands or the lane gives up. | review HIGH-6 | Release at delivery: a new lane in the same cell conflicts with an ejected deliverable. |
+| D21 | At enforce, the window of §10 takes its conflict feed from `SHIP_INTEGRATION_EJECTED` with `cause=conflict`. The ship and zero-ship counters count deliverables that merged, from `SHIP_INTEGRATION_MERGED`. | review HIGH-5, HIGH-6 | Keep the lane feeds: at enforce, a lane no longer lands, so they go silent. |
+| D22 | The CI waker is one blocking `gh run watch` child for each batch PR, in `internal/integration`. The `max_age_minutes` flush uses one `time.AfterFunc` for the oldest deliverable. `internal/orchestrator` keeps its guard. | the no-poll rule, review HIGH-7 | A poll of the GitHub API: the no-poll rule. |
+| D23 | Each batch has its own branch, `integration/w<wave>-b<n>`, cut from `origin/main` when its first deliverable composes. The branch is deleted after the merge. | M11, review M-2 | One branch for each wave: after a merge it needs a reset onto the new `main`. |
+
+### Consequences
+
+- Good: `main` moves once for each batch, not once for each lane, and no lane rebases at landing.
+- Good: one owner decides the order and the timing, with a reason that the record shows.
+- Good: a console PR can merge during a wave without a stranded lane.
+- Bad: a deliverable waits in the batch until a flush, up to `max_age_minutes`. Its cells stay held until the merge (D20).
+- Bad: the orchestrator becomes the single writer of `main` for the loop. A defect in it stops all landings. The stage `shadow` and the per-lane fallback bound that risk.
+- Bad: a red batch costs extra CI runs for the split.
+
+### What changes our mind
+
+- At shadow, the recorded batches show a red rate above one in three. Then design D (partitions) starts before enforce.
+- The flush by `max_age_minutes` holds deliverables longer than the per-lane landing did, over 30 batches. Then `max_age_minutes` goes down.
+
+## 6. Components and order
+
+| # | Component | Home | Route | Inbox item |
+|---|---|---|---|---|
+| I0 | The deliverable record of D2. The kind `ship.delivered` and the codes `SHIP_INTEGRATION_*` in the Signal Center registry. At `enforce`, a fleet lane's ship stops before `main`. | `go/internal/phases/ship`, `go/internal/core` | console | `wave-integration-i0-deliverable-record` |
+| I1 | The order score of D3, as a pure function | `go/internal/integration` (new) | lane | `wave-integration-i1-order-score` |
+| I2 | The compose engine: one commit for each deliverable, the overlap proof and the tier, reusing the ADR-0128 code (`planlanding.go`, `landprefixes.go`). Built 2026-11-04: `Composer.Compose` and `Composer.PrefixCheck` in `go/internal/integration`. The prefix check is a loop, not a reuse of `planlanding.go` and `landprefixes.go`, because the batch has one group and no window. | `go/internal/integration`, `go/internal/phases/ship` | console | `wave-integration-i2-compose-engine` |
+| I3 | The prefix check, the ejection and the ejection brief to the lane | `go/internal/integration`, `go/internal/orchestrator` | console | `wave-integration-i3-prefix-check-ejection` |
+| I3b | The batch test L2 of D16 and D17. It finds the affected set and runs each deliverable's predicates on the combined tree. It uses the prefix order for a red and records each verdict. | `go/internal/integration`, `go/internal/phases/ship` | console | `wave-integration-i3b-batch-test` |
+| I4 | The flush policy of D7 to D9, with the adaptive cap, as a pure function | `go/internal/integration` | lane | `wave-integration-i4-flush-policy` |
+| I5 | The batch PR: push and open it, and wake on CI through the `gh run watch` child of D22. Fast-forward `main` to the tested tip (D11). Re-run and split on red. | `go/internal/integration`, `go/cmd/evolve` | console | `wave-integration-i5-batch-pr` |
+| I6 | The bookkeeping batch of D12 | `go/internal/core`, `go/internal/inboxmover` | console | `wave-integration-i6-bookkeeping-batch` |
+| I7 | The compose again after a console merge into `main`. Amended by [§11](#11-amendment-of-2026-11-05-the-lane-side-gets-a-driver-i14): `Merger.land` meets it, and two behaviours move into I14. | `go/internal/integration` | lane | `wave-integration-i7-recompose-after-console-merge` |
+| I8 | `evolve wave integration status` and the signals. Amended by [§11](#11-amendment-of-2026-11-05-the-lane-side-gets-a-driver-i14): the verb is `evolve integration status`, and I14 absorbs it. | `go/cmd/evolve`, `go/internal/signalcenter` | lane | `wave-integration-i8-status-verb` |
+| I10 | The integration record of D19, with the lease epoch, the adoption on resume and `--force-with-lease` | `go/internal/integration`, `go/internal/core` | console | `wave-integration-i10-integration-record` |
+| I11 | The fast-forward of the plane's `main` after each merge, and the feeds of D21. Amended by [§11](#11-amendment-of-2026-11-05-the-lane-side-gets-a-driver-i14): I14 absorbs it. | `go/internal/core`, `go/internal/orchestrator` | console | `wave-integration-i11-plane-main-feeds` |
+| I9 | The move to `enforce` | `.evolve/policy.json` | operator | `wave-integration-i9-enforce-flip` |
+
+The ids name the components; the order is below. I1 and I4 are pure and come first. I0 to I3 make shadow possible. I5, I6, I10 and I11 are needed only for enforce.
+
+The plan audit of 2026-10-27 filed one inbox item for each component. The Route column gives the owner from this plan. The inbox route can differ:
+- An item that touches a gate file is `console-manual` until held proposals exist: I0, I2 and I3b (the ship phase).
+- A console item outside the gate files is `lane`, and admission decides: I3, I5, I6, I10 and I11.
+- I9 is a `decision` item for the operator.
+
+## 7. Open questions for the operator
+
+The operator accepted each proposed answer on 2026-10-27. Nothing in §6 waits on these questions now.
+
+| Id | Question | Decision (2026-10-27) |
+|---|---|---|
+| Q1 | The cap and `max_age_minutes` of a batch | Decided: cap 4 (adaptive, D8); 45 minutes. |
+| Q2 | The merge method of a batch | Decided: a fast-forward of `main` to the tested tip, one commit for each cycle (D11). The console PRs keep their squash merge. |
+| Q3 | The base of a new lane | Decided: `main`, until shadow data shows otherwise. A base on the integration tip lets later lanes build on earlier wave work, but an ejection then strands each lane on that base. That option waits for shadow data, and then needs the cascade rule: an ejection also ejects each deliverable whose `base_sha` holds the ejected patch-id. |
+| Q4 | Is the orchestrator allowed to fast-forward `main` during a wave at enforce? This amends the standing rule that code PRs merge only at a boundary. | Decided: yes, at enforce only. No lane writes `main` then, and I11 moves the plane's `main` after each merge. Console PRs keep the boundary rule. |
+
+## 8. Verification
+
+- **Order (I1):** a table test over seeded deliverable sets. A consumer never composes before its producer. Two deliverables with no edge keep their order by rank. The same input always gives the same order.
+- **Compose and prefix (I2, I3):**
+  - three fixture deliverables A, B and C, where C breaks a test. The prefix check passes A and A+B and fails A+B+C. It ejects C with the diff of A+B;
+  - a textual conflict ejects with no gate run.
+- **Flush (I4):**
+  - each trigger of D7 flushes once;
+  - a risky deliverable flushes alone;
+  - the cap halves on red and grows on green, inside 1 to 4.
+- **Batch test (I3b):**
+  - two fixture deliverables that pass alone and fail together. L2 runs both predicate sets on the combined tree and fails. It ejects the later one by the prefix order;
+  - the affected set of an edit in a package includes each package that imports it;
+  - a test that fails and then passes once is recorded as a flake, and nothing is ejected;
+  - a package with a green verdict on the same key is skipped and recorded as skipped.
+- **Identity (D2, D11):** after a compose and a fast-forward, each cycle is found on `main` by its trailer and its patch-id. The ledger entry, the dossier closeout and the consume check use that identity.
+- **Tested tree (D11, D13):** with a fixture `main` that moves after a green CI, the orchestrator does not fast-forward. It composes again and tests again.
+- **Resume (D19):** a second lease holder adopts the recorded branch, a write with a stale tip fails, and a PR of the old epoch closes.
+- **Batch PR (I5):** with a fake CI, a red run re-runs once. Then it splits until each part has at most 2 deliverables, and the culprit is ejected.
+- **After merge (D18):** with a fixture `main`, a red that passes on its re-run reverts nothing. A confirmed red bisects to the culprit and reverts only its commit.
+- **Shadow (D14):** at shadow, the landings are byte-identical to today, and no test gate runs. The record holds the order, the composes and the flush decisions of each wave.
+- **Shadow exit:** 3 waves with at least 2 deliverables each. The recorded order has no dependency inversion. The textual compose predicts the real `SHIP_GIT_FLEET_REBASE_*` events of those waves with a precision and a recall of at least 0.8.
+- **Enforce exit:** over 10 batches, the batch red rate is below one in three. The median time from delivery to merge is at most the per-lane baseline.
+
+## 9. Limits
+
+- A deliverable waits in its batch until a flush.
+- The prefix check catches what the scoped gates test. A defect outside them can pass, and the CI of the batch PR is the backstop.
+- Two deliverables that pass alone can fail together (research M14). The prefix check catches it only when a test covers the interaction.
+- The orchestrator is the single writer of `main` for the loop.
+
+## 10. Amendment of 2026-11-04: console PRs enter the train
+
+The operator asked on 2026-11-04: "should we update the merging component plan based on your latest research result? I would like to continue to finish the merging component tasks with the latest update to solve every PR has to be queued on main which continuing generating merge conflicts".
+
+**The answer is yes.** This plan solved the race between lanes. It left each console PR on its own path to `main`. D13 even treats a console merge as an outside event that forces a new compose. Sections 1 to 9 stay in force, and this section adds to them.
+
+### Why the plan changes
+
+| Finding | What it changes |
+|---|---|
+| `main` has no branch protection (research [F5.10](../research/harness-practices-2026-11.md#our-own-pr-queue-measured)) | The queue is our own process, so we can change it. |
+| 23 of 40 open PRs compose into one batch (F5.11) | Most of the queue can land with one CI run. |
+| 135 of 780 PR pairs share a file (F5.12) | Each PR shares a file with about 7 others, and each merge leaves all others behind `main`. |
+| `go/.cover-strict` causes 3 of 9 direct conflicts (F5.13) | One line list has a small fix. |
+| Three hand batches landed 76 PRs (F5.14) | The console train automates a procedure that works. |
+| A default patch-id changes on a nearby peer edit (F3.9) | The landed identity needs a fix before a batch relies on it. |
+
+### New decisions
+
+| Id | Decision | Because | Rejected options and why |
+|---|---|---|---|
+| D24 | A reviewed console PR is a deliverable of the train, with the source `console-pr`. Its record holds the PR number, its head, its review binding and its scope. | F5.10, F5.14 | A separate queue for console PRs: it keeps two writers of `main`. |
+| D25 | `evolve integration batch` takes each ready PR, composes in order, ejects each conflict and opens one PR. | F5.11, F5.14 | A batch by hand: three batches show that it works, and each one costs an operator hours. |
+| D26 | A member PR does not update its branch. The batch CI decides. Only an ejected PR rebases, on the integration tip. | F5.12 | `update-branch` for each PR: it moves each other PR behind and reruns CI. |
+| D27 | The console train goes live before lane `enforce`. It has its own operator verb, and it uses no lane path. | F5.14 | Wait for I9: the queue stays until then. |
+| D28 | `go/.cover-strict` and `go/.apicover-enforce` use the `union` merge driver, and authors append. A guard test checks that each package appears once. Only the train compose gains: GitHub does not apply this driver on a PR merge, and the compose must pass `--attr-source=<tip>`. | F5.13 | `union` on prose: it can join two edits into wrong text. |
+| D29 | A prose registry moves to one entry file for each change and a generator, as `docs/research-index/` does. It moves when its count of shared PRs stays high. | F5.13 | Move each file now: the measured gain does not justify the size. |
+| D30 | The landed identity uses a patch-id with one line of context. | F3.9 | The default context: a nearby peer edit changes the id. No context: the same text at another position matches. |
+| D31 | `main` gets branch protection in two steps. See below. | F5.10, operator 2026-11-04 | One required check when I12 lands: at `shadow`, lanes still push `main`, and the check refuses them. |
+
+D24 replaces the part of D13 that applies to a PR in the batch. A console PR that merges outside the train still makes the orchestrator compose again.
+
+### New components
+
+| Id | Component | Red test first, as a journey | Owner | Inbox item |
+|---|---|---|---|---|
+| I12 | The console train: the record adapter and `evolve integration batch` | Three reviewed PRs, one in conflict: two land with one fast-forward, and the third gets its brief. | console | `wave-integration-i12-console-pr-train` |
+| I13 | The `union` driver for line lists, with the guard test | Two PRs add one line each to `go/.cover-strict`, and both compose in either order, also in a bare clone. A repeated package with other lines fails the guard. | console | `wave-integration-i13-line-lists-union` |
+| I14 | The integration driver of lanes ([spec](../architecture/integration-driver.md)). Proposed by the console on 2026-11-05. | At enforce today, a delivered lane record never reaches `main`. This test is red first, and then the shadow journey follows. | console | `wave-integration-i14-integration-driver` |
+
+### The amended order
+
+The goal of the order is to end the queue first. The lane work follows.
+
+1. **I2 with R4.** The compose engine and the fixed identity. Everything below needs them.
+2. **I13.** It is small and independent. It removes a third of the conflicts in a compose. It does not change a GitHub PR merge.
+3. **I10, then I3 and I3b.** The record, the ejection brief and the batch test.
+4. **I5, then I12.** The flush and the merge, then the console train. **The queue on `main` ends here.**
+5. **I6, I7, I11 and I8.** The lane parts for `enforce`.
+6. **I9.** The operator moves lanes to `enforce` after two consecutive clean shadow waves ([ADR-0159](../architecture/adr/0159-the-loop-keeps-its-integration-train-and-takes-six-practices-from-the-2026-harness-projects.md)).
+
+Until step 4 lands, these components land as one more hand batch, because the train cannot carry itself.
+
+### Branch protection on `main`
+
+The operator decided on 2026-11-04: `main` gets branch protection once the train is live. The train replaces each writer of `main` in two steps, so the protection has two steps.
+
+| Step | When | Rule | Why this order |
+|---|---|---|---|
+| 1 | I12 lands | Refuse a force-push and a branch delete | A lane push is a fast-forward, so this rule does not stop a wave. |
+| 2 | I9 moves lanes to `enforce` | Add one required check | No lane writes `main` then. The tested tip carries its green check. |
+
+Step 2 requires no pull request and no up-to-date rule. D11 pushes the tested tip as a fast-forward, and each of these rules can refuse that push. A test on a scratch branch must prove this push before the rule applies to `main`. The inbox item is `main-branch-protection-in-two-steps`.
+
+### What this does not prove
+
+- The figure of 23 counts textual composition. A batch can still fail its tests, and D10 then splits it.
+- The simulation ran once, on one day, in the order of creation. The order score of D3 can give a different count.
+- A file conflict with a registry is the cheapest class. The other 14 ejected PRs need a rebase in any design.
+
+## 11. Amendment of 2026-11-05: the lane side gets a driver (I14)
+
+The operator's goal of 2026-11-04 stays: "finish the merging component tasks with the latest update to solve every PR has to be queued on main which continuing generating merge conflicts". The operator decided on 2026-11-04 that enforce needs two clean shadow waves, and that I9 is the operator's flip. Sections 1 to 10 stay in force, and this section adds to them. The spec of record is [integration-driver](../architecture/integration-driver.md).
+
+The console proposes the items below. The operator has not yet approved them.
+
+- The new component I14, and the shelving of the `Recomposer`.
+- The held shadow base, the pool id and the epoch file.
+- The `delivered` inbox state.
+- The move of the verb family and the split into three PRs.
+
+### The lane side has no driver
+
+Before PR (b) (#1321): only the console train (`evolve integration batch`) called the engine. No production code called `DecideFlush`, `PrefixCheck` or `WriteIntegrationRecord`. No production code emitted `SHIP_INTEGRATION_COMPOSED`, `_FLUSHED`, `_MERGED`, `_REVERTED` or `_EJECTED`. `orchestrator.Oversight` had no production constructor, so `Window.CleanLanding` and `Window.Conflict` had no live caller. At HEAD, `go/internal/integration/driver.go` calls `DecideFlush`.
+
+Before PR (b) (#1321): at enforce a lane ship stopped before `main`, and at shadow nothing composed. "Two clean shadow waves" has no evidence today. The sequence of §6 never named the component that connects the engine to the lanes.
+
+### New and amended decisions
+
+| Id | Decision | Because | Rejected options and why |
+|---|---|---|---|
+| D32 | A new component I14, the integration driver, connects the engine to the lanes. It runs under both pool kinds, with one Actor strategy for each stage. | The evidence above. No component of §6 owns it. | Spread the wiring over I7, I8 and I11: each one needs the same driver and record. |
+| D33 | I7 is met by `Merger.land`, which composes again when `main` moves (`go/internal/integration/batchpr.go:69`, `:167`). Two behaviours move into I14: the early `Watch` return and the skip of a landed member. The `Recomposer` is shelved. | `Merger.land` already does the compose again. The `Recomposer` has no caller and does not land. | Keep the `Recomposer`: it is a second mechanism for one job. |
+| D34 | I14 absorbs I11 and I8. | The plane sync, the feeds and the status verb need the driver and its record. | A separate I11 and I8: they have no input without the driver. |
+| D35 | The feed of D21 comes from the driver and not from the signal `SHIP_INTEGRATION_EJECTED`. The fact is the same, and the driver knows it first. | The driver holds the conflict and the merge before any signal. | Keep the signal feed: it adds a step that can lose the event. |
+| D36 | I8 is `evolve integration status`, class A, read-only. It moves out of the `wave` family. | The record is the record of a pool, and the console train already sits under `integration`. | `evolve wave integration status`: the verb of D21 does not say which pool. |
+| D37 | Amends D19 and I10. The record is `WaveRecord`, one for each pool, and `IntegrationRecord` becomes its batch element. `.evolve/integration-epoch` is the lease epoch that D19 named. | D19 assumed a loop lease, and only lane leases exist (`wave-orchestrator.md` §8). A wave has many flushes, and one `IntegrationRecord` holds one batch. | Keep one record for each wave: a later flush replaces the earlier batch. |
+
+D32 to D37 are console proposals, and the operator approved them on 2026-11-06. D33 amends I7 and D13 only for a lane batch. The console train keeps its path. D35 amends D21. D37 amends D19 and I10: the fence, `Adopter` and `--force-with-lease` stay, and they take the epoch from the file.
+
+### The amended order
+
+1. I14 PR (a): names, the pool id through to the lane, `IsAncestor` and the wave record type.
+2. I14 PR (b): the epoch, the private ref, `Driver`, `ShadowActor`, the wave-end wrapper and `evolve integration status` with the verdict. Enforce refuses to start.
+3. Two clean shadow waves can then be read with `status`.
+4. I14 PR (c): `EnforceActor`, the gate adapters and the open inputs F2, F3, F11, F12 and findings 3 to 5. PR (c) gets its own card and review before its code.
+5. I9. The operator moves the lanes to `enforce`.
+
+I5, I6, I10, I12 and I13 are landed, and this order starts after them. PR (c) is the first caller of I5 and I10 for a lane batch. I6 holds two predicates and no flush, so PR (c) builds the flush.
+
+### What this does not prove
+
+- Shadow proves the driver, the record, the order and the conflict count on a held base. It does not prove CI, the merge or the ejection handling.
+- The conflict counts at shadow are an upper bound, because a lane forked later counts as `conflicted_base_ahead`.
+- D3 stays unmeasured at shadow, because `Risk` and `Deps` are not supplied.

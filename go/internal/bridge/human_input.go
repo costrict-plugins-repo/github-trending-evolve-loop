@@ -1,0 +1,86 @@
+package bridge
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math/rand"
+	"os"
+	"strings"
+	"time"
+)
+
+func humanSampleMS(meanMS, sdMS int) time.Duration {
+	v := rand.NormFloat64()*float64(sdMS) + float64(meanMS)
+	if v < 10 {
+		v = 10
+	}
+	return time.Duration(int(v)) * time.Millisecond
+}
+
+func humanBootPause(deps Deps) {
+	ms := 1500 + rand.Intn(2001)
+	fmt.Fprintf(deps.Stderr, "[human-input] boot pause %dms\n", ms)
+	deps.Sleep(time.Duration(ms) * time.Millisecond)
+}
+
+func pastePrompt(ctx context.Context, deps Deps, pfx, session, promptFile string, human bool) (pasteOutcome, error) {
+	if err := deps.Tmux.LoadBuffer(ctx, session, promptFile); err != nil {
+		return pasteOutcome{}, fmt.Errorf("prompt load-buffer: %w", err)
+	}
+	if err := deps.Tmux.PasteBuffer(ctx, session); err != nil {
+		return pasteOutcome{}, fmt.Errorf("prompt paste-buffer: %w", err)
+	}
+	data, readErr := os.ReadFile(promptFile)
+	size := len(data)
+	if readErr != nil {
+		fmt.Fprintf(deps.Stderr, "%s paste settle: prompt file unreadable (%v) — assuming a large paste\n", pfx, readErr)
+		size = pasteSettleMaxBytes
+	}
+	settle := pasteSettleFor(size)
+	if human {
+		lines := strings.Count(string(data), "\n") + 1
+		mean := lines * 80
+		if mean < 200 {
+			mean = 200
+		}
+		fmt.Fprintf(deps.Stderr, "[human-input] paste review (%d lines)\n", lines)
+		settle = humanSampleMS(mean, mean/4)
+	}
+	out, err := settlePasteThenEnter(ctx, deps, pfx, session, settle, size)
+	if err != nil {
+		return out, fmt.Errorf("prompt submit: %w", err)
+	}
+	return out, nil
+}
+
+func humanSendKeysCSV(ctx context.Context, deps Deps, session, csv, rule string) {
+	for _, tok := range strings.Split(csv, ",") {
+		if tok == "Enter" {
+			_ = deps.Tmux.SendKeys(ctx, session, "", true)
+		} else if tok != "" {
+			_ = deps.Tmux.SendKeys(ctx, session, tok, false)
+		}
+		deps.Sleep(humanSampleMS(65, 20))
+	}
+	fmt.Fprintf(deps.Stderr, "[human-input] sent keys: %s (rule=%s)\n", csv, rule)
+}
+
+func humanReadingPause(deps Deps, text string) {
+	words := len(strings.Fields(text))
+	if words < 3 {
+		words = 3
+	}
+	ms := 60000 * words / 220
+	fmt.Fprintf(deps.Stderr, "[human-input] reading pause (~%d words)\n", words)
+	deps.Sleep(humanSampleMS(ms, ms/4))
+}
+
+var errBypassNotAudited = errors.New("this launch has no audit sink for a bypass; run it through evolve bridge launch")
+
+func (deps Deps) auditBypass(name, reason string) error {
+	if deps.RecordBypass == nil {
+		return fmt.Errorf("--%s: %w", name, errBypassNotAudited)
+	}
+	return deps.RecordBypass(name, reason)
+}

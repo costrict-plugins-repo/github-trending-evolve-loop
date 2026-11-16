@@ -1,0 +1,84 @@
+package core
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestAdvanceContinuationBase_HealsStaleBase(t *testing.T) {
+	t.Parallel()
+
+	root, wt := initContinuationRepo(t, 81)
+	if err := os.WriteFile(filepath.Join(wt, "lane.go"), []byte("package x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := snapshotPreservedWorktree(context.Background(), "", wt); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte(".evolve/*\n!.evolve/evals/\ngo/bin/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitOut(t, root, "add", ".gitignore")
+	gitOut(t, root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "carve out .evolve/evals (the #418 shape)")
+	mainTip := gitOut(t, root, "rev-parse", "main")
+
+	healed, err := advanceContinuationBase(context.Background(), wt, 81)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if healed != mainTip {
+		t.Fatalf("advanceContinuationBase = %q, want main tip %s — the stale base was not healed", healed, mainTip)
+	}
+	evalsDir := filepath.Join(wt, ".evolve", "evals")
+	if err := os.MkdirAll(evalsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(evalsDir, "x.md"), []byte("# eval\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out := gitOut(t, wt, "add", ".evolve/evals/x.md"); out != "" {
+		t.Fatalf("git add of the carved-out path failed post-heal: %s", out)
+	}
+	if _, err := os.Stat(filepath.Join(wt, "lane.go")); err != nil {
+		t.Error("lane work lost by the base advance")
+	}
+}
+
+func TestAdvanceContinuationBase_NoOpWhenCurrent(t *testing.T) {
+	t.Parallel()
+
+	root, wt := initContinuationRepo(t, 82)
+	if healed, err := advanceContinuationBase(context.Background(), wt, 82); err != nil || healed != gitOut(t, root, "rev-parse", "main") {
+		t.Fatalf("advance on an already-current base returned %q, want current main (no-op)", healed)
+	}
+}
+
+func TestAdvanceContinuationBase_ConflictReturnsErrorAndAborts(t *testing.T) {
+	t.Parallel()
+
+	root, wt := initContinuationRepo(t, 83)
+	if err := os.WriteFile(filepath.Join(wt, "a.txt"), []byte("lane\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := snapshotPreservedWorktree(context.Background(), "", wt); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitOut(t, root, "add", "a.txt")
+	gitOut(t, root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "diverge")
+	head := gitOut(t, wt, "rev-parse", "HEAD")
+
+	if healed, err := advanceContinuationBase(context.Background(), wt, 83); err == nil || healed != "" {
+		t.Fatalf("conflicting advance returned %q, want \"\" and an error", healed)
+	}
+	if got := gitOut(t, wt, "rev-parse", "HEAD"); got != head {
+		t.Errorf("worktree HEAD moved across an aborted merge: %s -> %s", head, got)
+	}
+	if status := gitOut(t, wt, "status", "--porcelain"); status != "" {
+		t.Errorf("aborted merge left residue:\n%s", status)
+	}
+}

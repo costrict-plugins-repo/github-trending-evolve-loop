@@ -1,0 +1,464 @@
+//go:build integration
+
+package ciparity
+
+import (
+	"bytes"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/gittest"
+)
+
+type routingCase struct {
+	name                string
+	paths               []string
+	remove              string
+	wantGo, wantLanding bool
+}
+
+func TestWorkflowGitHelpers_KeepAmbientRoutingOutsideFixtures(t *testing.T) {
+	for _, helper := range []string{"fixture", "workflow"} {
+		for _, routing := range []string{"clean", "repository", "index", "objects"} {
+			t.Run(helper+"/"+routing, func(t *testing.T) {
+				assertGitStaysInFixture(t, helper, routing)
+			})
+		}
+	}
+}
+
+func assertGitStaysInFixture(t *testing.T, helper, routing string) {
+	t.Helper()
+	dir, _ := routingRepo(t)
+	wantTop, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	external, _ := routingRepo(t)
+	routingFile(t, external, "untracked.txt")
+	if err := os.WriteFile(filepath.Join(dir, "go", "new.go"), []byte("unique routing object\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	blob := routingGit(t, dir, "hash-object", "go/new.go")
+	externalGit := filepath.Join(external, ".git")
+	index := filepath.Join(externalGit, "index")
+	before, err := os.ReadFile(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	redirectAmbientGit(t, routing, external, externalGit)
+	if top := stageThroughHelper(t, helper, dir); top != wantTop {
+		t.Errorf("Git escaped fixture: got %q, want %q", top, wantTop)
+	}
+	after, err := os.ReadFile(index)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Errorf("Git changed the external index: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(externalGit, "objects", blob[:2], blob[2:])); !os.IsNotExist(err) {
+		t.Errorf("Git wrote the fixture blob to external objects: %v", err)
+	}
+}
+
+func redirectAmbientGit(t *testing.T, routing, external, externalGit string) {
+	t.Helper()
+	switch routing {
+	case "repository":
+		t.Setenv("GIT_DIR", externalGit)
+		t.Setenv("GIT_WORK_TREE", external)
+		t.Setenv("GIT_COMMON_DIR", externalGit)
+	case "index":
+		t.Setenv("GIT_INDEX_FILE", filepath.Join(externalGit, "index"))
+	case "objects":
+		t.Setenv("GIT_OBJECT_DIRECTORY", filepath.Join(externalGit, "objects"))
+	}
+}
+
+func stageThroughHelper(t *testing.T, helper, dir string) string {
+	t.Helper()
+	if helper == "fixture" {
+		routingGit(t, dir, "add", "--all")
+		return routingGit(t, dir, "rev-parse", "--show-toplevel")
+	}
+	out, err := runWorkflowShell(t, dir, "git add --all\ngit rev-parse --show-toplevel", nil)
+	if err != nil {
+		t.Fatalf("workflow Git control failed: %v\n%s", err, out)
+	}
+	return strings.TrimSpace(out)
+}
+
+func routingPathCases() []routingCase {
+	cases := []routingCase{
+		{"report", []string{"docs/reports/review.md"}, "", false, false},
+		{"research", []string{"docs/research/testing/note.md"}, "", false, false},
+		{"archive", []string{"docs/private/archive/note.md"}, "", false, false},
+		{"non_markdown_research_fixture", []string{"docs/research/testing/cases.json"}, "", true, true},
+		{"go", []string{"go/internal/core/new.go"}, "", true, false},
+		{"go_module", []string{"go/go.mod"}, "", true, false},
+		{"go_fixture", []string{"go/test/fixtures/input.json"}, "", true, false},
+		{"go_gate", []string{"go/.cover-strict"}, "", true, false},
+		{"skill", []string{"skills/a/SKILL.md"}, "", true, false},
+		{"agent", []string{"agents/a.md"}, "", true, false},
+		{"landing", []string{"landing/cmd/build/main.go"}, "", false, true},
+		{"landing_module", []string{"landing/go.mod"}, "", false, true},
+		{"landing_template", []string{"landing/templates/page.html"}, "", false, true},
+		{"explanation", []string{"docs/explain/topic.md"}, "", false, true},
+		{"mixed", []string{"go/pkg/version/version.go", "landing/static/site.css", "docs/reports/review.md"}, "", true, true},
+		{"deleted_source", nil, "go/existing.go", true, false},
+		{"deleted_document", nil, "docs/reports/existing.md", false, false},
+		{"renamed_source_to_document", []string{"docs/reports/renamed.md"}, "go/existing.go", true, false},
+		{"renamed_document_to_source", []string{"go/renamed.go"}, "docs/reports/existing.md", true, false},
+		{"unusual_names", []string{"landing/a\nb\tc file.txt", "docs/reports/note with spaces.md"}, "", false, true},
+	}
+	for _, path := range []string{".github/workflows/go.yml", ".github/workflows/required.yml", ".github/workflows/ci.yml", ".github/workflows/release.yml", ".github/workflows/landing-pages.yml", ".github/workflows/landing-validation.yml", ".goreleaser.yml", ".evolve/policy.json", ".evolve/phases/a.json", ".evolve/profiles/a.json", ".claude-plugin/plugin.json", "install.sh", "README.md", "docs/architecture/phase-registry.json", "docs/architecture/note.md", "docs/incidents/note.md", "config/new.yaml", "future-module/new.rs"} {
+		cases = append(cases, routingCase{path, []string{path}, "", true, true})
+	}
+	return cases
+}
+
+func TestRequiredRouting_ConsumedPathsAndExplicitDocumentationSkips(t *testing.T) {
+	t.Parallel()
+	step := workflowStep(t, RequiredWorkflow, "changes", "paths")
+	for _, tc := range routingPathCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, base := routingRepo(t)
+			if tc.remove != "" {
+				if err := os.Remove(filepath.Join(dir, tc.remove)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, path := range tc.paths {
+				routingFile(t, dir, path)
+			}
+			head := routingCommit(t, dir)
+			got, err := routingOutput(t, dir, step.Run, "push", base, head)
+			if err != nil {
+				t.Fatalf("routing failed: %v\n%s", err, got)
+			}
+			want := routeText(tc.wantGo, tc.wantLanding, false, false, false)
+			if got != want {
+				t.Fatalf("route = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestRequiredRouting_MergeBaseExcludesBaseBranchOnlyChanges(t *testing.T) {
+	t.Parallel()
+	dir, _ := routingRepo(t)
+	routingGit(t, dir, "checkout", "-qb", "feature")
+	routingFile(t, dir, "go/pr.go")
+	head := routingCommit(t, dir)
+	routingGit(t, dir, "checkout", "-q", "main")
+	routingFile(t, dir, "landing/base-only.html")
+	base := routingCommit(t, dir)
+	got, err := routingOutput(t, dir, workflowStep(t, RequiredWorkflow, "changes", "paths").Run, "pull_request", base, head)
+	if err != nil || got != routeText(true, false, false, false, false) {
+		t.Fatalf("PR route included unrelated base changes: %q, %v", got, err)
+	}
+}
+
+func TestRequiredRouting_NonFastForwardPushDiffsTheReachableOldTip(t *testing.T) {
+	t.Parallel()
+	dir, base := routingRepo(t)
+	routingFile(t, dir, "go/dropped.go")
+	oldTip := routingCommit(t, dir)
+	routingGit(t, dir, "branch", "-q", "before-force-push")
+	routingGit(t, dir, "checkout", "-q", "-B", "main", base)
+	routingFile(t, dir, "docs/reports/rewrite.md")
+	head := routingCommit(t, dir)
+	if got := routingGit(t, dir, "rev-parse", "before-force-push"); got != oldTip {
+		t.Fatalf("old tip %s is not reachable from before-force-push (%s)", oldTip, got)
+	}
+	got, err := routingOutput(t, dir, workflowStep(t, RequiredWorkflow, "changes", "paths").Run, "push", oldTip, head)
+	if err != nil || got != routeText(true, false, false, false, false) {
+		t.Fatalf("a push that drops a Go commit must run Go: %q, %v", got, err)
+	}
+}
+
+func TestRequiredRouting_MissingEvidenceCannotBecomeDocumentationSkip(t *testing.T) {
+	t.Parallel()
+	dir, head := routingRepo(t)
+	step := workflowStep(t, RequiredWorkflow, "changes", "paths")
+	cases := []struct {
+		name, event, base, head string
+		pass                    bool
+	}{
+		{"manual", "workflow_dispatch", "", head, true},
+		{"initial_push", "push", strings.Repeat("0", 40), head, true},
+		{"empty_diff", "push", head, head, true},
+		{"scheduled", "schedule", "", head, true},
+		{"missing_base", "pull_request", "", head, false},
+		{"invalid_base", "push", "--output=bad", head, false},
+		{"unknown_base", "push", strings.Repeat("f", 40), head, false},
+		{"invalid_head", "push", head, "not-a-sha", false},
+		{"unknown_head", "push", head, strings.Repeat("f", 40), false},
+		{"unknown_event", "unknown", head, head, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := routingOutput(t, dir, step.Run, tc.event, tc.base, tc.head)
+			if (err == nil) != tc.pass {
+				t.Fatalf("pass=%v want %v: %v\n%s", err == nil, tc.pass, err, got)
+			}
+			if tc.pass && got != routeText(true, true, false, false, true) {
+				t.Fatalf("missing diff evidence weakened routing: %q", got)
+			}
+			if !tc.pass && strings.Contains(got, "=false") {
+				t.Fatalf("failed routing emitted a skip decision: %q", got)
+			}
+		})
+	}
+}
+
+func TestRequiredRouting_GitFailuresStopWithoutShellErrexit(t *testing.T) {
+	t.Parallel()
+	dir, head := routingRepo(t)
+	step := workflowStep(t, RequiredWorkflow, "changes", "paths")
+	for _, tc := range []struct{ name, prefix, event, base, head string }{
+		{"diff_missing_base", "", "push", strings.Repeat("f", 40), head},
+		{"diff_missing_head", "", "push", head, strings.Repeat("f", 40)},
+		{"merge_base_failure", "", "pull_request", strings.Repeat("f", 40), head},
+		{"git_unavailable", "PATH=/nonexistent\n", "push", head, head},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := routingOutput(t, dir, "set +e\n"+tc.prefix+step.Run, tc.event, tc.base, tc.head)
+			if err == nil || strings.Contains(out, "go=") || strings.Contains(out, "landing=") {
+				t.Fatalf("Git failure must stop routing without emitting decisions: err=%v output=%q", err, out)
+			}
+		})
+	}
+}
+
+func routeText(goRequired, landing, docsOnly, docs, inbox bool) string {
+	return "go=" + strconv.FormatBool(goRequired) + "\nlanding=" + strconv.FormatBool(landing) +
+		"\ndocs_only=" + strconv.FormatBool(docsOnly) + "\ndocs=" + strconv.FormatBool(docs) +
+		"\ninbox=" + strconv.FormatBool(inbox) + "\n"
+}
+
+func TestRequiredRouting_InboxOnlyChangesSkipTheGoMatrix(t *testing.T) {
+	t.Parallel()
+	step := workflowStep(t, RequiredWorkflow, "changes", "paths")
+	for _, event := range []string{"push", "pull_request"} {
+		for _, tc := range []struct {
+			name                       string
+			paths                      []string
+			remove                     string
+			wantGo, wantLanding, inbox bool
+		}{
+			{"inbox_only", []string{".evolve/inbox/2026-10-19T00-00-00Z-item.json"}, "", false, false, true},
+			{"inbox_processed_only", []string{".evolve/inbox/processed/item.json"}, "", false, false, true},
+			{"inbox_deleted_only", nil, ".evolve/inbox/existing.json", false, false, true},
+			{"inbox_and_go", []string{".evolve/inbox/item.json", "go/internal/core/new.go"}, "", true, false, true},
+			{"inbox_and_policy", []string{".evolve/inbox/item.json", ".evolve/policy.json"}, "", true, true, true},
+			{"parked_inbox_is_not_the_inbox", []string{".evolve/inbox-parked/item.json"}, "", true, true, false},
+			{"other_evolve_state", []string{".evolve/profiles/a.json"}, "", true, true, false},
+		} {
+			t.Run(event+"/"+tc.name, func(t *testing.T) {
+				dir, _ := routingRepo(t)
+				routingFile(t, dir, ".evolve/inbox/existing.json")
+				base := routingCommit(t, dir)
+				if tc.remove != "" {
+					if err := os.Remove(filepath.Join(dir, tc.remove)); err != nil {
+						t.Fatal(err)
+					}
+				}
+				for _, path := range tc.paths {
+					routingFile(t, dir, path)
+				}
+				head := routingCommit(t, dir)
+				got, err := routingOutput(t, dir, step.Run, event, base, head)
+				if err != nil {
+					t.Fatalf("routing failed: %v\n%s", err, got)
+				}
+				if want := routeText(tc.wantGo, tc.wantLanding, false, false, tc.inbox); got != want {
+					t.Fatalf("route = %q, want %q", got, want)
+				}
+			})
+		}
+	}
+}
+
+type docsRoutingCase struct {
+	name                              string
+	event                             string
+	paths                             []string
+	remove                            string
+	wantGo, wantLanding, wantDocsOnly bool
+	wantDocs                          bool
+}
+
+func docsRoutingCases() []docsRoutingCase {
+	return []docsRoutingCase{
+		{"pr_report", "pull_request", []string{"docs/reports/review.md"}, "", false, false, true, true},
+		{"pr_architecture_doc", "pull_request", []string{"docs/architecture/note.md"}, "", false, false, true, true},
+		{"pr_nested_doc", "pull_request", []string{"docs/a/b/c.md"}, "", false, false, true, true},
+		{"pr_root_doc", "pull_request", []string{"README.md"}, "", false, false, true, true},
+		{"pr_changelog", "pull_request", []string{"CHANGELOG.md"}, "", false, false, true, true},
+		{"pr_explanation_doc_is_landing_source", "pull_request", []string{"docs/explain/topic.md"}, "", false, true, false, true},
+		{"pr_explanation_doc_beside_plain_doc", "pull_request", []string{"docs/explain/topic.md", "docs/reports/review.md"}, "", false, true, false, true},
+		{"pr_lint_standard_is_not_docs_only", "pull_request", []string{"docs/conventions/ste100-writing.md"}, "", true, true, false, true},
+		{"pr_lint_standard_beside_plain_doc", "pull_request", []string{"docs/conventions/ste100-writing.md", "README.md"}, "", true, true, false, true},
+		{"pr_two_docs", "pull_request", []string{"docs/reports/a.md", "AGENTS.md"}, "", false, false, true, true},
+		{"pr_deleted_doc", "pull_request", nil, "docs/reports/existing.md", false, false, true, true},
+		{"pr_renamed_doc", "pull_request", []string{"docs/reports/renamed.md"}, "docs/reports/existing.md", false, false, true, true},
+		{"pr_doc_with_go", "pull_request", []string{"docs/architecture/note.md", "go/internal/core/new.go"}, "", true, true, false, true},
+		{"pr_doc_with_landing", "pull_request", []string{"docs/reports/review.md", "landing/static/site.css"}, "", false, true, false, true},
+		{"pr_doc_with_config", "pull_request", []string{"README.md", "config/new.yaml"}, "", true, true, false, true},
+		{"pr_deleted_doc_with_go", "pull_request", []string{"go/internal/core/new.go"}, "docs/reports/existing.md", true, false, false, true},
+		{"pr_doc_renamed_to_source", "pull_request", []string{"go/renamed.go"}, "docs/reports/existing.md", true, false, false, true},
+		{"pr_skill_doc_is_not_docs", "pull_request", []string{"skills/x/SKILL.md"}, "", true, false, false, false},
+		{"pr_agent_doc_is_not_docs", "pull_request", []string{"agents/x.md"}, "", true, false, false, false},
+		{"pr_docs_json_is_not_docs", "pull_request", []string{"docs/x.json"}, "", true, true, false, false},
+		{"pr_docs_json_beside_doc", "pull_request", []string{"docs/x.json", "docs/reports/review.md"}, "", true, true, false, true},
+		{"pr_go_only", "pull_request", []string{"go/internal/core/new.go"}, "", true, false, false, false},
+		{"pr_landing_only", "pull_request", []string{"landing/static/site.css"}, "", false, true, false, false},
+		{"pr_root_note_is_not_docs", "pull_request", []string{"NOTES.md"}, "", true, true, false, false},
+		{"push_report", "push", []string{"docs/reports/review.md"}, "", false, false, false, false},
+		{"push_architecture_doc", "push", []string{"docs/architecture/note.md"}, "", true, true, false, false},
+		{"push_root_doc", "push", []string{"README.md"}, "", true, true, false, false},
+	}
+}
+
+func TestRequiredRouting_DocsOnlyPullRequestSelectsOnlyTheLint(t *testing.T) {
+	t.Parallel()
+	step := workflowStep(t, RequiredWorkflow, "changes", "paths")
+	for _, tc := range docsRoutingCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, base := routingRepo(t)
+			if tc.remove != "" {
+				if err := os.Remove(filepath.Join(dir, tc.remove)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, path := range tc.paths {
+				routingFile(t, dir, path)
+			}
+			head := routingCommit(t, dir)
+			got, err := routingOutput(t, dir, step.Run, tc.event, base, head)
+			if err != nil {
+				t.Fatalf("routing failed: %v\n%s", err, got)
+			}
+			if want := routeText(tc.wantGo, tc.wantLanding, tc.wantDocsOnly, tc.wantDocs, false); got != want {
+				t.Fatalf("route = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestRequiredRouting_AnEmptyPullRequestDiffKeepsTheFullSelection(t *testing.T) {
+	t.Parallel()
+	dir, head := routingRepo(t)
+
+	got, err := routingOutput(t, dir, workflowStep(t, RequiredWorkflow, "changes", "paths").Run, "pull_request", head, head)
+
+	if err != nil || got != routeText(true, true, false, false, true) {
+		t.Fatalf("an empty PR diff must run everything and no docs-only job: %q, %v", got, err)
+	}
+}
+
+func routingOutput(t *testing.T, dir, script, event, base, head string) (string, error) {
+	t.Helper()
+	tmp := t.TempDir()
+	output := filepath.Join(tmp, "output")
+	out, err := runWorkflowShell(t, dir, script, map[string]string{"EVENT_NAME": event, "BASE_SHA": base, "HEAD_SHA": head, "GITHUB_OUTPUT": output, "RUNNER_TEMP": tmp})
+	b, readErr := os.ReadFile(output)
+	if err != nil {
+		return out + string(b), err
+	}
+	if readErr != nil {
+		t.Fatalf("successful routing did not produce outputs: %v\n%s", readErr, out)
+	}
+	return string(b), nil
+}
+
+func routingRepo(t *testing.T) (string, string) {
+	t.Helper()
+	dir := gittest.Fixture(t).Dir
+	for _, path := range []string{"go/existing.go", "docs/reports/existing.md"} {
+		routingFile(t, dir, path)
+	}
+	return dir, routingCommit(t, dir)
+}
+
+func routingFile(t *testing.T, dir, path string) {
+	t.Helper()
+	full := filepath.Join(dir, path)
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(full, []byte("same content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func routingCommit(t *testing.T, dir string) string {
+	t.Helper()
+	routingGit(t, dir, "add", "--all")
+	routingGit(t, dir, "commit", "-qm", "routing fixture")
+	return routingGit(t, dir, "rev-parse", "HEAD")
+}
+
+func routingGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	args = append([]string{"-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"}, args...)
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = workflowTestEnv()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git fixture: %v\n%s", err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func TestRequiredRouting_ScheduleSelectsEverySuiteWhateverTheDiff(t *testing.T) {
+	t.Parallel()
+	step := workflowStep(t, RequiredWorkflow, "changes", "paths")
+	dir, base := routingRepo(t)
+	routingFile(t, dir, "docs/reports/review.md")
+	docsHead := routingCommit(t, dir)
+	want := routeText(true, true, false, false, true)
+	for _, tc := range []struct{ name, base, head string }{
+		{"no_before_sha", "", docsHead},
+		{"zero_before_sha", strings.Repeat("0", 40), docsHead},
+		{"docs_only_diff", base, docsHead},
+		{"empty_diff", docsHead, docsHead},
+		{"unknown_before_sha", strings.Repeat("f", 40), docsHead},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := routingOutput(t, dir, step.Run, "schedule", tc.base, tc.head)
+			if err != nil {
+				t.Fatalf("a scheduled run must route without diff evidence: %v\n%s", err, got)
+			}
+			if got != want {
+				t.Fatalf("route = %q, want every suite selected %q", got, want)
+			}
+		})
+	}
+}
+
+func TestRequiredRouting_ScheduleRoutesLikeAManualRun(t *testing.T) {
+	t.Parallel()
+	step := workflowStep(t, RequiredWorkflow, "changes", "paths")
+	dir, head := routingRepo(t)
+	manual, err := routingOutput(t, dir, step.Run, "workflow_dispatch", "", head)
+	if err != nil {
+		t.Fatalf("manual routing failed: %v\n%s", err, manual)
+	}
+	scheduled, err := routingOutput(t, dir, step.Run, "schedule", "", head)
+	if err != nil {
+		t.Fatalf("scheduled routing failed: %v\n%s", err, scheduled)
+	}
+	if scheduled != manual {
+		t.Fatalf("schedule route = %q, manual route = %q", scheduled, manual)
+	}
+	for _, line := range []string{"go=true", "landing=true", "inbox=true", "docs_only=false", "docs=false"} {
+		if !strings.Contains(scheduled, line+"\n") {
+			t.Errorf("scheduled route %q lacks %q", scheduled, line)
+		}
+	}
+}

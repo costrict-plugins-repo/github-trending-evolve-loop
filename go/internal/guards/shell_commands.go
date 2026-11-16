@@ -1,0 +1,446 @@
+package guards
+
+import (
+	"path"
+	"regexp"
+	"strings"
+	"unicode"
+)
+
+type shellCommand struct {
+	text  string
+	words []string
+}
+
+func splitShellCommands(cmd string) []shellCommand {
+	s := &shellScanner{src: cmd}
+	s.push(0)
+	for s.i < len(s.src) {
+		if c := s.top(); c.inDquote {
+			s.scanDquoted(c)
+		} else {
+			s.scanUnquoted(c)
+		}
+	}
+	for len(s.stack) > 0 {
+		s.pop()
+	}
+	return s.out
+}
+
+type shellScanner struct {
+	src      string
+	i        int
+	stack    []*scanContext
+	heredocs []string
+	out      []shellCommand
+}
+
+type scanContext struct {
+	closer   byte
+	depth    int
+	inDquote bool
+	cmd      commandBuilder
+}
+
+func (s *shellScanner) top() *scanContext { return s.stack[len(s.stack)-1] }
+
+func (s *shellScanner) push(closer byte) {
+	s.stack = append(s.stack, &scanContext{closer: closer})
+}
+
+func (s *shellScanner) pop() {
+	s.endCommand(s.top())
+	s.stack = s.stack[:len(s.stack)-1]
+}
+
+func (s *shellScanner) peek(n int) byte {
+	if s.i+n < len(s.src) {
+		return s.src[s.i+n]
+	}
+	return 0
+}
+
+func (s *shellScanner) endCommand(c *scanContext) {
+	if cmd, ok := c.cmd.finish(); ok {
+		s.out = append(s.out, cmd)
+	}
+}
+
+func (s *shellScanner) scanUnquoted(c *scanContext) {
+	ch := s.src[s.i]
+	switch {
+	case ch == '\n':
+		s.endCommand(c)
+		s.i++
+		s.skipHeredocBodies()
+	case ch == ';' || ch == '|' || ch == '&':
+		s.endCommand(c)
+		s.i++
+	case ch == ' ' || ch == '\t':
+		c.cmd.space(ch)
+		s.i++
+	case ch == '#' && !c.cmd.inWord:
+		s.skipComment()
+	case ch == '\'':
+		s.singleQuoted(c)
+	case ch == '$' && s.peek(1) == '\'':
+		s.ansiCQuoted(c)
+	case ch == '$' && s.peek(1) == '"':
+		s.i++
+	case ch == '"':
+		c.inDquote = true
+		c.cmd.quote('"')
+		s.i++
+	case ch == '\\':
+		s.escaped(c)
+	case ch == '`' && c.closer == '`':
+		s.i++
+		s.pop()
+	case ch == '`' || (ch == '$' && s.peek(1) == '('):
+		s.openSubstitution(c)
+	case ch == '(' || ch == ')':
+		s.parenthesis(c, ch)
+	case ch == '<' && c.depth == 0 && strings.HasPrefix(s.src[s.i:], "<<"):
+		s.heredocOrHereString(c)
+	default:
+		c.cmd.char(ch)
+		s.i++
+	}
+}
+
+func (s *shellScanner) scanDquoted(c *scanContext) {
+	switch ch := s.src[s.i]; {
+	case ch == '"':
+		c.inDquote = false
+		c.cmd.quote('"')
+		s.i++
+	case ch == '\\':
+		s.escaped(c)
+	case ch == '`' || (ch == '$' && s.peek(1) == '('):
+		s.openSubstitution(c)
+	default:
+		c.cmd.char(ch)
+		s.i++
+	}
+}
+
+func (s *shellScanner) openSubstitution(c *scanContext) {
+	closer := byte(')')
+	if s.src[s.i] == '`' {
+		closer = '`'
+		s.i++
+	} else {
+		s.i += 2
+	}
+	c.cmd.char('$')
+	s.push(closer)
+}
+
+func (s *shellScanner) parenthesis(c *scanContext, ch byte) {
+	s.i++
+	s.endCommand(c)
+	switch {
+	case ch == '(':
+		c.depth++
+	case c.depth > 0:
+		c.depth--
+	case c.closer == ')':
+		s.stack = s.stack[:len(s.stack)-1]
+	}
+}
+
+func (s *shellScanner) singleQuoted(c *scanContext) {
+	end := strings.IndexByte(s.src[s.i+1:], '\'')
+	if end < 0 {
+		end = len(s.src) - s.i - 1
+	}
+	body := s.src[s.i+1 : s.i+1+end]
+	c.cmd.quote('\'')
+	c.cmd.literal(body)
+	c.cmd.quote('\'')
+	s.i += end + 2
+}
+
+func (s *shellScanner) ansiCQuoted(c *scanContext) {
+	body, width := ansiCBody(s.src[s.i+2:])
+	c.cmd.quote('\'')
+	c.cmd.literal(body)
+	c.cmd.quote('\'')
+	s.i += 2 + width
+}
+
+func ansiCBody(src string) (string, int) {
+	var body strings.Builder
+	i := 0
+	for i < len(src) && src[i] != '\'' {
+		if src[i] != '\\' || i+1 == len(src) {
+			body.WriteByte(src[i])
+			i++
+			continue
+		}
+		decoded, width := ansiCEscape(src[i+1:])
+		body.WriteString(decoded)
+		i += 1 + width
+	}
+	return body.String(), min(i+1, len(src))
+}
+
+var ansiCSingle = map[byte]string{
+	'a': "\a", 'b': "\b", 'e': "\x1b", 'E': "\x1b", 'f': "\f", 'n': "\n", 'r': "\r",
+	't': "\t", 'v': "\v", '\\': "\\", '\'': "'", '"': "\"", '?': "?",
+}
+
+type ansiCNumeric struct {
+	digits, base int
+	isRune       bool
+}
+
+var ansiCNumerics = map[byte]ansiCNumeric{'x': {2, 16, false}, 'u': {4, 16, true}, 'U': {8, 16, true}}
+
+var ansiCOctal = ansiCNumeric{digits: 3, base: 8}
+
+func ansiCEscape(src string) (string, int) {
+	if decoded, ok := ansiCSingle[src[0]]; ok {
+		return decoded, 1
+	}
+	if spec, ok := ansiCNumerics[src[0]]; ok {
+		if decoded, width := spec.decode(src[1:]); width > 0 {
+			return decoded, 1 + width
+		}
+	} else if decoded, width := ansiCOctal.decode(src); width > 0 {
+		return decoded, width
+	}
+	return "\\" + src[:1], 1
+}
+
+func (n ansiCNumeric) decode(src string) (string, int) {
+	value, width := 0, 0
+	for width < len(src) && width < n.digits {
+		digit := strings.IndexRune("0123456789abcdef"[:n.base], unicode.ToLower(rune(src[width])))
+		if digit < 0 {
+			break
+		}
+		value, width = value*n.base+digit, width+1
+	}
+	if n.isRune {
+		return string(rune(value)), width
+	}
+	return string([]byte{byte(value)}), width
+}
+
+var shellAssignmentRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
+
+var commandWrappers = map[string]bool{
+	"arch": true, "builtin": true, "caffeinate": true, "command": true, "env": true, "exec": true, "nice": true,
+	"nohup": true, "sudo": true, "time": true, "timeout": true, "xargs": true,
+}
+
+func programName(word string) string {
+	return strings.ToLower(path.Base(word))
+}
+
+var shellReservedWords = map[string]bool{
+	"!": true, "{": true, "if": true, "then": true, "elif": true, "else": true, "do": true, "while": true, "until": true,
+}
+
+func candidateCommands(words []string) [][]string {
+	for len(words) > 0 && (shellAssignmentRe.MatchString(words[0]) || shellReservedWords[words[0]]) {
+		words = words[1:]
+	}
+	if len(words) == 0 {
+		return nil
+	}
+	if !commandWrappers[programName(words[0])] {
+		return [][]string{words}
+	}
+	candidates := make([][]string, 0, len(words)-1)
+	for i := 1; i < len(words); i++ {
+		candidates = append(candidates, words[i:])
+	}
+	return candidates
+}
+
+func anyCommand(words []string, runs func(name string, args []string) bool) bool {
+	for _, c := range candidateCommands(words) {
+		if runs(programName(c[0]), c[1:]) {
+			return true
+		}
+	}
+	return false
+}
+
+var gitOptionsWithValue = map[string]bool{
+	"-C": true, "-c": true, "--git-dir": true, "--work-tree": true,
+	"--namespace": true, "--super-prefix": true, "--config-env": true,
+}
+
+func gitSubcommand(args []string) string {
+	if i := gitSubcommandIndex(args); i >= 0 {
+		return args[i]
+	}
+	return ""
+}
+
+func gitSubcommandIndex(args []string) int {
+	for i := 0; i < len(args); i++ {
+		if !strings.HasPrefix(args[i], "-") {
+			return i
+		}
+		if gitOptionsWithValue[args[i]] {
+			i++
+		}
+	}
+	return -1
+}
+
+func (s *shellScanner) escaped(c *scanContext) {
+	if s.peek(1) == '\n' {
+		s.i += 2
+		return
+	}
+	c.cmd.text.WriteByte('\\')
+	s.i++
+	if s.i < len(s.src) {
+		c.cmd.char(s.src[s.i])
+		s.i++
+	}
+}
+
+func (s *shellScanner) skipComment() {
+	if end := strings.IndexByte(s.src[s.i:], '\n'); end >= 0 {
+		s.i += end
+		return
+	}
+	s.i = len(s.src)
+}
+
+func (s *shellScanner) heredocOrHereString(c *scanContext) {
+	rest := s.src[s.i:]
+	if strings.HasPrefix(rest, "<<<") {
+		c.cmd.literal("<<<")
+		s.i += 3
+		return
+	}
+	n := len("<<")
+	if strings.HasPrefix(rest[n:], "-") {
+		n++
+	}
+	for n < len(rest) && (rest[n] == ' ' || rest[n] == '\t') {
+		n++
+	}
+	width, marker := heredocWord(rest[n:])
+	if marker != "" {
+		s.heredocs = append(s.heredocs, marker)
+	}
+	c.cmd.literal(rest[:n+width])
+	s.i += n + width
+}
+
+func heredocWord(src string) (int, string) {
+	var marker strings.Builder
+	i := 0
+	for i < len(src) && !strings.ContainsRune(" \t\n;&|()<>", rune(src[i])) {
+		switch src[i] {
+		case '\'':
+			end := strings.IndexByte(src[i+1:], '\'')
+			if end < 0 {
+				end = len(src) - i - 1
+			}
+			marker.WriteString(src[i+1 : i+1+end])
+			i += end + 2
+		case '"':
+			i += dquotedWordPart(src[i+1:], &marker) + 1
+		case '\\':
+			if i+1 < len(src) && src[i+1] != '\n' {
+				marker.WriteByte(src[i+1])
+			}
+			i += 2
+		default:
+			marker.WriteByte(src[i])
+			i++
+		}
+	}
+	return min(i, len(src)), marker.String()
+}
+
+func dquotedWordPart(src string, marker *strings.Builder) int {
+	i := 0
+	for i < len(src) && src[i] != '"' {
+		if src[i] == '\\' && i+1 < len(src) && strings.ContainsRune("$`\"\\\n", rune(src[i+1])) {
+			if src[i+1] != '\n' {
+				marker.WriteByte(src[i+1])
+			}
+			i += 2
+			continue
+		}
+		marker.WriteByte(src[i])
+		i++
+	}
+	return i + 1
+}
+
+func (s *shellScanner) skipHeredocBodies() {
+	for _, marker := range s.heredocs {
+		for s.i < len(s.src) {
+			line := s.src[s.i:]
+			if end := strings.IndexByte(line, '\n'); end >= 0 {
+				line = line[:end]
+			}
+			trimmed := strings.TrimLeft(line, " \t")
+			if trimmed == marker || strings.HasPrefix(trimmed, marker+")") {
+				s.i += len(line) - len(trimmed) + len(marker)
+				break
+			}
+			s.i += len(line) + 1
+		}
+	}
+	if s.i > len(s.src) {
+		s.i = len(s.src)
+	}
+	s.heredocs = nil
+}
+
+type commandBuilder struct {
+	text   strings.Builder
+	word   strings.Builder
+	words  []string
+	inWord bool
+}
+
+func (b *commandBuilder) char(ch byte) {
+	b.text.WriteByte(ch)
+	b.word.WriteByte(ch)
+	b.inWord = true
+}
+
+func (b *commandBuilder) literal(s string) {
+	b.text.WriteString(s)
+	b.word.WriteString(s)
+	b.inWord = true
+}
+
+func (b *commandBuilder) quote(q byte) {
+	b.text.WriteByte(q)
+	b.inWord = true
+}
+
+func (b *commandBuilder) space(ch byte) {
+	b.endWord()
+	b.text.WriteByte(ch)
+}
+
+func (b *commandBuilder) endWord() {
+	if b.inWord {
+		b.words = append(b.words, b.word.String())
+	}
+	b.word.Reset()
+	b.inWord = false
+}
+
+func (b *commandBuilder) finish() (shellCommand, bool) {
+	b.endWord()
+	cmd := shellCommand{text: b.text.String(), words: b.words}
+	*b = commandBuilder{}
+	return cmd, strings.TrimSpace(cmd.text) != ""
+}

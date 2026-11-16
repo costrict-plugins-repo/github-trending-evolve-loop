@@ -1,0 +1,174 @@
+# ADR-0105: Identity-preserving fleet rebase — verdicts follow the change, gates follow the tree
+
+- **Status:** Proposed, 2026-09-26. The operator's direction: "If the audit pass, we should trust the result and mitigate the ship issue and make sure the ship issue can be resolved. The pass audit changes should not be blocked because process issue."
+- **Amended by:** [ADR-0128](0128-landing-queue-tiered-reverification.md) (Proposed, 2026-10-09). A queue lane composes its audited tree, so B1 and the recovery-path rebind and carry retire for queue lanes. B4 accepts two new record methods. Until the queue enforces, the ladder runs the proof for continuation lanes, and it reports a proof that did not run.
+- **Amends:**
+  - [ADR-0049](0049-concurrent-multi-cycle-execution.md) S5 ("rebase and re-audit");
+  - [recovery-predicate-authority](../recovery-predicate-authority.md), whose principle holds: carried predicate evidence still needs a fresh receipt on the composed tree;
+  - [build-explanation-contract](../build-explanation-contract.md), where Build Binding comes to mean the authored base.
+- **Record:** [incident 2026-09-26, a passed audit sent back by ship-stage process issues](../../incidents/2026-09-26-a-passed-audit-sent-back-by-ship-process-issues.md)
+
+## Context
+
+A fleet lane that passed audit reaches ship after a peer lane has moved main. `recoverFromShipError` rebases the lane. For every cycle with a versioned build explanation, which is every cycle today, it then returns to Build, so Build and Audit re-run. That costs 20 to 30 minutes and an LLM round each, even when the change is byte-identical. Cycles 1698 and 1701 both took this path on 2026-09-26.
+
+The merge ladder already has a RUNG 0 meant to carry an audit across a trivial rebase. Review found it cannot carry anything in worktree mode:
+- **F1.** It diffs `main...<plane HEAD at audit>`, which is always empty there. No `composition-verdict` row has ever been written.
+- **F2.** Ship's binding reads HEAD, the tree state and the patch-id from the plane, so even a written verdict would not bind.
+- **F3.** Explanation contract v1 puts the base SHA inside the audited patch, as the document's `## Build Binding` line.
+- **F4.** The failed ship's own inbox consumption rides in the diverged commit, so no identity proof can hold as-is.
+- **F5.** RUNG 0 writes its artifacts inside the worktree, which would break `ledger verify` once the worktree is removed. **Corrected (2026-10-06):** B3 shipped with the same hazard, and it was live. The identity carry wrote its diffs into the cycle worktree and its record into the project ledger, so after the first carry's worktree was cleaned up the plane ledger stopped verifying, and ship's whole-ledger Verify refused all six carries (1766 to 1810). Resolved by [ADR-0123](0123-ledger-durable-evidence-segments-incremental-verify.md) Phase 1: the diffs live in the ledger's content-addressed store, and `evolve ledger evidence restore` rebuilds the lost ones from git ([incident](../../incidents/2026-10-06-carry-refused-ledger-verify-f5.md)).
+
+## Decision
+
+A four-rung recovery ladder with no LLM calls, as a chain of responsibility. Each rung either succeeds or falls back to today's route, which is still the safe default.
+
+1. **B1 — unwind, rebase, re-pend** (`core/ship_recovery.go`), for contract cycles. It runs only when:
+   - the worktree has no tracked changes and no untracked files;
+   - the lane forked at the audited base (`merge-base HEAD main`);
+   - git holds the audited tree `T0`;
+   - the change since audit is exactly ship's inbox consumption pairs, and no consumed item carries a released continuation.
+
+   The steps:
+   - make a carrier commit of `T0` on the audited base (`commit-tree`), so it holds exactly the audited bytes, and reset to it;
+   - replay it with the existing `rebaseWithDerivedRegen`;
+   - soft-reset to the fork point, whatever the rebase's outcome. After a clean replay that is the new base; after an aborted one it is the audited base, which restores the audited shape.
+
+   The result is the pending shape Audit binds, and the re-ship consumes its inbox items again. No unwind runs when the pre-screen predicts a conflict.
+2. **B2 — `explanationdocs.RebindIdenticalRebase(ctx, binding, newBase, persist) (rebound bool, err error)`.** It rebinds the host state under an identity proof and skips Build. It returns `(false, nil)` and writes nothing on any doubt.
+3. **B3 — a repaired RUNG 0.**
+   - It compares tree diffs (`diff --binary --full-index --no-ext-diff --no-textconv --no-renames base0 T0` against `base1 T1`) byte-for-byte.
+   - The composed-tree gates run under `treefence.Begin/End`, and the host predicate suite re-runs on `T1` with a sealed receipt.
+   - It writes a `composition-verdict{method:"identical-rebase"}` record whose artifacts live in the host workspace. It skips Audit. **Corrected (2026-10-06):** the code wrote the artifacts into the cycle worktree, not the host workspace. Since 2026-10-06 the ledger writer stores them in `.evolve/ledger-artifacts/` beside the ledger, and the record names them by sha256 (ADR-0123 C1, C2).
+   - A carry always chains from the authored base and never from another carry.
+4. **B4 — ship's worktree binding.** When ship lands from a worktree, it ignores the plane HEAD and the plane diff.
+   - If the current worktree tree equals the audited tree, today's binding applies.
+   - Otherwise it requires a carry record matching this audit's report, the audited tree, the current tree and the run. Ship then recomputes the ancestry, disjointness, byte-equal diffs, gates and receipt itself; it never trusts the writer.
+
+### The identity proof (B2)
+
+Patch-id is not sufficient:
+- it ignores whitespace and binary content;
+- `.gitattributes` textconv can hide content;
+- a peer edit outside the three-line context moves the `path:line` citations the document and the audit rely on.
+
+The proof is per-path byte identity, and every check must hold:
+1. The new base is valid and different, and it descends from both the authored base and the old base.
+2. **Pre-image identity:** the peer delta `D = diff --name-only(authored, base1)` and the lane's paths `S1` do not intersect, even case-folded. A `.gitattributes` or `.gitignore` in `D` declines. So does any path in `D` or `S1` that is not plain (non-ASCII; containing `:`, `\` or `~`; a component ending in a dot or a space, or longer than 250 bytes), because some filesystem resolves it to a differently spelled file.
+3. **Post-image identity:** `pathStateSHA256(worktree, domain(old base), S1) == view.DiffSHA256`. This covers raw bytes, modes and the document itself.
+4. The material paths and material digest are equal, and the build-report declaration still matches the view.
+5. A REQUIRED document does not exist at the new base and passes its immutable-history checks.
+
+A separate clean-replay check is not needed. A path the rebase regenerated or resolved is one the peer delta also touched, which check 2 declines, and any other byte change fails check 3.
+
+### What the host may re-derive
+
+| Artifact | Re-derived | Must stay equal |
+|---|---|---|
+| Activation marker | `BaseSHA` → new base | contract, cycle, run, workspace, worktree |
+| Result snapshot | `View.BaseSHA`, `View.DiffSHA256`, a new `View.AuthoredBaseSHA` (set once) | material digest, status, reason, document path and digest, material paths |
+| `build-explanation.json` | rewritten to the new view | must satisfy `SameView` |
+| The Markdown document, `build-report.md` | nothing | bytes (proven) |
+
+`BaseSHA`, `DiffSHA256` and the handoff are host-derived facts. The Builder's document keeps saying it was written against the authored base, which stays true, so no new rationale is asserted over proven-identical bytes. `Verify` becomes lineage-aware: the document's base must equal `AuthoredBaseSHA` when it is set, with ancestry and disjointness re-derived; when it is absent, strict equality applies. `SealResult` never sets it.
+
+### Placement
+
+In `ship_recovery.go`, after the pre-screen: B1, then the rebase.
+- If the change is pending on its fork point and identical, B2 runs. When it rebinds, B3 runs and returns Ship on a green carry, else Audit. A committed change never goes to Audit this way: the Auditor reads `git diff HEAD`, which would be empty.
+- Otherwise today's `RebaseBuildAndPersist` returns Build.
+
+The write order is marker, then `persist`, then the handoff, then the snapshot, which is the commit point. A carry record is written only after the snapshot.
+
+## Consequences
+
+- A clean fleet rebase of an unchanged change ships with no LLM round. Build re-runs only when the change differs, and Audit only when the composed tree fails its gates or predicates.
+- About six protected files change: `explanationdocs`, `phaseio/handoffs.go`, `core/ship_recovery.go` and the composition carry-forward, `phases/ship/audit.go` and `composition.go`, and the ledger composition adapter. The ADR-0064 manifest gains the ship binding reader and the composition files, which are not protected today.
+- An old binary ignores `authored_base_sha` and fails closed. Deploy at a wave boundary.
+
+## Components, steps and tests
+
+Each rung lands at its own wave boundary as a stack of small commits, one component per commit. Every component has its own tests, which run alone with `go test -count=1 -run '<selector>' ./internal/<pkg>/`. A component lands unwired first; the wiring is a separate commit that carries the integration tests. The suite is green at every commit, and the full floor runs on the tip.
+
+### B2 — the explanation rebind (`internal/explanationdocs`)
+
+| Component | Step it implements | Tests |
+|---|---|---|
+| Path states: `readPathStates`, `foldPathStates` | one read of the lane's paths, folded per digest domain | the existing digest suite |
+| Authored base: `AuthoredBaseSHA`, lineage-aware `Verify` | Audit, Ship and Retro accept the document's base only with lineage re-derived | `TestVerify_` |
+| Re-seal policy: `SealResult`, `RefreshResult`, `revalidateResult` | the host never re-seals a rebound handoff | `TestSealResult_`, `TestRefreshResult_` |
+| Alias guard: `peerTouchesLane`, `isPlainPath` | the disjointness check | `TestPeerTouchesLane` |
+| `RebindIdenticalRebase` | the proof, then marker → checkpoint → handoff → snapshot | `TestRebindIdenticalRebase_` |
+
+Content drift is covered by the whitespace and binary drift tests. The check that the document is absent at the new base is defence in depth: disjointness and the digest decline that case first, so no public seam reaches it.
+
+### B1 — the unwind, then the wiring (`internal/core`), in commit order
+
+| # | Component | Step it implements | Tests |
+|---|---|---|---|
+| 1 | `forkPoint` (a fix) | the rebased base is the lane's fork point, `merge-base HEAD main`, not main's tip, which a later landing moves | `TestRouteRebasedExplanation_BindsTheForkPoint` |
+| 2 | `latestAuditedTree` | read the audited tree `T0` from the newest auditor row of the run, by the same rule ship binds (`auditledger`); an empty tree declines | `TestLatestAuditedTree_` |
+| 3 | `unwindShipCommit`, `pendRebasedChange` | replace ship's commit with a carrier of `T0` on the audited base, then leave the change pending on the fork point; it declines unless the delta is exactly ship's inbox consumption pairs, the worktree has no untracked files, and no consumed item carries a released continuation | `TestUnwindShipCommit_`, `TestPendRebasedChange_` |
+| 4 | `routeRebasedExplanation` calls B2 | only a change pending on its fork point may be rebound, because Audit reads `git diff HEAD`; the result is Audit, anything else Build, and an incomplete rebind aborts | `TestRouteRebasedExplanation_` |
+| 5 | Wiring: unwind → rebase → pend → route | contract cycles only; no unwind when the pre-screen predicts a conflict; pend whatever the rebase's outcome, so a failed rebase leaves the audited shape | `TestRecoverFromShipError_IdenticalRebaseSkipsBuild`, `…_NonIdenticalRebaseStillReturnsToBuild`, `…_WithoutAnAuditedTreeRebasesTheShipCommit`, `…_APredictedConflictIsNotUnwound`, `…_ALegacyCycleIsNotUnwound` |
+
+B1 opens two crash windows. After the carrier reset and before the rebase, a resumed ship binds `T0` again and the unwind repeats, so that window heals itself. Between the rebase and the pend, the carrier sits committed on the new base, and a resumed ship would go to a re-audit of a committed change. The resume heal (`resume-heals-a-carrier-left-at-head`, via the `Evolve-Carrier` trailer) is therefore required before B3 or B4 builds on B1. Before building B3, confirm that the first live fleet-rebase recovery logs `unwound its ship commit`, not `ship unwind declined:`.
+
+The heal landed on 2026-10-20 (`resume_carrier_heal.go`). On resume, before a phase runs, `healCarrierAtHead` reads the `Evolve-Carrier` trailer of HEAD. When it names this cycle and run, the heal pends the change on its fork point and emits `ORCHESTRATOR_RESUME_CARRIER_PENDED`. The debugger's carrier (B5) has the same trailer, so the same heal covers it. The heal also covers the first window: a carrier on the audited base is pended there, so the unwind does not repeat.
+
+### Phase by phase
+
+- **Build.** A change that is not identical still invalidates the snapshot and returns to Build (step 5's non-identical test).
+- **Audit.** The rebound explanation verifies on the new base (`explanationdocs.Verify` in steps 4 and 5), and Audit always receives a pending change.
+- **Ship.** `TestVerifyAuditBinding_ShipsACarriedRebaseWithoutASecondAudit` (`phases/ship/execution_tree_carry_test.go`) drives the real audit binding on a carried rebase: a peer lands, the audit binds, the lane rebases byte for byte, and ship accepts the carry with no second audit. It proves the binding with a carry record written by a test helper; the end-to-end proof through the real recovery is step 4's open item. This line first named `TestFleetRebase_Cycle1701Shape_ShipsWithoutBuildOrAudit`, which was never written. Without that proof, `verifyAuditBinding`'s predicate-execution tree check (older than B4) kept comparing the held tree with the audited one directly, so every carry (cycles 1766, 1768, 1772) was refused there and re-audited; since 2026-09-30 that check applies B4's rule too.
+
+### A constraint on B4 found on the way
+
+Ship's comparison of the plane's HEAD is load-bearing for a worktree ship: a resumed ship detects "merged locally, push pending" through it (`phases/ship/repair_resume_test.go`). Dropping the check for worktree ships turns that resume into a false "shipped". B4 must keep that detection, for example by asking whether the plane already contains the lane's tip, before it stops treating a sibling's closeout commit as a moved HEAD (cycle 1704, 2026-09-26).
+
+### B3 — the carry (`internal/treedelta`, `internal/adapters/ledger`, `internal/core`), in commit order
+
+| # | Component | Step it implements | Tests |
+|---|---|---|---|
+| 1 | `treedelta.Delta`, `treedelta.Identical` | the byte-exact change (`diff --binary --full-index --no-ext-diff --no-textconv --no-renames`) of `T0` on `base0` equals that of `T1` on `base1`, and is not empty; a leaf, so ship re-proves with the same bytes | `TestIdentical_HoldsForTheSameBytesOnTwoBasesAndDeclinesOneByte`, `TestDelta_KeepsWhitespaceAndArgsAreTheOneInvocation`, `TestIdenticalChange_HoldsAcrossACleanRebaseAndDeclinesAnyByte` |
+| 2 | `IdenticalRebaseMethod`, `AuditedTreeSHA`, `LatestCompositionVerdict` | the carry record names the audit artifact, the audited tree and the composed tree; the newest record for an audit wins | `TestWriteCompositionVerdict_IdenticalRebaseRecordsTheAuditedTreeAndReadsBack`, `TestLatestCompositionVerdict_AbsentLedgerIsNoCarry` |
+| 3 | `identityCarryForward` after `routeRebasedExplanation`'s rebind | the auditor row names `T0` and the artifact, and the base its worktree stood on is `base0` (`carriedAudit`: `auditledger.Entry.AuditedBase` reads `worktree_base_sha`, which `recordAuditBinding` writes, else `git_head` on an older row; a row naming no base declines); `T1` is the index; the proof holds; the composed gates run under the fence and the index is still `T1`; the record goes to the root ledger; Ship, else Audit | `TestRouteRebasedExplanation_AByteIdenticalRebaseShipsOnTheCarriedVerdict`, `TestRouteRebasedExplanation_AMainThatMovedBeforeTheAuditStillCarries`, `TestRouteRebasedExplanation_ACarryThatCannotBeProvenReturnsToAudit` (nine declines), `TestCarriedAudit_ARowNamingNoBaseNeverCarriesEvenOnAnEmptyBase`, `TestEmitPhaseBindings_TheAuditRowNamesTheBaseTheAuditedWorktreeStoodOn`, `TestLedgerEntry_EveryFieldSurvivesTheLedgerRoundTrip`, `TestEntry_AuditedBasePrefersTheWorktreeBaseAndFallsBackToTheHead` |
+
+**The audited base (wave 21, 2026-09-28).** The carry declined on cycles 1724 and 1727 with "the audit was bound on X, not on the base Y the change was authored on", and each paid a second audit of a byte-identical rebase. The row's `git_head` is the project root's HEAD when the audit was bound, not the audited worktree's base: a sibling lane's landing (1723 before 1724's re-audit, 1728's no-work dossier before 1727's audit) had moved main while the worktree still stood on `Y`. The audit judged `T0` on `Y`, so the carry now compares the row's `worktree_base_sha` with `base0`. `git_head` stays the plane-HEAD record that ship's head check and release preflight read. Two readers still take it for an audited base: RUNG 0's snapshot (`cmd/evolve/cmd_composition_wiring.go`, which diffs `main...git_head`) and ship's composition check (`internal/phases/ship/composition.go`, which compares a record's `AuditedBase` with `git_head`). RUNG 0 therefore cannot carry a real rebase; it fails closed to a re-audit, and the inbox item `composition-snapshot-reads-the-worktree-base` measures and fixes or retires it.
+
+### B4 — ship accepts a carry (`internal/phases/ship`)
+
+| # | Component | Step it implements | Tests |
+|---|---|---|---|
+| 1 | `Options.internalAuditArtifactSHA` | the binding remembers which audit artifact it bound, beside the audited tree | `TestAuditBindingSatisfied_AcceptsAReProvenCarry` |
+| 2 | `carrySatisfied` inside `auditBindingSatisfied` | when the tree ship holds is not the bound tree: the newest `identical-rebase` record for that artifact must name the bound tree and the held tree, the ledger chain must verify, both bases' ancestry holds in the tree's own directory, the bytes are identical (B3 step 1, recomputed) and the record's patch-id is theirs; the consumption explanation stays the next rule; the success log names the reason | `TestAuditBindingSatisfied_DeclinesACarryItCannotReProve`, `TestAuditBindingSatisfied_DeclinesACarryWhoseRecordLies`, `TestAuditBindingSatisfied_ReProvesTheRecordsClaimsIndependently` |
+
+**Corrected (2026-10-07):** B1 and row 2 contradicted each other. B1's re-ship consumes its inbox items again, so after a carry ship holds the carried tree plus that consumption; row 2 required a record naming the held tree and kept the consumption explanation as the next rule, measured from the audited tree. Neither accepted the sum, and cycle 1825 was sealed FAIL on a false `INTEGRITY_TREE_DRIFT` ([incident](../../incidents/2026-10-07-cycle-1825-carry-refused-the-reships-consumption.md)). The carry now composes with the consumption: the record must name the bound audit and the bound audited tree, the drift from the record's tree to the held tree must be only the sanctioned consumption, and the carry is re-proven on the record's own tree (`carryExplains` in `carrySatisfied`). Every binding check (verify-class, pre-commit, post-push, the direct path) goes through it. Pinned by `TestVerifyStagedTree_ACarriedRebaseShipsWithTheReShipsInboxConsumption`, `TestVerifyCommittedTree_ACarriedRebaseShipsWithTheReShipsInboxConsumption`, their preservation twins and `TestCarrySatisfied_DeclinesWhatTheReShipsConsumptionCannotCompose`.
+
+**Extended (2026-10-27):** row 2 binds the tree, but the HEAD check of `verifyAuditBinding` ran first. A carry for a `main` that moved after the audit thus failed with `AUDIT_BINDING_HEAD_MOVED`, and the lane paid an audit round. `carryReboundHead` now accepts the moved HEAD for a worktree ship. The newest carry for the bound audit must name that HEAD as its `git_head`, and `reProveCarry` must pass. The constraint above holds: a lane that `main` already merged moves HEAD past the `git_head` of the carry. The orchestrator also sends `AUDIT_BINDING_HEAD_MOVED` on a pending, unchanged lane to this ladder through a carrier commit (`carryAuditedChangeOverMovedMain`), not to Audit.
+
+Ship does not re-run the composed gates a second time: the writer refuses a record whose gates are not green and the verified chain proves the record came through the writer. Re-running them in ship is the follow-up the design doc names C4b.
+### B5 — the debugger's resolution rejoins the rebase (`internal/core`)
+
+A non-derived conflict aborts the fleet rebase (`rebaseWithDerivedRegen`) and routes to the debugger with a clean tree on the base the ship diverged from. Before B5 the debugger's decision (a reship, a re-run) ran on that base: cycle 1719 re-authored and re-audited there, shipped, diverged again, and only then rebased cleanly. `resumeFleetRebaseAfterDebugger` (`ship_recovery_debugger.go`, called after `decideAfterDebugger` when `ShipRecoveryCode` is the fleet rebase's) carries the resolved worktree's tracked state as a commit on the fork point (`carryResolvedTree`: a rebase refuses a dirty tree; untracked files never ride), rebases it onto main, pends it on the new base and routes it through `routeRebasedExplanation` — B3's carry when the bytes are identical, B2's rebind, else a Build that re-authors. It runs inside the ship-recovery budget and after the contention backoff, never on an in-place worktree; a re-entry costs one attempt, so a full debugger round trip — the ship error that dispatched the debugger, then the re-entry — costs two of the budget's units (two at fleet width one), and the reship's own failure is the third. A Build or Audit re-run the debugger asked for still runs, on the rebased tree; a tests-first request yields to the route, said on stderr, because the explanation contract's post-TDD refresh cannot follow a binding the route has just moved. A conflict that survives the resolution, a rebase the host cannot finish or a spent budget ends the cycle on stderr and as `ORCHESTRATOR_REBASE_REENTRY_ABORTED` in the Signal Center. The sequence has no checkpoint of its own; an interrupted re-entry leaves a carrier commit that keeps the change intact — finishing it on resume is B5b, designed — the same heal B1 still awaits, which B3, B4 and now B5 extend the precedent of shipping ahead of. Tests: `TestRecoverFromShipError_ADebuggerResolvedConflictReentersTheRebaseNotAStaleReship` (a real conflict repo; a ship that commits and fails whenever main is not its ancestor; two ship calls, the second on main; build and audit re-run once; the debugger's untracked scratch file absent from the shipped tree), `TestRecoverFromShipError_ADebuggersBuildRerunRunsOnTheRebasedTree`, `TestRecoverFromShipError_ADebuggersTestsFirstRequestYieldsToTheRebasedRoute`, `TestRecoverFromShipError_AConflictTheDebuggerLeftEndsTheCycleWithoutAReship`, `TestResumeFleetRebaseAfterDebugger_ASpentBudgetOrAnInPlaceWorktreeTouchesNoGit`, `TestEarliestPhase_KeepsAnUpstreamDebuggerTarget`, `TestFleetRebaseRecovery_NamesOnlyTheFleetRebaseCodes`.
+
+**First live run (cycle 1725, wave 21, 2026-09-28).** A genuine conflict on the append-only `go/.apicover-enforce` routed to the debugger, whose resolution the read-only worktree fence reverted; the re-entry met the same conflict and aborted, and the cycle ended with the audit's WARN, leaving its item claimed. Two consequences landed: a cycle the debugger ends now ends FAIL with a ship fail reason, so its claim is released, and the append-only registry merges as a union (`.gitattributes`). The fence itself is the open item `fleet-rebase-debugger-resolution-fenced`: as configured, the debugger cannot write a resolution, so B5 cannot yet succeed on a real conflict. Fixed the same day: the rebase returns its non-derived conflicted paths, the cycle records them (`CycleState.ShipRecoveryConflicts`, cleared by the ship latch), and the debugger of that recovery gets them as `PhaseRequest.WorktreeWritablePaths`: its prompt names them as the only paths it may write, and the fence keeps its writes to them and reverts every other ([ADR-0097](0097-read-only-phase-worktree-fence.md) decision 6). Pinned end to end by `TestRecoverFromShipError_TheFenceKeepsTheDebuggersResolutionOfTheConflictedFile`: a genuine conflict, a debugger held by the production fence, the resolution shipped on main and the debugger's other file reverted.
+
+### RUNG 0 is retired (2026-10-21)
+
+F1 of the Context stayed true after B3. The snapshot of RUNG 0 diffed `main...git_head`, and `git_head` is the tip of main when the audit was bound. Ship compared the `audited_base` of a record with the same `git_head`.
+
+- The measurement: the live ledger held 45 `composition-verdict` records, and all were `identical-rebase` records of B3. RUNG 0 wrote none.
+- Every new cycle has the explanation contract, so B3 serves the callers of RUNG 0.
+- The decision: `compositionCarryForward` and ship's `tryTrivialRebaseCarryForward` are removed. A legacy cycle with no contract tries RUNG 2, then goes to Audit with a WARN that names the reason. Stage 7 of the landing-queue plan retires RUNG 2 and the snapshot.
+- Pinned by `TestRecoverFromShipError_ALegacyCleanRebaseIsAuditedAgainForAStatedReason`, `TestRunCycleFromPhase_ALegacyRebaseWhoseMainMovedIsAuditedAgainForAStatedReason` and `TestVerifyAuditBinding_ARetiredTrivialRebaseRecordNeverCarriesAMovedHead`.
+
+## Rollout, rung by rung, each test-first and merged at a boundary
+
+0. **Done.** The worktree-mode tree binding: ship binds a worktree ship to the worktree it lands from, not to the plane's bookkeeping. This removes 1701's second bounce.
+1. **Done.** B2 with its `Verify` lineage and the tests in its component table above (`rebind_identical_rebase_test.go`). Nothing calls it until B1 wires the recovery.
+2. **Done.** B1 (the unwind) and the reordered recovery, returning Audit, not Build, when the change is identical.
+3. **Done (2026-09-27).** B3, built as the carry after the rebind rather than a repair of the commit-based RUNG 0, which a pended change can never satisfy; the F5 artifact relocation stays separate. **Corrected (2026-10-06):** keeping F5 separate was the defect. The design review had said F5 must land with B3, no inbox item tracked it, and B3's artifacts died with their worktree. F5 is resolved by ADR-0123 Phase 1.
+4. **Done (2026-09-27).** B4, ship re-proving the carry inside its one binding rule. **Corrected (2026-09-30):** the rule did not reach `verifyAuditBinding`'s predicate-execution check, so no carry shipped until that check applied it too. `TestVerifyAuditBinding_ShipsACarriedRebaseWithoutASecondAudit` now proves the ship-side binding on a carried rebase, with the carry record written by a test helper. A test that drives the real recovery (`identityCarryForward` writing the record) through ship's later stages (the pre-commit and post-push tree checks and the ship binding) is still to be written (inbox `carry-recovery-to-ship-end-to-end-proof`). **Corrected again (2026-10-06):** the 2026-09-30 correction overclaimed. Its test kept the carry's diffs in `repo/.evolve`, which no cleanup removes, so it never met F5. Live, ship still refused 1773, 1782 and 1810, because the whole-ledger Verify could not read the diffs of earlier carries from deleted worktrees. `TestVerifyAuditBinding_ShipsASecondCarryAfterTheFirstCarrysWorktreeIsGone` now ships a second carry after the first carry's worktree is gone, and `core`'s `TestCarryRecord_VerifiesAfterItsCycleWorktreeIsRemoved` drives the real writer through the real identity carry. **Corrected again (2026-10-07):** the rule required the held tree to be the record's tree, so a carried lane's re-ship, which consumes its inbox items again (B1), was refused at the pre-commit check (cycle 1825); the carry now composes with the consumption (B4's 2026-10-07 correction). The end-to-end proof through the real recovery is still open.
+
+The evidence, the full test list (33 named tests), the crash windows and the mutation map are in the [design review](../../research/2026-09-26-identity-preserving-rebase-design-review.md).

@@ -1,0 +1,15 @@
+# Go build artifacts
+/bin/
+/dist/
+*.test
+*.out
+coverage.html
+coverage.txt
+coverage.run.*
+coverage.func.txt
+coverage.apicover.txt
+apicover-report.txt
+
+# Local dev
+.envrc.local
+/secure-orchestrator

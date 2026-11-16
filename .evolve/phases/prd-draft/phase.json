@@ -1,0 +1,44 @@
+{
+  "name": "prd-draft",
+  "catalog": "on-demand",
+  "archetype": "plan",
+  "agent": "evolve-prd-draft",
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/scout-report.md"
+    ],
+    "signals": []
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/prd-draft-report.md"
+    ],
+    "signals": [
+      "prd.requirements_count"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Problem",
+      "Goals and Success Metrics",
+      "Requirements",
+      "Out of Scope"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "product-discovery"
+      },
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "frontend-ui"
+      }
+    ]
+  },
+  "after": "triage",
+  "optional": true
+}

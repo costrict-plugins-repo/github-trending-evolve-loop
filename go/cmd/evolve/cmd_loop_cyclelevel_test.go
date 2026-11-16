@@ -1,0 +1,99 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+	"github.com/mickeyyaya/evolve-loop/go/test/fixtures"
+)
+
+type secondCallErrRunner struct {
+	name  string
+	calls int
+}
+
+func (r *secondCallErrRunner) Name() string { return r.name }
+func (r *secondCallErrRunner) Run(context.Context, core.PhaseRequest) (core.PhaseResponse, error) {
+	r.calls++
+	if r.calls == 2 {
+		return core.PhaseResponse{}, errors.New("synthetic scout bridge death (cycle-level)")
+	}
+	return core.PhaseResponse{Verdict: core.VerdictPASS}, nil
+}
+
+func TestLoop_CycleLevelFailureContinues(t *testing.T) {
+	projectRoot := t.TempDir()
+	initLoopContractRepo(t, projectRoot)
+	writeDispatchPolicy(t, filepath.Join(projectRoot, ".evolve"), "off")
+	raiseZeroShipCeiling(t, filepath.Join(projectRoot, ".evolve"))
+	scout := &secondCallErrRunner{name: "scout"}
+
+	prev := wireOrchestratorDepsFn
+	defer func() { wireOrchestratorDepsFn = prev }()
+	wireOrchestratorDepsFn = func(string, string, io.Writer, routingRun) orchDeps {
+		st := &fixtures.FakeStorage{}
+		ld := newFakeLedger()
+		runners := map[core.Phase]core.PhaseRunner{
+			core.PhaseIntent:       noopRunner{name: "intent"},
+			core.PhaseScout:        scout,
+			core.PhaseTriage:       noopRunner{name: "triage"},
+			core.PhaseTDD:          noopRunner{name: "tdd"},
+			core.PhaseBuildPlanner: noopRunner{name: "build-planner"},
+			core.PhaseBuild:        noopRunner{name: "build"},
+			core.PhaseAudit:        noopRunner{name: "audit"},
+			core.PhaseShip:         noopRunner{name: "ship"},
+			core.PhaseRetro:        noopRunner{name: "retro"},
+		}
+		return orchDeps{Storage: st, Ledger: ld, Orchestrator: core.NewOrchestrator(st, ld, runners, core.WithWorktreeProvisioner(inPlaceStubWorktree{}))}
+	}
+
+	var stdout, stderr bytes.Buffer
+	rc := runLoop([]string{
+		"--project-root", projectRoot,
+		"--goal-text", "supervision tree",
+		"--cycles", "3",
+	}, nil, &stdout, &stderr)
+
+	if rc == 2 {
+		t.Fatalf("rc=2 (batch-fatal) for a cycle-level failure — batch must continue; stderr=%q stdout=%q",
+			stderr.String(), stdout.String())
+	}
+
+	var lr struct {
+		StopReason string           `json:"stop_reason"`
+		Cycles     []map[string]any `json:"cycles"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &lr); err != nil {
+		t.Fatalf("loop output is not the canonical JSON envelope: %v\n%s", err, stdout.String())
+	}
+	if lr.StopReason != "max_cycles" {
+		t.Errorf("stop_reason=%q, want \"max_cycles\" (the failed cycle must not stop the batch)", lr.StopReason)
+	}
+	if len(lr.Cycles) != 3 {
+		t.Errorf("cycles in batch output = %d, want 3 (cycle 2 failed, cycles 1+3 ran)", len(lr.Cycles))
+	}
+
+	if scout.calls != 3 {
+		t.Errorf("scout dispatches = %d, want 3 — the cycle after the failure never ran", scout.calls)
+	}
+
+	if !strings.Contains(stderr.String(), "synthetic scout bridge death") {
+		t.Errorf("stderr does not mention the cycle failure cause; failures must be logged loudly\nstderr=%q", stderr.String())
+	}
+}
+
+func raiseZeroShipCeiling(t *testing.T, evolveDir string) {
+	t.Helper()
+	content := `{"dispatch":{"policy":"off"},"workflow":{"auto_prune":false},"failure_policy":{"thresholds":{"zero_ship_halt":9}}}`
+	if err := os.WriteFile(filepath.Join(evolveDir, "policy.json"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
