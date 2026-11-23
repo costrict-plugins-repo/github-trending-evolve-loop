@@ -1,0 +1,53 @@
+{
+  "name": "forces-analysis",
+  "catalog": "on-demand",
+  "archetype": "evaluate",
+  "agent": "evolve-forces-analysis",
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/scout-report.md"
+    ],
+    "signals": []
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/forces-analysis-report.md"
+    ],
+    "signals": [
+      "forces.high_pressure_count"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Competitive Rivalry",
+      "Buyer and Supplier Power",
+      "Entry and Substitute Threats",
+      "Attractiveness Verdict"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "business-strategy"
+      },
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "strategy-options"
+      },
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "business-plan"
+      },
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "partnership-deal"
+      }
+    ]
+  },
+  "after": "triage"
+}

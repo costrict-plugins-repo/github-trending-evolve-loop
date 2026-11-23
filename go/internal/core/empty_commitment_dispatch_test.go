@@ -1,0 +1,372 @@
+package core
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/config"
+	"github.com/mickeyyaya/evolve-loop/go/internal/router"
+)
+
+type triageDecisionRunner struct {
+	verdict  string
+	decision string
+}
+
+func (r triageDecisionRunner) Name() string { return string(PhaseTriage) }
+
+func (r triageDecisionRunner) Run(_ context.Context, req PhaseRequest) (PhaseResponse, error) {
+	if err := os.WriteFile(filepath.Join(req.Workspace, "handoff-triage.json"), []byte(`{"cycle_size":"small","deliverable_kind":"code","phase_skip":[]}`), 0o644); err != nil {
+		return PhaseResponse{}, err
+	}
+	if r.decision != "" {
+		if err := os.WriteFile(filepath.Join(req.Workspace, "triage-decision.json"), []byte(r.decision), 0o644); err != nil {
+			return PhaseResponse{}, err
+		}
+	}
+	return PhaseResponse{Phase: string(PhaseTriage), Verdict: r.verdict, ArtifactsDir: req.Workspace}, nil
+}
+
+func writeTriageWorkspace(t *testing.T, committed int) string {
+	t.Helper()
+	ws := t.TempDir()
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(ws, name), []byte(body), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	write("handoff-scout.json", `{"cycle_size_estimate":"small","deliverable_kind":"code","backlog_size":1}`)
+	write("handoff-triage.json", `{"cycle_size":"small","deliverable_kind":"code","phase_skip":[]}`)
+	if committed >= 0 {
+		topN := "["
+		for i := 0; i < committed; i++ {
+			if i > 0 {
+				topN += ","
+			}
+			topN += `{"id":"task-` + string(rune('a'+i)) + `"}`
+		}
+		topN += "]"
+		write("triage-decision.json", `{"cycle":1623,"top_n":`+topN+`,"deferred":[],"dropped":[]}`)
+	}
+	return ws
+}
+
+func digestTriageWorkspace(t *testing.T, committed int) router.RoutingSignals {
+	t.Helper()
+	ws := writeTriageWorkspace(t, committed)
+	sig, err := router.Digest(ws, []string{"scout", "triage"})
+	if err != nil {
+		t.Fatalf("router.Digest(%s): %v", ws, err)
+	}
+	return sig
+}
+
+func TestSelectNext_StaticRoutingHonorsTriageTermination(t *testing.T) {
+	t.Parallel()
+	stages := []config.Stage{config.StageOff, config.StageShadow, config.StageAdvisory, config.StageEnforce}
+	cases := []struct {
+		name      string
+		verdict   string
+		committed int
+		wantPhase Phase
+		wantAct   loopAction
+	}{
+		{"failed-contract", VerdictFAIL, 1, PhaseEnd, loopBreak},
+		{"empty-commitment", VerdictPASS, 0, PhaseEnd, loopBreak},
+		{"committed-work", VerdictPASS, 1, PhaseTDD, loopNext},
+	}
+	for _, stage := range stages {
+		for _, tc := range cases {
+			t.Run(stage.String()+"/"+tc.name, func(t *testing.T) {
+				cr := cycleRun{
+					ctx: context.Background(),
+					o: &Orchestrator{
+						sm:       NewStateMachine(),
+						strategy: router.StaticPreset{},
+						now:      time.Now,
+						ledger:   &fakeLedger{},
+						cfg: config.RoutingConfig{
+							Stage:     stage,
+							Mandatory: []string{"scout", "build", "audit", "ship"},
+							Order:     []string{"scout", "triage", "tdd", "build", "audit", "ship"},
+						},
+					},
+					cs: CycleState{
+						WorkspacePath:   writeTriageWorkspace(t, tc.committed),
+						CompletedPhases: []string{"scout", "triage"},
+					},
+					current:     PhaseTriage,
+					lastVerdict: tc.verdict,
+				}
+				gotPhase, gotAct, err := cr.selectNext()
+				if err != nil {
+					t.Fatalf("selectNext: %v", err)
+				}
+				if tc.verdict == VerdictPASS && tc.committed > 0 {
+					if gotPhase == PhaseEnd || gotAct != loopNext {
+						t.Errorf("selectNext() = (%s, %v), committed work must advance", gotPhase, gotAct)
+					}
+					return
+				}
+				if gotPhase != tc.wantPhase || gotAct != tc.wantAct {
+					t.Errorf("selectNext() = (%s, %v), want (%s, %v)", gotPhase, gotAct, tc.wantPhase, tc.wantAct)
+				}
+			})
+		}
+	}
+}
+
+func TestRunCycle_EmptyTriageCommitmentIsPlannedNoWork(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name        string
+		verdict     string
+		decision    string
+		wantVerdict string
+		wantReason  string
+		wantCleanup int
+	}{
+		{
+			name:        "explicit-empty-decision",
+			verdict:     VerdictPASS,
+			decision:    `{"top_n":[],"deferred":[{"id":"protected","reason":"source surface is protected"}]}`,
+			wantVerdict: CycleOutcomeSkippedUnknown,
+			wantReason:  CycleTerminationTriageNoWork,
+			wantCleanup: 1,
+		},
+		{
+			name:        "failed-triage-with-empty-decision",
+			verdict:     VerdictFAIL,
+			decision:    `{"top_n":[]}`,
+			wantVerdict: CycleOutcomeSkippedUnknown,
+			wantReason:  CycleTerminationTriageNoWork,
+			wantCleanup: 1,
+		},
+		{
+			name:        "failed-triage-without-decision",
+			verdict:     VerdictFAIL,
+			wantVerdict: VerdictFAIL,
+			wantCleanup: 0,
+		},
+		{
+			name:        "failed-triage-with-committed-work",
+			verdict:     VerdictFAIL,
+			decision:    `{"top_n":[{"id":"task-a"}]}`,
+			wantVerdict: VerdictFAIL,
+			wantCleanup: 0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			storage := &fakeStorage{}
+			ledger := &fakeLedger{}
+			runners := buildRunners(nil)
+			runners[PhaseTriage] = triageDecisionRunner{verdict: tc.verdict, decision: tc.decision}
+			worktree := &fakeWorktree{path: t.TempDir()}
+			orchestrator := NewOrchestrator(storage, ledger, runners, WithWorktreeProvisioner(worktree))
+
+			result, err := orchestrator.RunCycle(context.Background(), CycleRequest{ProjectRoot: t.TempDir(), GoalHash: "protected-task"})
+			if err != nil {
+				t.Fatalf("RunCycle: %v", err)
+			}
+			if result.FinalVerdict != tc.wantVerdict {
+				t.Errorf("FinalVerdict = %q, want %q", result.FinalVerdict, tc.wantVerdict)
+			}
+			if result.TerminationReason != tc.wantReason {
+				t.Errorf("TerminationReason = %q, want %q", result.TerminationReason, tc.wantReason)
+			}
+			if got := len(worktree.cleaned); got != tc.wantCleanup {
+				t.Errorf("worktree cleanup calls = %d, want %d", got, tc.wantCleanup)
+			}
+			if got, want := result.PhasesRun, []Phase{PhaseScout, PhaseTriage}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+				t.Errorf("PhasesRun = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestRunCycleFromPhase_ResumedFailedTriageWithEmptyDecisionIsPlannedNoWork(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	ws := RunWorkspacePath(root, 7)
+	if err := os.MkdirAll(ws, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	worktree := &fakeWorktree{path: t.TempDir()}
+	storage := &fakeStorage{
+		state: State{LastCycleNumber: 7},
+		cycleState: CycleState{
+			CycleID:         7,
+			RunID:           "original-run",
+			WorkspacePath:   ws,
+			ActiveWorktree:  worktree.path,
+			CompletedPhases: []string{"scout"},
+		},
+	}
+	runners := buildRunners(nil)
+	runners[PhaseTriage] = triageDecisionRunner{verdict: VerdictFAIL, decision: `{"top_n":[]}`}
+	orchestrator := NewOrchestrator(storage, &fakeLedger{}, runners, WithWorktreeProvisioner(worktree))
+
+	result, err := orchestrator.RunCycleFromPhase(context.Background(),
+		CycleRequest{ProjectRoot: root, GoalHash: "protected-task"},
+		&ResumePoint{Phase: string(PhaseTriage), CycleID: 7})
+	if err != nil {
+		t.Fatalf("RunCycleFromPhase: %v", err)
+	}
+	if result.FinalVerdict != CycleOutcomeSkippedUnknown {
+		t.Errorf("FinalVerdict = %q, want %q", result.FinalVerdict, CycleOutcomeSkippedUnknown)
+	}
+	if result.TerminationReason != CycleTerminationTriageNoWork {
+		t.Errorf("TerminationReason = %q, want %q", result.TerminationReason, CycleTerminationTriageNoWork)
+	}
+	if got := len(worktree.cleaned); got != 1 {
+		t.Errorf("worktree cleanup calls = %d, want 1", got)
+	}
+	for _, phase := range []Phase{PhaseTDD, PhaseBuild, PhaseAudit, PhaseShip} {
+		if got := len(runners[phase].(*fakeRunner).requests); got != 0 {
+			t.Errorf("%s dispatched %d time(s) after a resumed terminal triage", phase, got)
+		}
+	}
+}
+
+func TestEnforceNext_EmptyTriageCommitmentIsALegalTermination(t *testing.T) {
+	t.Parallel()
+	o := &Orchestrator{
+		sm: NewStateMachine(),
+		cfg: config.RoutingConfig{
+			Mandatory: []string{"scout", "build", "audit", "ship"},
+			Order:     []string{"scout", "triage", "tdd", "build", "audit", "ship"},
+		},
+	}
+	cases := []struct {
+		name        string
+		current     Phase
+		staticNext  Phase
+		verdict     string
+		committed   int
+		shipPlanned bool
+		wantPhase   Phase
+		wantOK      bool
+	}{
+		{"empty-commitment-terminates-even-when-ship-planned", PhaseTriage, PhaseTDD, VerdictPASS, 0, true, PhaseEnd, true},
+		{"empty-commitment-terminates-when-no-ship", PhaseTriage, PhaseTDD, VerdictPASS, 0, false, PhaseEnd, true},
+		{"failed-contract-terminates-with-committed-work", PhaseTriage, PhaseTDD, VerdictFAIL, 1, true, PhaseEnd, true},
+		{"committed-work-outranks-a-spurious-end-proposal", PhaseTriage, PhaseTDD, VerdictPASS, 1, true, PhaseTDD, false},
+		{"two-committed-tasks-still-advance", PhaseTriage, PhaseTDD, VerdictPASS, 2, true, PhaseTDD, false},
+		{"unknown-commitment-stays-blocked-when-ship-planned", PhaseTriage, PhaseTDD, VerdictPASS, -1, true, PhaseTDD, false},
+		{"scout-edge-unchanged", PhaseScout, PhaseTriage, VerdictPASS, -1, true, PhaseTriage, false},
+		{"post-build-never-terminates-early", PhaseBuild, PhaseAudit, VerdictPASS, 0, true, PhaseAudit, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sig := digestTriageWorkspace(t, tc.committed)
+			gotPhase, gotOK := o.enforceNext(tc.current, tc.staticNext, tc.verdict, sig,
+				router.RouterDecision{NextPhase: router.PhaseEnd}, tc.shipPlanned)
+			if gotPhase != tc.wantPhase || gotOK != tc.wantOK {
+				t.Errorf("enforceNext(current=%s, staticNext=%s, committed=%d, shipPlanned=%t) = (%s, %v), want (%s, %v)",
+					tc.current, tc.staticNext, tc.committed, tc.shipPlanned,
+					gotPhase, gotOK, tc.wantPhase, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestCanTerminateEarly_ShipPlannedInvariantIntact(t *testing.T) {
+	t.Parallel()
+	sm := NewStateMachine()
+	for _, from := range []Phase{PhaseScout, PhaseTriage, PhaseBuild, PhaseAudit} {
+		if sm.CanTerminateEarly(from, true) {
+			t.Errorf("CanTerminateEarly(%s, shipPlanned=true) = true, want false — a ship-intended cycle must satisfy the integrity floor before it can end", from)
+		}
+	}
+	if !sm.CanTerminateEarly(PhaseTriage, false) {
+		t.Errorf("CanTerminateEarly(triage, shipPlanned=false) = false, want true — the pre-existing no-ship early exit regressed")
+	}
+	if sm.CanTerminateEarly(PhaseBuild, false) {
+		t.Errorf("CanTerminateEarly(build, shipPlanned=false) = true, want false — only pre-build decision points may terminate early")
+	}
+}
+
+func TestResumeCursorTriageTerminationOverridesScheduledSuccessor(t *testing.T) {
+	t.Parallel()
+	ws := writeTriageWorkspace(t, 0)
+	o := &Orchestrator{sm: NewStateMachine()}
+	cursor := newResumeCursor(PhaseTriage)
+	cs := CycleState{WorkspacePath: ws, CompletedPhases: []string{"scout", "triage"}}
+	if next, err := cursor.next(o, cs, ""); err != nil || next != PhaseTriage {
+		t.Fatalf("first next = (%s, %v), want triage", next, err)
+	}
+	cursor.advance(PhaseTriage, VerdictPASS)
+	cursor.schedule(PhaseTDD)
+
+	next, err := cursor.next(o, cs, "")
+	if err != nil {
+		t.Fatalf("terminal next: %v", err)
+	}
+	if next != PhaseEnd {
+		t.Errorf("terminal next = %s, want end", next)
+	}
+}
+
+func TestSkippedUnknownWarningExcludesPlannedNoWork(t *testing.T) {
+	t.Parallel()
+	if shouldWarnSkippedUnknown(CycleResult{
+		FinalVerdict:      CycleOutcomeSkippedUnknown,
+		TerminationReason: CycleTerminationTriageNoWork,
+	}) {
+		t.Error("planned no-work would emit the discarded-implementation warning")
+	}
+	if !shouldWarnSkippedUnknown(CycleResult{FinalVerdict: CycleOutcomeSkippedUnknown}) {
+		t.Error("an unexplained skipped cycle must retain the operator warning")
+	}
+}
+
+func TestIsTriageNoWorkResult(t *testing.T) {
+	t.Parallel()
+	valid := CycleResult{
+		FinalVerdict:      CycleOutcomeSkippedUnknown,
+		TerminationReason: CycleTerminationTriageNoWork,
+		PhasesRun:         []Phase{PhaseScout, PhaseTriage},
+	}
+	tests := []struct {
+		name   string
+		result CycleResult
+		want   bool
+	}{
+		{name: "planned no-work cycle", result: valid, want: true},
+		{
+			name: "resumed at triage",
+			result: CycleResult{
+				FinalVerdict:      CycleOutcomeSkippedUnknown,
+				TerminationReason: CycleTerminationTriageNoWork,
+				PhasesRun:         []Phase{PhaseTriage},
+			},
+			want: true,
+		},
+		{name: "wrong outcome", result: CycleResult{FinalVerdict: VerdictPASS, TerminationReason: valid.TerminationReason, PhasesRun: valid.PhasesRun}},
+		{name: "missing reason", result: CycleResult{FinalVerdict: valid.FinalVerdict, PhasesRun: valid.PhasesRun}},
+		{name: "wrong reason", result: CycleResult{FinalVerdict: valid.FinalVerdict, TerminationReason: "operator-cancelled", PhasesRun: valid.PhasesRun}},
+		{name: "empty phase history", result: CycleResult{FinalVerdict: valid.FinalVerdict, TerminationReason: valid.TerminationReason}},
+		{name: "ends before triage", result: CycleResult{FinalVerdict: valid.FinalVerdict, TerminationReason: valid.TerminationReason, PhasesRun: []Phase{PhaseScout}}},
+		{name: "continues past triage", result: CycleResult{FinalVerdict: valid.FinalVerdict, TerminationReason: valid.TerminationReason, PhasesRun: []Phase{PhaseScout, PhaseTriage, PhaseRetro}}},
+		{name: "tdd ran", result: CycleResult{FinalVerdict: valid.FinalVerdict, TerminationReason: valid.TerminationReason, PhasesRun: []Phase{PhaseScout, PhaseTDD, PhaseTriage}}},
+		{name: "build planner ran", result: CycleResult{FinalVerdict: valid.FinalVerdict, TerminationReason: valid.TerminationReason, PhasesRun: []Phase{PhaseScout, PhaseBuildPlanner, PhaseTriage}}},
+		{name: "swarm plan ran", result: CycleResult{FinalVerdict: valid.FinalVerdict, TerminationReason: valid.TerminationReason, PhasesRun: []Phase{PhaseScout, PhaseSwarmPlan, PhaseTriage}}},
+		{name: "build ran", result: CycleResult{FinalVerdict: valid.FinalVerdict, TerminationReason: valid.TerminationReason, PhasesRun: []Phase{PhaseScout, PhaseBuild, PhaseTriage}}},
+		{name: "audit ran", result: CycleResult{FinalVerdict: valid.FinalVerdict, TerminationReason: valid.TerminationReason, PhasesRun: []Phase{PhaseScout, PhaseAudit, PhaseTriage}}},
+		{name: "ship ran", result: CycleResult{FinalVerdict: valid.FinalVerdict, TerminationReason: valid.TerminationReason, PhasesRun: []Phase{PhaseScout, PhaseShip, PhaseTriage}}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := IsTriageNoWorkResult(tt.result); got != tt.want {
+				t.Errorf("IsTriageNoWorkResult(%+v) = %t, want %t", tt.result, got, tt.want)
+			}
+		})
+	}
+}

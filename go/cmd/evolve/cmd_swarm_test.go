@@ -1,0 +1,208 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/swarm"
+)
+
+func writeEmptyManifest(t *testing.T, path string, cycle int, phase string, pid int) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	body := fmt.Sprintf(`{"cycle":%d,"phase":%q,"pid":%d,"sessions":[]}`, cycle, phase, pid)
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+}
+
+func TestManifestPath(t *testing.T) {
+	t.Parallel()
+	got := manifestPath(".evolve", 42)
+	want := filepath.Join(".evolve", "runs", "cycle-42", ".swarm", "sessions.json")
+	if got != want {
+		t.Errorf("manifestPath = %q, want %q", got, want)
+	}
+}
+
+func TestRunSwarmStatus_MissingCycle_ExitTwo(t *testing.T) {
+	t.Parallel()
+	var stdout, stderr strings.Builder
+	code := runSwarmStatus([]string{"--evolve-dir", t.TempDir()}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("exit = %d, want 2 (missing --cycle); stderr=%s", code, stderr.String())
+	}
+}
+
+func TestRunSwarmStatus_ManifestMissing_ExitZero(t *testing.T) {
+	t.Parallel()
+	var stdout, stderr strings.Builder
+	code := runSwarmStatus([]string{"--evolve-dir", t.TempDir(), "--cycle", "1"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (missing manifest is fail-open); stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "no swarm sessions recorded") {
+		t.Errorf("stdout = %q, want the no-sessions message", stdout.String())
+	}
+}
+
+func TestRunSwarmStatus_NoSessions_ExitZero(t *testing.T) {
+	t.Parallel()
+	evolveDir := t.TempDir()
+	writeEmptyManifest(t, manifestPath(evolveDir, 5), 5, "build", 12345)
+
+	var stdout, stderr strings.Builder
+	code := runSwarmStatus([]string{"--evolve-dir", evolveDir, "--cycle", "5"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "no swarm sessions recorded") {
+		t.Errorf("stdout = %q, want the no-sessions message", stdout.String())
+	}
+}
+
+func TestRunSwarmStatus_WithSession_ListsIt(t *testing.T) {
+	t.Parallel()
+	evolveDir := t.TempDir()
+	reg := swarm.NewSessionRegistry(manifestPath(evolveDir, 7), 7, "build", 999)
+	if err := reg.Register(swarm.SessionHandle{
+		WorkerID: "w1", Agent: "build-w1", TmuxSession: "", PGID: 0,
+		Branch: "cycle-7-w1", Status: swarm.StatusLive,
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	var stdout, stderr strings.Builder
+	code := runSwarmStatus([]string{"--evolve-dir", evolveDir, "--cycle", "7"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "w1") || !strings.Contains(stdout.String(), "cycle-7-w1") {
+		t.Errorf("stdout = %q, want it to list worker w1 / branch cycle-7-w1", stdout.String())
+	}
+}
+
+func TestRunSwarmReap_MissingCycle_ExitTwo(t *testing.T) {
+	t.Parallel()
+	var stdout, stderr strings.Builder
+	code := runSwarmReap([]string{"--evolve-dir", t.TempDir()}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("exit = %d, want 2 (missing --cycle)", code)
+	}
+}
+
+func TestRunSwarmReap_ManifestMissing_ExitZero(t *testing.T) {
+	t.Parallel()
+	var stdout, stderr strings.Builder
+	code := runSwarmReap([]string{"--evolve-dir", t.TempDir(), "--cycle", "3"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (missing manifest is fail-open); stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "no swarm sessions to reap") {
+		t.Errorf("stdout = %q, want the no-sessions message", stdout.String())
+	}
+}
+
+func TestRunSwarmReap_NoSessions_ExitZero(t *testing.T) {
+	t.Parallel()
+	evolveDir := t.TempDir()
+	writeEmptyManifest(t, manifestPath(evolveDir, 9), 9, "build", 1)
+	var stdout, stderr strings.Builder
+	code := runSwarmReap([]string{"--evolve-dir", evolveDir, "--cycle", "9"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "no swarm sessions to reap") {
+		t.Errorf("stdout = %q, want the no-sessions message", stdout.String())
+	}
+}
+
+func TestRunSwarmReap_LiveSession_ReapsWithoutTouchingOS(t *testing.T) {
+	t.Parallel()
+	evolveDir := t.TempDir()
+	path := manifestPath(evolveDir, 11)
+	reg := swarm.NewSessionRegistry(path, 11, "build", 1)
+	if err := reg.Register(swarm.SessionHandle{
+		WorkerID: "w1", Agent: "build-w1", TmuxSession: "", PGID: 0, Status: swarm.StatusLive,
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	var stdout, stderr strings.Builder
+	code := runSwarmReap([]string{"--evolve-dir", evolveDir, "--cycle", "11"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "reaped 1 session") {
+		t.Errorf("stdout = %q, want it to report reaping 1 session", stdout.String())
+	}
+	if stderr.String() != "" {
+		t.Errorf("stderr = %q, want empty (no kill errors for a PGID=0/no-tmux session)", stderr.String())
+	}
+}
+
+func TestRunSwarmReapOrphans_NoRunsDir_ExitZero(t *testing.T) {
+	t.Parallel()
+	evolveDir := t.TempDir()
+	var stdout, stderr strings.Builder
+	code := runSwarmReapOrphans([]string{"--evolve-dir", evolveDir, "--dry-run"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "orphan runs=0") {
+		t.Errorf("stdout = %q, want orphan runs=0", stdout.String())
+	}
+}
+
+func TestRunSwarmReapOrphans_UnknownFlag_ExitTwo(t *testing.T) {
+	t.Parallel()
+	var stdout, stderr strings.Builder
+	code := runSwarmReapOrphans([]string{"--not-a-real-flag"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("exit = %d, want 2 (flag parse error)", code)
+	}
+}
+
+func TestRunSwarm_NoSubcommand_ExitTwo(t *testing.T) {
+	t.Parallel()
+	var stdout, stderr strings.Builder
+	code := runSwarm(nil, nil, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("exit = %d, want 2 (no subcommand)", code)
+	}
+}
+
+func TestRunSwarm_UnknownSubcommand_ExitTwo(t *testing.T) {
+	t.Parallel()
+	var stdout, stderr strings.Builder
+	code := runSwarm([]string{"bogus"}, nil, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("exit = %d, want 2 (unknown subcommand)", code)
+	}
+}
+
+func TestRunSwarm_DispatchesStatus(t *testing.T) {
+	t.Parallel()
+	evolveDir := t.TempDir()
+	writeEmptyManifest(t, manifestPath(evolveDir, 1), 1, "build", 1)
+	var stdout, stderr strings.Builder
+	code := runSwarm([]string{"status", "--evolve-dir", evolveDir, "--cycle", "1"}, nil, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%s", code, stderr.String())
+	}
+}
+
+func TestSwarmFixture_PersistsRealManifestFile(t *testing.T) {
+	t.Parallel()
+	evolveDir := t.TempDir()
+	path := manifestPath(evolveDir, 4)
+	writeEmptyManifest(t, path, 4, "build", 1)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("manifest file not written at %q: %v", path, err)
+	}
+}

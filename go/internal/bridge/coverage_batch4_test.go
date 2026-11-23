@@ -1,0 +1,96 @@
+package bridge
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+)
+
+func TestDrivers_OpenLogsError(t *testing.T) {
+	t.Parallel()
+	for _, cli := range []string{"claude-p", "codex", "agy"} {
+		t.Run(cli, func(t *testing.T) {
+			fx := newFixture(t, cli, "")
+			args := []string{
+				"--cli=" + cli, "--profile=" + fx.profile, "--model=auto",
+				"--prompt-file=" + fx.promptFile, "--workspace=" + fx.ws,
+				"--stdout-log=" + fx.ws,
+				"--stderr-log=" + fx.stderrLog, "--artifact=" + fx.artifact,
+			}
+			if code, _ := runLookup(t, &fakeRunner{}, args, nil); code != ExitBadFlags {
+				t.Fatalf("%s open-logs error → code=%d, want ExitBadFlags", cli, code)
+			}
+		})
+	}
+}
+
+func TestEngineLaunch_ArgBranchesAndMissingArtifact(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	prof := writeJSON(t, filepath.Join(ws, "p.json"), `{"name":"n","model":"haiku"}`)
+	art := filepath.Join(ws, "art.md")
+	wt := t.TempDir()
+	fr := &fakeRunner{}
+	eng := NewEngine(Deps{Runner: fr.runner(), LookupEnv: mapLookup(nil), CaptureBaseline: zeroBaselineCapture})
+	resp, err := eng.Launch(context.Background(), core.BridgeRequest{
+		CLI: "claude-p", Profile: prof, Model: "auto", Prompt: "x",
+		Workspace: ws, ArtifactPath: art,
+		Cycle: 5, Worktree: wt,
+	})
+	if err != nil {
+		t.Fatalf("Launch err: %v", err)
+	}
+	if resp.Stdout != "" {
+		t.Fatalf("missing artifact on success → Stdout should be empty, got %q", resp.Stdout)
+	}
+	if _, e := os.Stat(filepath.Join(ws, "agent-prompt.txt")); e != nil {
+		t.Fatalf("default agent prompt file should be written: %v", e)
+	}
+}
+
+func TestRunTmuxREPL_NamedSessionCreate(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t, "claude-tmux", "")
+	writeJSON(t, fx.artifact, "done")
+	tmux := &fakeTmux{paneSeq: []string{tmuxPromptMarkerDefault}}
+	code, se := runTmux(t, fx, tmux, nil, "--allow-bypass", "--session-name=brandnew")
+	if code != ExitOK {
+		t.Fatalf("named-create exit = %d, want ExitOK; se=%q", code, se)
+	}
+	if !strings.Contains(se, "CREATE-NAMED") {
+		t.Fatalf("should log CREATE-NAMED; se=%q", se)
+	}
+	if tmux.sentContains("/exit") {
+		t.Fatal("named session must be preserved (no /exit)")
+	}
+}
+
+func TestLoadProfile_ReadDirError(t *testing.T) {
+	t.Parallel()
+	if _, err := LoadProfile(t.TempDir()); err == nil {
+		t.Fatal("reading a directory as a profile should error")
+	}
+}
+
+func TestBuildReport_ArtifactIsDirectory(t *testing.T) {
+	t.Parallel()
+	ws := t.TempDir()
+	if err := os.Mkdir(filepath.Join(ws, "artifact.md"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r, err := BuildReport(ws, "artifact.md", time.Now())
+	if err != nil {
+		t.Fatalf("BuildReport err: %v", err)
+	}
+	if r.Artifact.Exists {
+		t.Fatal("a directory must not count as an existing artifact")
+	}
+	if r.Verdict != "incomplete" {
+		t.Fatalf("verdict = %q, want incomplete", r.Verdict)
+	}
+}

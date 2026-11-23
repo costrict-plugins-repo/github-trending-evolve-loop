@@ -1,0 +1,57 @@
+{
+  "name": "migration-safety-check",
+  "catalog": "on-demand",
+  "archetype": "evaluate",
+  "optional": true,
+  "agent": "evolve-migration-safety-check",
+  "categories": [
+    "data-migration"
+  ],
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/build-report.md"
+    ],
+    "signals": [
+      "build.files_touched",
+      "scout.goal_type"
+    ]
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/migration-safety-check-report.md"
+    ],
+    "signals": [
+      "migration.severity_max",
+      "migration.destructive_count"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Migration Operations",
+      "Reversibility Analysis",
+      "Verdict"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "data-migration"
+      },
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "data-pipeline"
+      },
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "database"
+      }
+    ],
+    "skip_when": null
+  },
+  "gates": {},
+  "after": "build"
+}

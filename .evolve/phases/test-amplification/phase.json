@@ -1,0 +1,45 @@
+{
+  "name": "test-amplification",
+  "archetype": "evaluate",
+  "agent": "evolve-test-amplification",
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/tdd-contract.md",
+      ".evolve/runs/cycle-{cycle}/build-report.md",
+      ".evolve/runs/cycle-{cycle}/covering-tests.md"
+    ],
+    "signals": []
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/test-amplification-report.md"
+    ],
+    "signals": [
+      "amplify.tests_added",
+      "amplify.failures_found"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Generated Tests",
+      "Results"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "build.files_touched",
+        "op": "gt",
+        "value": 0
+      },
+      {
+        "field": "scout.cycle_size",
+        "op": "!=",
+        "value": "trivial"
+      }
+    ]
+  },
+  "after": "build",
+  "writes_source": true,
+  "retract_on_fail": true
+}

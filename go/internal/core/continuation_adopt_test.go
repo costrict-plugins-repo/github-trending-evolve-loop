@@ -1,0 +1,283 @@
+package core
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/continuation"
+)
+
+var RealInboxForTest struct {
+	Resolve      func(root string, cycle int) *continuation.Continuation
+	ResolveScope func(root string, cycle int, scopeIDs []string) *continuation.Continuation
+	Release      func(root string, cycle int, reason string) error
+	Claim        func(root, taskID, cycle string) error
+	Shed         func(root string, cycle int, declined continuation.Continuation) ([]string, error)
+}
+
+func stampedContinuation(t *testing.T, root, wt string, oldCycle int) continuation.Continuation {
+	t.Helper()
+	ws := filepath.Join(root, ".evolve", "runs", cycleDirName(oldCycle))
+	if err := os.MkdirAll(ws, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "prior_work.go"), []byte("package prior\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base := gitOut(t, wt, "rev-parse", "HEAD")
+	o := NewOrchestrator(&fakeStorage{}, &fakeLedger{}, buildRunners(nil))
+	cs := CycleState{CycleID: oldCycle, WorkspacePath: ws, ActiveWorktree: wt, WorktreeBaseSHA: base}
+	o.stampContinuationManifest(context.Background(), cs, oldCycle, root)
+	m, ok, err := continuation.ReadManifest(ws)
+	if err != nil || !ok {
+		t.Fatalf("fixture stamp failed: ok=%v err=%v", ok, err)
+	}
+	return m
+}
+
+func cycleDirName(cycle int) string {
+	return "cycle-" + itoa(cycle)
+}
+
+func TestGitWorktree_CreateFromSeedsSnapshot(t *testing.T) {
+	t.Parallel()
+
+	root, wt := initContinuationRepo(t, 81)
+	m := stampedContinuation(t, root, wt, 81)
+
+	wt2, err := gitWorktree{}.CreateFrom(root, 85, m.SnapshotSHA)
+	if err != nil {
+		t.Fatalf("CreateFrom: %v", err)
+	}
+	if got := gitOut(t, wt2, "rev-parse", "HEAD"); got != m.SnapshotSHA {
+		t.Errorf("new worktree HEAD = %s, want snapshot %s", got, m.SnapshotSHA)
+	}
+	if _, err := os.Stat(filepath.Join(wt2, "prior_work.go")); err != nil {
+		t.Errorf("prior work must be present in the seeded worktree: %v", err)
+	}
+}
+
+func TestValidateContinuation_CleanPassesConflictAndGarbageFail(t *testing.T) {
+	t.Parallel()
+
+	root, wt := initContinuationRepo(t, 82)
+	m := stampedContinuation(t, root, wt, 82)
+
+	if err := validateContinuation(context.Background(), root, &m); err != nil {
+		t.Errorf("clean continuation must validate: %v", err)
+	}
+
+	garbage := m
+	garbage.SnapshotSHA = "0000000000000000000000000000000000000000"
+	if err := validateContinuation(context.Background(), root, &garbage); err == nil {
+		t.Error("missing snapshot commit must fail validation")
+	}
+
+	if err := os.WriteFile(filepath.Join(root, "prior_work.go"), []byte("package mainside\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitOut(t, root, "add", "prior_work.go")
+	gitOut(t, root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "conflicting")
+	if err := validateContinuation(context.Background(), root, &m); err == nil {
+		t.Error("a snapshot that now conflicts with main must fail the adopt-time re-screen")
+	}
+}
+
+func TestRunCycle_AdoptsContinuationAndServesFindings(t *testing.T) {
+	t.Parallel()
+
+	root, wt := initContinuationRepo(t, 83)
+	oldExplanation := "docs/explain/builds/cycle-83-old-run.md"
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(wt, oldExplanation)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, oldExplanation), []byte("unshipped explanation\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := stampedContinuation(t, root, wt, 83)
+
+	published := "docs/explain/builds/cycle-84-published.md"
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(root, published)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, published), []byte("published record\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitOut(t, root, "add", published)
+	gitOut(t, root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "land canonical record")
+	mainTip := gitOut(t, root, "rev-parse", "main")
+	if err := os.WriteFile(m.FindingsPath, []byte(`{"phase":"build","summary":"export X unnamed in tests"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	seedStampedInboxItem(t, root, 83, "task-a")
+
+	runners := buildRunners(nil)
+	buildR := runners[PhaseBuild].(*fakeRunner)
+	probe := &worktreeProbeRunner{
+		fakeRunner: buildR, probeFile: "prior_work.go", absentFile: oldExplanation,
+		archiveFile: filepath.Base(oldExplanation), publishedFile: published, wantAncestor: mainTip,
+	}
+	runners[PhaseBuild] = probe
+	runners[PhaseTriage] = &claimingTriageRunner{fakeRunner: runners[PhaseTriage].(*fakeRunner), root: root, taskID: "task-a"}
+	o := NewOrchestrator(&fakeStorage{}, &fakeLedger{}, runners,
+		WithContinuationResolver(productionResolver(t)))
+
+	if _, err := o.RunCycle(context.Background(), CycleRequest{ProjectRoot: root, GoalHash: "g"}); err != nil {
+		t.Fatalf("RunCycle: %v", err)
+	}
+	if buildR.calls == 0 {
+		t.Fatal("build must have dispatched")
+	}
+	req := buildR.requests[0]
+	if req.Worktree == "" || req.Worktree == wt {
+		t.Fatalf("build must run in a NEW seeded worktree, got %q (old %q)", req.Worktree, wt)
+	}
+	if req.WorktreeBaseSHA != mainTip {
+		t.Errorf("review base=%s want pinned main %s", req.WorktreeBaseSHA, mainTip)
+	}
+	if !probe.sawPublishedFile {
+		t.Error("published canonical record was incorrectly archived")
+	}
+	if !probe.sawAncestor {
+		t.Error("Build dispatched before clean snapshot advanced to main")
+	}
+	if !probe.sawFile {
+		t.Error("prior work must be intact in the adopted worktree at build time")
+	}
+	if probe.sawAbsentFile {
+		t.Error("an unshipped ancestor explanation must leave the canonical cycle path before the new Builder runs")
+	}
+	if !probe.sawArchivedFile {
+		t.Error("unshipped ancestor explanation must be preserved in the docs archive before Build")
+	}
+	if !strings.Contains(req.Context["continuation_findings"], "export X unnamed") {
+		t.Errorf("build context must carry prior findings; got %q", req.Context["continuation_findings"])
+	}
+	if _, ok, _ := continuation.ReadManifest(req.Workspace); !ok {
+		t.Error("adopting cycle's workspace must carry the continuation manifest copy")
+	}
+}
+
+func TestRunCycle_InvalidContinuationFallsBackFresh(t *testing.T) {
+	t.Parallel()
+
+	root, wt := initContinuationRepo(t, 84)
+	m := stampedContinuation(t, root, wt, 84)
+	m.SnapshotSHA = "1111111111111111111111111111111111111111"
+	seedStampedItemDirect(t, root, m, "task-a")
+
+	runners := buildRunners(nil)
+	buildR := runners[PhaseBuild].(*fakeRunner)
+	probe := &worktreeProbeRunner{fakeRunner: buildR, probeFile: "prior_work.go"}
+	runners[PhaseBuild] = probe
+	runners[PhaseTriage] = &claimingTriageRunner{fakeRunner: runners[PhaseTriage].(*fakeRunner), root: root, taskID: "task-a"}
+	o := NewOrchestrator(&fakeStorage{}, &fakeLedger{}, runners,
+		WithContinuationResolver(productionResolver(t)))
+
+	if _, err := o.RunCycle(context.Background(), CycleRequest{ProjectRoot: root, GoalHash: "g"}); err != nil {
+		t.Fatalf("RunCycle must not fail on a stale continuation: %v", err)
+	}
+	if buildR.calls == 0 {
+		t.Fatal("build must have dispatched")
+	}
+	if probe.sawFile {
+		t.Error("stale continuation must NOT seed prior work (fresh worktree kept)")
+	}
+	if buildR.requests[0].Context["continuation_findings"] != "" {
+		t.Error("fresh fallback must not serve findings")
+	}
+}
+
+func productionResolver(t *testing.T) func(string, int, []string) *continuation.Continuation {
+	t.Helper()
+	return func(root string, cycle int, _ []string) *continuation.Continuation {
+		return RealInboxForTest.Resolve(root, cycle)
+	}
+}
+
+func seedStampedInboxItem(t *testing.T, root string, failedCycle int, taskID string) {
+	t.Helper()
+	procDir := filepath.Join(root, ".evolve", "inbox", "processing", "cycle-"+itoa(failedCycle))
+	if err := os.MkdirAll(procDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(procDir, taskID+".json"), []byte(`{"id":"`+taskID+`"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := RealInboxForTest.Release(root, failedCycle, "cycle-failure-release"); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+}
+
+func seedStampedItemDirect(t *testing.T, root string, m continuation.Continuation, taskID string) {
+	t.Helper()
+	inbox := filepath.Join(root, ".evolve", "inbox")
+	if err := os.MkdirAll(inbox, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(map[string]any{"id": taskID, "continuation": m})
+	if err := os.WriteFile(filepath.Join(inbox, taskID+".json"), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type claimingTriageRunner struct {
+	*fakeRunner
+	root   string
+	taskID string
+}
+
+func (r *claimingTriageRunner) Run(ctx context.Context, req PhaseRequest) (PhaseResponse, error) {
+	if err := RealInboxForTest.Claim(r.root, r.taskID, itoa(req.Cycle)); err != nil {
+		return PhaseResponse{}, err
+	}
+	return r.fakeRunner.Run(ctx, req)
+}
+
+type worktreeProbeRunner struct {
+	*fakeRunner
+	probeFile        string
+	absentFile       string
+	archiveFile      string
+	sawFile          bool
+	sawAbsentFile    bool
+	sawArchivedFile  bool
+	publishedFile    string
+	wantAncestor     string
+	sawPublishedFile bool
+	sawAncestor      bool
+}
+
+func (r *worktreeProbeRunner) Run(ctx context.Context, req PhaseRequest) (PhaseResponse, error) {
+	if req.Worktree != "" {
+		if r.publishedFile != "" {
+			_, err := os.Stat(filepath.Join(req.Worktree, r.publishedFile))
+			r.sawPublishedFile = err == nil
+		}
+		if r.wantAncestor != "" {
+			cmd := exec.Command("git", "merge-base", "--is-ancestor", r.wantAncestor, "HEAD")
+			cmd.Dir = req.Worktree
+			r.sawAncestor = cmd.Run() == nil
+		}
+		if _, err := os.Stat(filepath.Join(req.Worktree, r.probeFile)); err == nil {
+			r.sawFile = true
+		}
+		if r.absentFile != "" {
+			if _, err := os.Stat(filepath.Join(req.Worktree, r.absentFile)); err == nil {
+				r.sawAbsentFile = true
+			}
+		}
+		if r.archiveFile != "" {
+			pattern := filepath.Join(req.Worktree, "docs", "private", "research", "archived-*", "unshipped-build-explanations", r.archiveFile)
+			if matches, err := filepath.Glob(pattern); err == nil && len(matches) == 1 {
+				r.sawArchivedFile = true
+			}
+		}
+	}
+	return r.fakeRunner.Run(ctx, req)
+}

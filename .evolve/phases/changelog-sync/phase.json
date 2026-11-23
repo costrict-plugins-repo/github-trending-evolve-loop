@@ -1,0 +1,40 @@
+{
+  "name": "changelog-sync",
+  "archetype": "control",
+  "agent": "evolve-changelog-sync",
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/build-report.md"
+    ],
+    "signals": [
+      "ship.class"
+    ]
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/changelog-sync-report.md"
+    ],
+    "signals": [
+      "changelog.drift_count"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Shipped Commits",
+      "Changelog State",
+      "Drift",
+      "Verdict"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "ship.class",
+        "op": "==",
+        "value": "cycle"
+      }
+    ]
+  },
+  "after": "ship",
+  "optional": true
+}

@@ -1,0 +1,184 @@
+package phasecontract
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestRenderContractBlock_Markdown_NoPath(t *testing.T) {
+	c, _ := For("build")
+	block := RenderContractBlock(c)
+	if !strings.Contains(block, "## Changes") {
+		t.Errorf("block must name required section %q; got:\n%s", "## Changes", block)
+	}
+	if !strings.Contains(block, "evolve phase verify build") {
+		t.Errorf("block must instruct the self-check command; got:\n%s", block)
+	}
+	if strings.Contains(block, "/") && strings.Contains(block, "build-report.md") {
+		t.Errorf("block must not embed the artifact path (cache-safety); got:\n%s", block)
+	}
+}
+
+func TestRenderContractBlock_Audit_MentionsVerdictSentinel(t *testing.T) {
+	block := RenderContractBlock(mustContract(t, "audit"))
+	if !strings.Contains(block, "evolve-verdict") {
+		t.Errorf("audit block must mention the verdict sentinel; got:\n%s", block)
+	}
+}
+
+func TestRenderContractBlockStage_BuildFailureInstructionGated(t *testing.T) {
+	c := mustContract(t, "build")
+
+	off := RenderContractBlockStage(c, false)
+	if off != RenderContractBlock(c) {
+		t.Fatalf("RenderContractBlockStage(c,false) must byte-equal RenderContractBlock(c)")
+	}
+	if strings.Contains(off, "evolve-verdict") {
+		t.Errorf("default (off): build block must NOT instruct a verdict sentinel; got:\n%s", off)
+	}
+
+	on := RenderContractBlockStage(c, true)
+	if !strings.Contains(on, "evolve-verdict") {
+		t.Errorf("activated: build block must instruct the failure sentinel; got:\n%s", on)
+	}
+	if !strings.Contains(on, "FAIL") || !strings.Contains(on, "failure") {
+		t.Errorf("activated: build block must explain the FAIL/WARN failure block; got:\n%s", on)
+	}
+}
+
+func TestRenderContractBlockStage_AuditUnchangedByPhaseIO(t *testing.T) {
+	c := mustContract(t, "audit")
+	if RenderContractBlockStage(c, false) != RenderContractBlock(c) {
+		t.Errorf("audit: stage(false) must equal RenderContractBlock")
+	}
+	if RenderContractBlockStage(c, true) != RenderContractBlock(c) {
+		t.Errorf("audit already instructs the sentinel unconditionally; the PhaseIO bool must not double-add it")
+	}
+}
+
+func mustContract(t *testing.T, phase string) Contract {
+	t.Helper()
+	c, ok := For(phase)
+	if !ok {
+		t.Fatalf("no contract for %q", phase)
+	}
+	return c
+}
+
+func TestRenderContractBlock_Deterministic(t *testing.T) {
+	c, _ := For("audit")
+	if RenderContractBlock(c) != RenderContractBlock(c) {
+		t.Error("RenderContractBlock must be deterministic (prompt-cache safety)")
+	}
+}
+
+func TestRenderContractBlock_JSON_UsesRequiredKeys(t *testing.T) {
+	c, _ := For("orchestrator")
+	block := RenderContractBlock(c)
+	if !strings.Contains(block, "cycle_id") {
+		t.Errorf("orchestrator JSON block must name the required key 'cycle_id'; got:\n%s", block)
+	}
+	if strings.Contains(block, "evolve-verdict") {
+		t.Errorf("JSON deliverable has no verdict sentinel; got:\n%s", block)
+	}
+}
+
+func TestRenderJSONContractsDescribeTheirTopLevelShape(t *testing.T) {
+	tests := []struct {
+		contract string
+		shape    string
+	}{
+		{contract: "router", shape: "array"},
+		{contract: "router-replan", shape: "array"},
+		{contract: "router-proposal", shape: "object"},
+		{contract: "orchestrator", shape: "object"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.contract, func(t *testing.T) {
+			c := mustContract(t, tt.contract)
+			want := "valid JSON " + tt.shape
+			if block := RenderContractBlock(c); !strings.Contains(block, want) {
+				t.Errorf("contract block must describe a %s; got:\n%s", tt.shape, block)
+			}
+			if tail := RenderContractTail(c, "/workspace/"+c.ArtifactName, "/workspace"); !strings.Contains(tail, want) {
+				t.Errorf("contract tail must describe a %s; got:\n%s", tt.shape, tail)
+			}
+		})
+	}
+}
+
+func TestRenderContractFooter_CarriesExactPath(t *testing.T) {
+	c, _ := For("build")
+	path := "/abs/.evolve/runs/cycle-213/build-report.md"
+	footer := RenderContractFooter(c, path)
+	if !strings.Contains(footer, path) {
+		t.Errorf("footer must carry the exact path %q; got:\n%s", path, footer)
+	}
+}
+
+func TestRenderContractBlock_FailureContextInstruction(t *testing.T) {
+	audit, _ := For("audit")
+	block := RenderContractBlock(audit)
+	for _, want := range []string{"failure", "schema_version\":2", "\"defects\""} {
+		if !strings.Contains(block, want) {
+			t.Errorf("audit contract block missing failure-context teaching %q:\n%s", want, block)
+		}
+	}
+
+	build, _ := For("build")
+	if strings.Contains(RenderContractBlock(build), "schema_version\":2") {
+		t.Error("build contract block must not carry the failure-context teaching")
+	}
+}
+
+func TestRenderContract_StatesTheAgentOwedFilesAndEffectsTheGateVerifies(t *testing.T) {
+	c := Contract{Phase: "triage", ArtifactName: "triage-report.md", Kind: KindMarkdown,
+		AgentOwedFiles: []string{"triage-decision.json"}, Effects: []string{EffectInboxClaim}}
+	block := RenderContractBlock(c)
+	if !strings.Contains(block, `"triage-decision.json"`) || !strings.Contains(block, "<owed-files>") {
+		t.Fatalf("the block names each agent-owed file and where it goes:\n%s", block)
+	}
+	if !strings.Contains(block, `"inbox-claim"`) || !strings.Contains(block, "effect") {
+		t.Fatalf("the block names each declared effect the gate verifies:\n%s", block)
+	}
+	tail := RenderContractTail(c, "/ws/triage-report.md", "/ws")
+	if !strings.Contains(tail, "<owed-file>/ws/triage-decision.json</owed-file>") || !strings.Contains(tail, "<effect>inbox-claim</effect>") {
+		t.Fatalf("the tail restates the machine half — owed files and effects — beside the sections:\n%s", tail)
+	}
+	plain, _ := For("build")
+	if got := RenderContractBlock(plain) + RenderContractTail(plain, "/ws/build-report.md", "/ws"); strings.Contains(got, "owed") || strings.Contains(got, "effect") {
+		t.Fatalf("a contract with no owed files or effects renders no such clause (byte-identical prompts):\n%s", got)
+	}
+}
+
+func TestOwedPath_IsTheOneJoinTheGateReads(t *testing.T) {
+	if got := OwedPath("/ws", "triage-decision.json"); got != "/ws/triage-decision.json" {
+		t.Fatalf("a bare name joins the workspace: %q", got)
+	}
+	if got := OwedPath("/ws", "reports/handoff.json"); got != "/ws/handoff.json" {
+		t.Fatalf("a declared separator never steers the read outside the workspace: %q", got)
+	}
+}
+
+func TestRenderContractTail_RendersTheOwedFilesAtTheExactPathsTheGateReads(t *testing.T) {
+	c := Contract{Phase: "triage", ArtifactName: "triage-report.md", Kind: KindMarkdown,
+		AgentOwedFiles: []string{"triage-decision.json", "reports/handoff.json"}, Effects: []string{"inbox-claim"}}
+	tail := RenderContractTail(c, "/elsewhere/triage-report.md", "/ws")
+	if !strings.Contains(tail, "<owed-file>/ws/triage-decision.json</owed-file>") || !strings.Contains(tail, "<owed-file>/ws/handoff.json</owed-file>") {
+		t.Fatalf("the tail names each owed file at OwedPath(workspace, name) — the workspace, not the artifact's directory:\n%s", tail)
+	}
+	block := RenderContractBlock(c)
+	if strings.Contains(block, "SAME directory") || !strings.Contains(block, "<owed-files>") || !strings.Contains(block, `"triage-decision.json"`) {
+		t.Fatalf("the block names the files and points at the tail for their paths, never describes a location:\n%s", block)
+	}
+}
+
+func TestRenderContractBlock_Audit_NamesTheFailureClassVocabulary(t *testing.T) {
+	block := RenderContractBlock(mustContract(t, "audit"))
+	for _, want := range []string{"code-audit-fail", "code-audit-warn", "infrastructure-transient", "infrastructure-systemic"} {
+		if !strings.Contains(block, want) {
+			t.Errorf("audit block must list failure class %q; got:\n%s", want, block)
+		}
+	}
+}

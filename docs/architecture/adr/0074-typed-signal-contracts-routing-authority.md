@@ -1,0 +1,236 @@
+# ADR-0074: Typed signal contracts — routing authority, verified consumers, transactional evidence
+
+- **Status:** Accepted (slice 1 implemented; slices tracked in `.evolve/inbox`)
+- **Date:** 2026-07-22
+- **Deciders:** operator (console session) + strong review (commit-gate dual review)
+- **Supersedes/extends:** builds on ADR-0072 (system-failure policy), ADR-0073
+  (mint registry), and the cycles 215–231 retrospective's coherence diagnosis.
+- **Amended by:** [ADR-0139](0139-a-wave-orchestrator-supplies-admits-and-backfills-every-lane.md) decision 5 (2026-10-17). A declared directory that only contains protected files no longer routes to the console. Only a directory inside a protected fragment does.
+  Amended again by the operator on 2026-10-18: every declared protected path is binding, file or directory. `route:lane` cannot relax it, and only a heuristic derivation stays open to it.
+
+## Context
+
+Batch-5 (cycles 1028–1037) closed with zero pipeline false-REDs — the
+v22.4–v22.7 hardening held — yet three of its four FAILs were one disease:
+lanes drew tasks whose fix surface is the pipeline's own **control plane**
+(`guards.ProtectedSurfaceManifest` paths a cycle is forbidden to write).
+Cycle-1034 built the disposition gate but could not enroll it in the manifest;
+1035 drew the guard-phase-hook task (fix = `.claude/settings.json`); 1036 drew
+the role.go allowance (fix = a protected guard file). Recurrence on the class:
+4+ across two weeks (cycle-858 was the first recorded instance).
+
+The routing knowledge existed every time — in retro preventive actions, in
+operator annotations (`route: console-manual` prose), in review findings — but
+**no component consumed it**. Investigation found the same producer-without-
+consumer shape across the open pipeline defects:
+
+- `internal/retrofile` (built cycle 657 to auto-file retro preventive actions):
+  zero production callers; every FAIL's structured recommendations evaporate.
+- `internal/recurrence` Escalator/Autofiler (cycle 661): defined, unwired.
+- Carryforward/prune API (cycle 962), `LandPrefixes` (975 era): shipped inert.
+- Reviewer flagged the state RMW race MEDIUM in cycle-992 — nothing escalated
+  it; it destroyed data in cycle-1001.
+- Cycle-948 recorded PASS; its commit never landed; the driving item was
+  consumed anyway (consumption fires on *pick*, not on *land*).
+- FAIL-cycle dossiers record `retro: skipped` while `retrospective-report.md`
+  exists on disk.
+
+## Decision
+
+One architectural principle, three enforced invariants:
+
+> **Signals that cross the control-plane/work-plane boundary must be typed,
+> enforced contracts — never prose, convention, or an artifact nobody reads.**
+
+### I1 — Routing authority is typed and enforced at every handoff
+
+Every inbox item has a dispatch authority: **lane** (default) or **console**
+(operator-owned). It is carried by a first-class `route` field
+(`console-manual`, `console-salvage`, `lane` override) and *derived* for the
+statically-blocked class: any declared fix-surface file matching
+`guards.IsProtectedSurface` console-routes the item automatically.
+
+Enforcement lives where selection authority actually crosses into dispatch —
+the **plan-time gate**: `triage-decision.json`'s `top_n`/`committed_floors` is
+the load-bearing selection→build handoff, and `fleet.TodosFromTriage` (single-
+sourced by the wave scheduler, the pool scheduler, the min-width repair path,
+and the wave-seed-inbox fallback) refuses console-routed ids via a required
+`RoutedFn` parameter, loudly (WARN per refusal at the composition root). All
+layers share ONE classifier (`inboxbatch.ConsoleRouted`/`PartitionConsole`/
+`RoutedResolver`):
+
+1. **Plan-time gate (binding)** — a console-routed id never becomes a lane
+   todo, whichever scheduler consumes the decision.
+2. **Handoff backstop (binding)** — `inboxmover.Claim` refuses console-routed
+   items with typed `ErrConsoleRouted` (CLI exit 3); the triage agent doc +
+   permission profile bind the claim step to `evolve inbox-mover claim`
+   (wiring-pinned by test — the prior doc invoked a deleted script, an I2
+   violation caught in this ADR's own strong review).
+3. **Visibility (advisory only)** — triage prompt composition partitions the
+   backlog and lists exclusions (`console_routed_excluded: …ids`). This is
+   UX, not enforcement: the agent enumerates the raw inbox directory, so the
+   prompt hint alone can never be the control.
+
+An id the LLM mis-picks anyway is refused at plan time; an item claimed out of
+band is refused at the mover.
+
+### I2 — Every signal producer has a verified live-path consumer
+
+A mechanism ships only with proof that its output is consumed on the composed
+production path (wiring proof), the same way apicover already forbids
+uncalled exports. Applies retroactively to the inert set: retrofile,
+recurrence Escalator/Autofiler, carryforward/prune. The failure-disposition
+router (queued 0.96; S1+S2 salvaged from cycle-1034) is the unifying consumer
+for retro output: mandatory `disposition.json` + deterministic routing floors
++ boundary applier.
+
+### I3 — State transitions are transactional with their evidence
+
+Recorded state must be entailed by on-disk/git evidence at the moment of
+recording: PASS ⇒ commit reachable from main (ship-landed floor, queued 0.96);
+item consumed ⇒ work landed (transactional consumption); dossier phase records
+⇒ phase artifacts exist (dossier-retro mislabel fix, queued).
+
+## Consequences
+
+- Control-plane work becomes an explicit **operator lane**: console-routed
+  items surface in the triage prompt's exclusion note and are worked at batch
+  boundaries through the sanctioned manual-ship flow (commit-gate → ship).
+  A cycle that legitimately *creates* a new gate-shaped file still FAILs the
+  protectedsurface tripwire (the security floor is untouched) — but the
+  disposition router (I2) turns that into a structured operator handoff
+  instead of a discarded cycle.
+- False-positive derivations (a file the text only names, a declared
+  directory that merely holds protected files, the pipeline-* kind) are
+  overridden explicitly with `route: "lane"` (narrowed 2026-09-26 by the F35
+  amendment below: never over a declared protected FILE — an item that only
+  *reads* a protected file declares the files it changes and names the read
+  in prose) — with an ADR-0073 clamp-parity
+  floor: an **agent-autofiled** item (`injected_by` set) cannot lane-override a
+  protected derivation, so agent-authored fields never widen agent authority.
+  The `route` field itself is unauthenticated (sandbox-off, nothing on disk is
+  — ADR-0073's conclusion); the accepted residual is that a forged override at
+  most forces a *doomed* pipeline, because the ship-time protectedsurface
+  tripwire still blocks the merge. The inverse gaming vectors (self-setting
+  `route:console` or padding `files[]` with a protected path to dodge lane
+  work) are bounded the same way: they bury an item in the loud, operator-
+  reviewed exclusion list rather than making anything mergeable.
+- The derivation matches only surfaces **already on the manifest** and scans
+  every token of each `files[]` entry (in SCOPE since F29 — a declared
+  directory holding protected files counts; with no declared surface, the
+  files the item's own text names are read — see the F29 amendment). A task
+  that will *create* a new gate-shaped file (the cycle-1034 shape) is out of
+  the derivation's reach by construction — that class is handled by the ship tripwire plus the
+  disposition router's structured operator handoff (I2), not by routing.
+- The pass-rate metric stops being polluted by structurally-doomed draws; the
+  remaining FAIL budget is reserved for honest rejections.
+- Amendment 2026-09-15 (research F25, wave 6 cycle 1688): the item's `kind` is
+  a routing input beside `route` and `files[]`. A `pipeline-*` kind
+  (`pipeline-repair`, `pipeline-integrity`) is pipeline-integrity work the
+  operator owns — the ADR-0072 halt autofiles that kind for the console — so
+  it console-routes even with no files list, under the same override clamp
+  (operator-authored `route:"lane"` honored, agent-autofiled ignored). The
+  halt autofiler stamps `injected_by`, so its records sit under that clamp.
+  `class` (the archetype, e.g. `pipeline-architecture`) is deliberately NOT a
+  routing input — it names a shape of work, not its owner.
+- Amendment 2026-09-26 (research F29): **for every surface the record itself
+  states, the seed-time classifier refuses at least what triage's breaker
+  would** (surfaces triage derives beyond the record remain the residual —
+  `lane-alternates-on-refusal`, F32). 18 of the ~60 cycles before this
+  date died at triage with `TRIAGE_PROTECTED_SURFACE` after a full
+  scout+triage spend, and a lane's fleet scope is ONE item, so a refusal has no
+  fallback. All 18 traced to five items whose protected surface was visible in
+  their own record: the kind (F25, 11 refusals), a declared DIRECTORY holding
+  protected files (4 — `"files": ["go/internal/core/"]` evaded the file-level
+  manifest), or — with no declared `files[]` — a protected FILE the item's own
+  text names (3). (1) **Two projections of the one manifest:**
+  `guards.IsProtectedSurface` stays MEMBERSHIP (its one fix: a path naming a
+  protected directory without the trailing slash is a member of it), used by
+  the ship tripwire, the role write-guard, the fleet preflight and the breaker;
+  `guards.IsProtectedScope` adds "a directory CONTAINS protected surface" and
+  is what the routing roots inject (the wave seed, the widen seam, the plan-time
+  resolver, the claim floor, the prompt partition, `evolve inbox`). Membership
+  implies scope (pinned), so the seed never admits a stated surface the
+  breaker refuses; the breaker's only change is the slashless-directory
+  membership fix. (2) **A declared surface wins; an
+  undeclared one is read from the item's text:** `Item.DeclaredSurface` — the
+  ONE home of that belief — is the set of path-shaped tokens (not every segment a single character — a
+  placeholder like `TBD`/`N/A`, a bare `role.go` or an annotation word like the
+  `go` of "(go test)" declares nothing, and only these tokens are judged); with none, the FILES the
+  record's author-written fields name are judged (derived at decode in
+  `Item.UnmarshalJSON`, because the wave seed, the claim floor and `LoadFile`
+  each decode records; machine-written fields are skipped; a directory mention
+  is context, not surface). This is a typed, deterministic derivation that can
+  only move an item TO the console — never widen lane authority — so it keeps
+  this ADR's rule that prose never GRANTS routing. (3) **The weight stays the
+  priority:** `triagecap.RankForDispatch`, the one ordering the seed paths
+  share, breaks EQUAL weights toward the verified-admissible candidate
+  (`FleetCandidate.Declared`, set from the same belief). *(Superseded 2026-10-06 by [ADR-0121](0121-inbox-priority-is-a-computed-rank.md)'s P2 amendment: the seed paths read the computed inbox rank, whose tie-break still puts a declared surface first; `RankForDispatch` and `FleetCandidate.Declared` are deleted.)* Live queue: 65 → 47
+  lane-dispatchable. Follow-ups filed console-owned: scope-aware triage
+  termination (`triage-termination-scope-aware`, cycle 1682), in-lane
+  alternates on refusal (`lane-alternates-on-refusal`).
+- Amendment 2026-09-26 (research F34, F35): **the same parity, for the two
+  paths F29 left open.** (1) **A declared protected FILE binds:** the
+  `route:"lane"` override relaxes only the HEURISTIC derivations: a
+  `pipeline-*` kind, a declared directory that merely holds protected files,
+  and a file the text only names. It never relaxes a declared file on the
+  manifest, because triage's breaker and the ship tripwire judge MEMBERSHIP
+  of each file with no route exception, so the override could only force a
+  doomed lane. Two live operator overrides did exactly that
+  (`cyclerun-seat-helper`, `bwrap-bind-requires-existing-write-dir`, set
+  after their files joined the manifest). An item that only reads a
+  protected file declares the files it changes. For a file spelling the
+  injected scope predicate IS membership, so FILE spellings need no second
+  predicate. Residual (F35c, filed console-owned): a declared DIRECTORY that
+  is itself inside a protected directory fragment (`go/internal/bridge/`,
+  `.evolve/build-explanation-contracts/`) or an extensionless member prefix
+  (`go/internal/phases/audit/probe_quarantine`) still reads as scope and
+  stays overridable; binding it needs membership injected beside scope
+  (both projections as one port), pinned by a manifest-walk test.
+  A trailing source locator (`x.go:178`, `#L10-L20`) is how a file is
+  cited, not part of its path: it is stripped before judgment, because the
+  breaker's substring match saw through it and the classifier did not.
+  (2) **The plan prunes what the gate would refuse, before the widen:** the
+  prior decision's top_n loses its console-routed ids (one WARN each,
+  through the gate's own resolver) before `WidenNarrowDecision`. Kept, they
+  filled the fleet width, the widen short-circuited, and the gate refused
+  them only after the lanes were cut (wave 7 ran 1 of 2 lanes). The
+  plan-time gate stays the binding backstop.
+
+### Amendment (2026-09-30): the operator override is a CLI verb
+
+The `route:"lane"` override had no writer: an operator set it by editing item JSON, which the operating rule that every control goes through the published CLI forbids, and which let an override land on an item it cannot relax (the two live overrides the F35 amendment above found). `evolve inbox route-lane <id> <reason>` now writes it through `inboxmover.RouteLane`. The verb judges the rewritten item with `ConsoleRouted`, the claim floor's raw decode and the same lane-forbidden predicate as the claim floor, and refuses when the item would stay console-owned, so a declared protected file and an agent-autofiled item cannot be overridden through it either. It stamps `routed_reason` and `routed_at` and appends a `route-lane` ledger line, so an override now carries its authority and evidence the way a console route does. The decision is unchanged; this closes the gap between the rule and the operator's only means of applying it.
+
+### Amendment (2026-09-26): the routing floor honors the builder's sandbox
+
+"What a lane can never change" had two sources. The compiled integrity manifest (`guards.IsProtectedScope`) and the build profile's `sandbox.deny_subpaths` both describe it, and the routing floor consulted only the first. An item declaring `.evolve/profiles/historian.json (new)` therefore routed to lanes whose builder the sandbox denies `.evolve/profiles`, and it failed at the build floor in cycles 1696 and 1699 ([incident](../../incidents/2026-09-26-lane-sent-work-its-sandbox-denies.md)).
+
+The routing predicate is now one composition: protected surface, or a path the build profile's enforced sandbox denies (`lanerouting.Forbidden`, over `profiles.SandboxConfig.Denies`). It reads the same deny list the OS sandbox enforces, only when `sandbox.enabled` is true, and never copies it.
+
+`cmd/evolve`'s `laneForbidden` wires it into the loop's routing roots: the wave seed and widen, the host and CLI claim floors, and `evolve inbox batches`. Triage receives it through `triage.Config.LaneForbidden`, for both its prompt partition and its breaker on `top_n` cards. `TestRoutingRoots_JudgeWithTheLanePredicate` pins that no `cmd/evolve` root passes the manifest predicate alone.
+
+The routing reason "protected fix surface" now means lane-forbidden. Two known gaps remain: `core`'s sequential termination check and the triage registry factory (see [internal-lanerouting § Known gaps](../packages/internal-lanerouting.md#known-gaps)).
+
+## Slice map (implementation tracking)
+
+| Slice | Invariant | Status |
+|---|---|---|
+| Routing classifier + **plan-time gate** (`TodosFromTriage` RoutedFn, all schedulers) + claim backstop + agent-doc/profile claim binding | I1 | **implemented (this ADR's PR)** |
+| Triage prompt partition + exclusion note | I1 (advisory UX) | implemented (this ADR's PR) |
+| Disposition router S1+S2 (assembler + schema gate; cycle-1034 salvage + manifest enrollment) | I2 | console boundary work |
+| Disposition router S3+S4 (floors/router + boundary applier; wires retrofile/recurrence) | I1+I2 | queued 0.96 |
+| Ship-landed floor: postship landing gate + `IsLandedFn` are live; transactional item consumption remains | I3 | partially live; remainder queued 0.96 |
+| Pre-dispatch AC authoring guard (scout/TDD operator-action disposition) | I1 | queued 0.90 |
+| Operator worklist surface (`evolve inbox` console section, stable terminal bucket) | I1 ergonomics | queued 0.70 |
+| Dossier record coherence (retro-skipped mislabel) | I3 | queued 0.60 |
+
+## Alternatives considered
+
+- **Prompt-level instruction only** ("triage: skip console items") — rejected:
+  prose is the failure mode this ADR exists to end; the 1036 wave read a
+  prompt composed before the annotation existed.
+- **Weight suppression** (drop console items below the lane band) — rejected:
+  weight encodes priority, not authority; conflating them hides operator work.
+- **Hard delete from inbox to a side directory** — rejected: loses the single
+  backlog view and the triage-visible exclusion note; racy with claims
+  mid-wave.

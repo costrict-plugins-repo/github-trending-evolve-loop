@@ -1,0 +1,133 @@
+package evalqualitycheck
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+)
+
+type DiversityLevel int
+
+const (
+	DiversityPass DiversityLevel = 0
+	DiversityWarn DiversityLevel = 1
+	DiversityHalt DiversityLevel = 2
+)
+
+const maxCohesiveSuiteSize = 12
+
+type DiversityOptions struct {
+	EvalDir string
+	Slug    string
+}
+
+type EvalDiversity struct {
+	Path        string
+	HasNegative bool
+	HasEdge     bool
+}
+
+type DiversityResult struct {
+	EvalDir           string
+	EvalCount         int
+	NegativeCaseCount int
+	EdgeCaseCount     int
+	PositiveOnlyCount int
+	Level             DiversityLevel
+	Reasons           []string
+	Files             []EvalDiversity
+}
+
+var (
+	negativeCaseRE = regexp.MustCompile(`(^|\s)!\s|\bexit\s+1\b|-ne\s+0|\[[^]]*!=[^]]*\]|\b(assert|expect|should|must)[_-]?(fail|error|reject|not)\b`)
+	edgeCaseRE     = regexp.MustCompile(`\binvalid\b|\bmissing\b|\bcorrupt(ed)?\b|\bmalformed\b|\boverflow\b|\bboundary\b|\bempty\b|""|''`)
+)
+
+func CheckDiversity(opts DiversityOptions) (DiversityResult, error) {
+	if opts.EvalDir == "" {
+		return DiversityResult{}, fmt.Errorf("evalqualitycheck: EvalDir required")
+	}
+	entries, err := os.ReadDir(opts.EvalDir)
+	if err != nil {
+		return DiversityResult{}, fmt.Errorf("evalqualitycheck: read dir %s: %w", opts.EvalDir, err)
+	}
+
+	res := DiversityResult{EvalDir: opts.EvalDir}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".md") {
+			continue
+		}
+		if strings.HasPrefix(name, "_") {
+			continue
+		}
+		if opts.Slug != "" && !strings.Contains(name, opts.Slug) {
+			continue
+		}
+		ed, hasCmds, err := fingerprintEval(filepath.Join(opts.EvalDir, name))
+		if err != nil {
+			return DiversityResult{}, err
+		}
+		if !hasCmds {
+			continue
+		}
+		res.EvalCount++
+		if ed.HasNegative {
+			res.NegativeCaseCount++
+		}
+		if ed.HasEdge {
+			res.EdgeCaseCount++
+		}
+		if !ed.HasNegative && !ed.HasEdge {
+			res.PositiveOnlyCount++
+		}
+		res.Files = append(res.Files, ed)
+	}
+
+	res.Level, res.Reasons = scoreDiversity(res)
+	return res, nil
+}
+
+func fingerprintEval(path string) (EvalDiversity, bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return EvalDiversity{}, false, fmt.Errorf("evalqualitycheck: open %s: %w", path, err)
+	}
+	cmds, scanErr := scanBashCommands(f)
+	_ = f.Close()
+	if scanErr != nil {
+		return EvalDiversity{}, false, fmt.Errorf("evalqualitycheck: scan %s: %w", path, scanErr)
+	}
+	if len(cmds) == 0 {
+		return EvalDiversity{}, false, nil
+	}
+	ed := EvalDiversity{Path: path}
+	for _, c := range cmds {
+		if negativeCaseRE.MatchString(c) {
+			ed.HasNegative = true
+		}
+		if edgeCaseRE.MatchString(c) {
+			ed.HasEdge = true
+		}
+	}
+	return ed, true, nil
+}
+
+func scoreDiversity(d DiversityResult) (DiversityLevel, []string) {
+	switch {
+	case d.EvalCount == 0:
+		return DiversityPass, []string{"no evals with commands to assess"}
+	case d.NegativeCaseCount > 0:
+		return DiversityPass, nil
+	case d.EvalCount >= 3 && d.EvalCount <= maxCohesiveSuiteSize:
+		return DiversityHalt, []string{
+			fmt.Sprintf("cohesive suite of %d evals has zero negative cases — add a rejection/failure test", d.EvalCount),
+		}
+	default:
+		return DiversityWarn, []string{
+			fmt.Sprintf("no negative cases across %d evals (suite too small or archive-scale for hard HALT; advisory)", d.EvalCount),
+		}
+	}
+}

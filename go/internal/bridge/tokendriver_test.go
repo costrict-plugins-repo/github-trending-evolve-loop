@@ -1,0 +1,37 @@
+package bridge
+
+import (
+	"testing"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+	"github.com/mickeyyaya/evolve-loop/go/internal/tokenusage"
+)
+
+func TestRecordTokenUsage_PassesDriverToResolver(t *testing.T) {
+	t.Parallel()
+	start := time.Date(2026, 7, 13, 10, 0, 0, 0, time.UTC)
+	var got tokenusage.Window
+	e := NewEngine(Deps{
+		Now: func() time.Time { return start.Add(90 * time.Second) },
+		TokenResolver: func(w tokenusage.Window) (tokenusage.Result, error) {
+			got = w
+			return tokenusage.Result{Source: tokenusage.SourceNone}, nil
+		},
+	})
+	req := core.BridgeRequest{
+		CLI:       "codex",
+		Agent:     "build",
+		Workspace: t.TempDir(),
+		Worktree:  "/repo/worktrees/cycle-779",
+	}
+	var resp core.BridgeResponse
+	e.recordTokenUsage(req, "gpt-5", 0, start, &resp)
+
+	if got.Driver != "codex" {
+		t.Errorf("Window.Driver = %q, want %q (recordTokenUsage drops req.CLI — per-driver dispatch impossible)", got.Driver, req.CLI)
+	}
+	if got.Worktree != req.Worktree {
+		t.Errorf("Window.Worktree = %q, want %q (driver plumbing must not displace existing context)", got.Worktree, req.Worktree)
+	}
+}

@@ -1,0 +1,113 @@
+# goreleaser config for the evolve-loop Go binary.
+#
+# Run locally: goreleaser release --snapshot --clean
+# Run in CI:   goreleaser release --clean (with a v* git tag pushed)
+#
+# Mirrors the matrix produced by `go/Makefile`'s dist-* targets and the
+# `binaries[].artifacts` entries in .claude-plugin/plugin.json. If you
+# add or remove a (GOOS, GOARCH) pair, update both.
+#
+# Why CGO_ENABLED=0: same reason as the Makefile — evolve-loop's Go
+# tree has no cgo and disabling cgo strips the glibc-version surface
+# on linux, producing fully static binaries.
+version: 2
+
+project_name: evolve
+
+before:
+  # goreleaser execs hooks directly (no shell), so `cd go && …` fails with
+  # "cd: not found"; the module is under go/, so use `go -C go …`. The release
+  # tag is cut on main, which CI (go.yml) already fully tests (make build +
+  # race + e2e), so this only re-tidies modules — it does NOT re-run the suite
+  # here (that also needs build artifacts the --clean checkout lacks, e.g.
+  # commit-prefix-scope.json's go/bin/** path).
+  hooks:
+    - go -C go mod tidy
+
+builds:
+  - id: evolve
+    main: ./cmd/evolve
+    dir: go
+    binary: evolve
+    env:
+      - CGO_ENABLED=0
+    # Every Unix target the pure-Go tree cross-compiles to (verified). Windows is
+    # excluded: internal/adapters/flock uses unix syscall.Flock, and the loop
+    # runtime needs tmux/bash anyway (Windows users run it under WSL2).
+    targets:
+      - darwin_amd64
+      - darwin_arm64
+      - linux_amd64
+      - linux_arm64
+      - linux_arm
+      - linux_386
+      - linux_riscv64
+      - linux_ppc64le
+      - linux_s390x
+      - freebsd_amd64
+      - freebsd_arm64
+      - openbsd_amd64
+      - netbsd_amd64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/mickeyyaya/evolve-loop/go/pkg/version.version={{.Version}}
+      - -X github.com/mickeyyaya/evolve-loop/go/pkg/version.commit={{.ShortCommit}}
+      - -X github.com/mickeyyaya/evolve-loop/go/pkg/version.builtAt={{.Date}}
+
+# One macOS fingerprint per version (one-binary S2): lipo the two darwin arch
+# builds into a single fat binary. goreleaser publishes its archive with
+# .Arch="all" -> evolve_darwin_all.tar.gz, which release-verify-binaries requires
+# (releasetargets surfaces a darwin_all target when this block is present).
+# replace:false keeps the per-arch archives published too, so install.sh's
+# existing per-arch source URLs (evolve_darwin_arm64.tar.gz, …) keep working —
+# the universal is the ADDITIONAL single-fingerprint corporate artifact, not a
+# replacement. (releasetargets honors replace either way, so a future flip to
+# replace:true would correctly stop requiring the per-arch archives.)
+universal_binaries:
+  - id: evolve-universal
+    ids:
+      - evolve
+    replace: false
+    name_template: evolve
+
+archives:
+  - id: evolve
+    # Version-LESS name so install.sh can fetch a stable URL:
+    #   .../releases/latest/download/evolve_<os>_<arch>.tar.gz
+    name_template: 'evolve_{{ .Os }}_{{ .Arch }}'
+    files:
+      - LICENSE
+      - README.md
+      - CHANGELOG.md
+      # Skill payload bundled beside the binary so a downloaded `evolve` is
+      # self-contained: installer.Install + runSkillsPublish read these from
+      # disk (there is no go:embed). Mirrors what `evolve install` consumes.
+      - .claude-plugin/plugin.json
+      - .claude-plugin/marketplace.json
+      - 'agents/evolve-*.md'
+      - 'skills/**'
+      - docs/reference/genes.md
+      - docs/reference/instincts.md
+      - docs/reference/configuration.md
+    formats: [ 'tar.gz' ]
+    format_overrides:
+      - goos: windows
+        formats: [ 'zip' ]
+
+checksum:
+  name_template: 'checksums.txt'
+
+snapshot:
+  version_template: '{{ incpatch .Version }}-snapshot-{{ .ShortCommit }}'
+
+changelog:
+  disable: true  # release-pipeline.sh already maintains CHANGELOG.md
+
+release:
+  github:
+    owner: mickeyyaya
+    name: evolve-loop
+  draft: false
+  prerelease: auto

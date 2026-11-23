@@ -1,0 +1,89 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"os"
+	"path/filepath"
+	"strconv"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/test/fixtures"
+)
+
+func writeLoopFinalizeFixture(t *testing.T, evolveDir string, cycleID, lastCycleNumber int) {
+	t.Helper()
+	if err := os.MkdirAll(evolveDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(evolveDir, "policy.json"), []byte(`{"dispatch":{"policy":"off"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stateJSON := `{"failedApproaches":[],"lastCycleNumber":` + strconv.Itoa(lastCycleNumber) + `}`
+	if err := os.WriteFile(filepath.Join(evolveDir, "state.json"), []byte(stateJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	csJSON := `{"cycle_id":` + strconv.Itoa(cycleID) + `,"phase":"ship","workspace_path":"` + filepath.ToSlash(filepath.Join(evolveDir, "runs", "cycle-finalize-fixture")) + `"}`
+	if err := os.WriteFile(filepath.Join(evolveDir, "cycle-state.json"), []byte(csJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoop_MaxCyclesExit_ClearsCompletedMarker(t *testing.T) {
+	projectRoot := t.TempDir()
+	evolveDir := filepath.Join(projectRoot, ".evolve")
+	writeLoopFinalizeFixture(t, evolveDir, 5, 5)
+
+	storage := &fixtures.FakeStorage{}
+	ledger := newFakeLedger()
+	defer installStubDeps(t, storage, ledger)()
+
+	var stdout, stderr bytes.Buffer
+	rc := runLoop([]string{
+		"--project-root", projectRoot,
+		"--evolve-dir", evolveDir,
+		"--goal-text", "finalize goal",
+		"--cycles", "1",
+	}, nil, &stdout, &stderr)
+
+	if rc != 0 {
+		t.Fatalf("rc=%d, want 0 (clean max_cycles completion); stderr=%s", rc, stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(evolveDir, "cycle-state.json")); !os.IsNotExist(err) {
+		t.Errorf("cycle-state.json still present after a clean max_cycles exit (stat err=%v) — ClearCompletedCycleMarker was not wired at the batch-end call site", err)
+	}
+}
+
+func TestLoop_SignalExit_PreservesMarker(t *testing.T) {
+	projectRoot := t.TempDir()
+	evolveDir := filepath.Join(projectRoot, ".evolve")
+	writeLoopFinalizeFixture(t, evolveDir, 5, 5)
+
+	storage := &fixtures.FakeStorage{}
+	ledger := newFakeLedger()
+	defer installStubDeps(t, storage, ledger)()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	prevSig := loopSignalContext
+	loopSignalContext = func(context.Context) (context.Context, context.CancelFunc) { return ctx, cancel }
+	defer func() { loopSignalContext = prevSig }()
+
+	prevOrch := loopOrchOverride
+	loopOrchOverride = &cancelOnRunOrch{cancel: cancel}
+	defer func() { loopOrchOverride = prevOrch }()
+
+	var stdout, stderr bytes.Buffer
+	rc := runLoop([]string{
+		"--project-root", projectRoot,
+		"--evolve-dir", evolveDir,
+		"--goal-text", "finalize goal",
+		"--cycles", "5",
+	}, nil, &stdout, &stderr)
+
+	if rc != 130 {
+		t.Fatalf("rc=%d, want 130 (graceful signal stop); stderr=%s", rc, stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(evolveDir, "cycle-state.json")); err != nil {
+		t.Errorf("cycle-state.json removed on a signal-interrupted exit (stat err=%v) — must be preserved for --resume", err)
+	}
+}

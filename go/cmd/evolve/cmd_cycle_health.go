@@ -1,0 +1,72 @@
+package main
+
+import (
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strconv"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/cyclehealth"
+	"github.com/mickeyyaya/evolve-loop/go/internal/paths"
+	"github.com/mickeyyaya/evolve-loop/go/internal/policy"
+)
+
+var cycleHealthAbsoluteRoot = paths.AbsoluteRoot
+
+func runCycleHealth(args []string, _ io.Reader, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("cycle-health", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	if err := fs.Parse(args); err != nil {
+		return 10
+	}
+	rest := fs.Args()
+	if len(rest) < 2 {
+		fmt.Fprintln(stderr, "evolve cycle-health: missing <cycle-N> <workspace>")
+		return 10
+	}
+	cycle, err := strconv.Atoi(rest[0])
+	if err != nil || cycle <= 0 {
+		fmt.Fprintf(stderr, "evolve cycle-health: invalid cycle %q\n", rest[0])
+		return 10
+	}
+	pol, err := policy.Load(filepath.Join(cycleHealthRoot(rest[1], stderr), ".evolve", "policy.json"))
+	if err != nil {
+		fmt.Fprintf(stderr, "evolve cycle-health: %v\n", err)
+		return 1
+	}
+	retryCfg := pol.RetryConfig()
+	res, err := cyclehealth.Check(cyclehealth.Options{
+		Cycle:                cycle,
+		Workspace:            rest[1],
+		NowFn:                time.Now,
+		PhaseLatencyCeilingS: retryCfg.PhaseLatencyCeilingS,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "evolve cycle-health: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "[cycle-health] cycle=%d workspace=%s\n", res.Cycle, res.Workspace)
+	for _, a := range res.Anomalies {
+		fmt.Fprintf(stdout, "  [%s] %s: %s\n", a.Severity, a.Signal, a.Message)
+	}
+	if res.OverallFatal {
+		fmt.Fprintln(stdout, "[cycle-health] verdict: HALT (fatal anomalies present)")
+		return 1
+	}
+	fmt.Fprintf(stdout, "[cycle-health] verdict: OK (%d signal(s) ran, %d warn(s))\n",
+		len(res.SignalsRun), len(res.Anomalies))
+	return 0
+}
+
+func cycleHealthRoot(workspace string, stderr io.Writer) string {
+	projectRoot := os.Getenv("EVOLVE_PROJECT_ROOT")
+	if projectRoot == "" {
+		projectRoot = filepath.Dir(filepath.Dir(filepath.Dir(workspace)))
+	}
+	return cycleHealthAbsoluteRoot("EVOLVE_PROJECT_ROOT", projectRoot, func(m string) {
+		fmt.Fprintf(stderr, "evolve cycle-health: WARN: %s\n", m)
+	})
+}

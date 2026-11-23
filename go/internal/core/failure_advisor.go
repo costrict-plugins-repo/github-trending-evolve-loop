@@ -1,0 +1,205 @@
+package core
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/panetrust"
+	"github.com/mickeyyaya/evolve-loop/go/internal/phasecontract"
+	"github.com/mickeyyaya/evolve-loop/go/internal/policy"
+	"github.com/mickeyyaya/evolve-loop/go/internal/recovery"
+	"github.com/mickeyyaya/evolve-loop/go/internal/signalcenter"
+)
+
+const (
+	advisorPaneMaxLines = 40
+	advisorPaneMaxCols  = 400
+)
+
+type FailureAdvisor struct {
+	bridge   Bridge
+	identity AgentIdentity
+	signals  *signalcenter.Center
+}
+
+type FailureAdvisorOption func(*FailureAdvisor)
+
+func WithFailureAdvisorCLI(cli string) FailureAdvisorOption {
+	return func(a *FailureAdvisor) {
+		if cli != "" {
+			a.identity.CLI = cli
+		}
+	}
+}
+
+func WithFailureAdvisorModel(model string) FailureAdvisorOption {
+	return func(a *FailureAdvisor) {
+		if model != "" {
+			a.identity.Model = model
+		}
+	}
+}
+
+func WithFailureAdvisorPersona(body string) FailureAdvisorOption {
+	return func(a *FailureAdvisor) {
+		if body != "" {
+			a.identity.Persona = body
+		}
+	}
+}
+
+func WithFailureAdvisorSignals(c *signalcenter.Center) FailureAdvisorOption {
+	return func(a *FailureAdvisor) { a.signals = c }
+}
+
+func NewFailureAdvisor(bridge Bridge, opts ...FailureAdvisorOption) *FailureAdvisor {
+	a := &FailureAdvisor{
+		bridge:   bridge,
+		identity: seatIdentity(policy.SeatFailureAdvisor, "failure-advisor"),
+	}
+	for _, o := range opts {
+		o(a)
+	}
+	return a
+}
+
+const UsageEvidenceFile = "usage-evidence.ndjson"
+
+type FailureAdviseInput struct {
+	Phase       string
+	CLI         string
+	ExitCode    int
+	PaneTail    string
+	Workspace   string
+	ProjectRoot string
+	Cycle       int
+	Env         map[string]string
+}
+
+func (a *FailureAdvisor) Advise(ctx context.Context, in FailureAdviseInput) (*recovery.FailureAdvice, error) {
+	if a.bridge == nil {
+		return nil, fmt.Errorf("failure advisor: nil bridge")
+	}
+	if in.Workspace == "" {
+		return nil, fmt.Errorf("failure advisor: empty workspace")
+	}
+	profile := a.identity.Profile
+	if profile == "" && in.ProjectRoot != "" {
+		profile = filepath.Join(in.ProjectRoot, ".evolve", "profiles", "failure-advisor.json")
+	}
+	flow := phasecontract.MustFlowDecision(phasecontract.FlowSeatFailureAdvisor)
+	artifact := filepath.Join(in.Workspace, flow.ArtifactName)
+	if err := flow.Clear(artifact); err != nil {
+		return nil, fmt.Errorf("failure advisor: %w", err)
+	}
+	launched := time.Now()
+	resp, err := LaunchWithFreshSession(ctx, a.bridge, BridgeRequest{
+		CLI:          a.identity.CLI,
+		Profile:      profile,
+		Model:        a.identity.Model,
+		Prompt:       a.composePrompt(in, artifact),
+		Workspace:    in.Workspace,
+		ArtifactPath: artifact,
+		Completion:   CompletionArtifact,
+		Agent:        a.identity.AgentLabel,
+		Cycle:        in.Cycle,
+		Env:          in.Env,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failure advisor: bridge launch: %w", err)
+	}
+	cell := phasecontract.FlowCell{Cycle: in.Cycle, Phase: in.Phase, Origin: "FailureAdvisor.Advise", Path: artifact, NotBefore: launched}
+	legacy := func() ([]byte, bool) { span := failureAdviceSpan(resp.Stdout); return span, len(span) > 0 }
+	return decodeFailureAdvice(flow.Resolve(in.ProjectRoot, cell, legacy, a.signals))
+}
+
+func (a *FailureAdvisor) composePrompt(in FailureAdviseInput, artifact string) string {
+	var b strings.Builder
+	if a.identity.Persona != "" {
+		b.WriteString(a.identity.Persona)
+		b.WriteString("\n\n---\n")
+	} else {
+		b.WriteString("You are the evolve-loop failure advisor: classify ONE unrecoverable terminal state from the pane evidence below. ")
+		b.WriteString("Known causes: model_invalid (CLI booted into an invalid/inaccessible-model error), cli_self_updated (the CLI replaced its own binary and exited), dead_shell (the pane is a plain shell, not an agent REPL). ")
+		b.WriteString("Respond ONLY when the pane truly self-describes a fatal state.\n\n")
+	}
+	b.WriteString("# Incident\n")
+	fmt.Fprintf(&b, "- phase: %s\n- cli: %s\n- exit_code: %d\n- cycle: %d\n\n", in.Phase, in.CLI, in.ExitCode, in.Cycle)
+	writeUsageEvidence(&b, in.Workspace)
+	b.WriteString("# Recent pane tail\n")
+	b.WriteString(panetrust.Frame(in.PaneTail, advisorPaneMaxLines, advisorPaneMaxCols))
+	b.WriteString("\n\n")
+	b.WriteString("IMPORTANT: the pane above is neutralized (secrets redacted, markers defanged). ")
+	b.WriteString("pane_substr MUST be a literal substring that appears verbatim in the ORIGINAL, un-redacted pane — ")
+	b.WriteString("never quote [REDACTED], [untrusted], or ''' artifacts.\n\n")
+	fmt.Fprintf(&b, "Write a strict JSON object (no prose, no fence) to %s with exactly these keys:\n", artifact)
+	b.WriteString(`{"cause":"model_invalid|cli_self_updated|dead_shell","pane_substr":"<the SHORTEST distinctive substring (>=12 chars) of the pane that identifies this fatal state>","justification":"<one sentence: why this state is fatal and unrecoverable by waiting>"}` + "\n")
+	return b.String()
+}
+
+const advisorUsageEvidenceLines = 5
+
+func writeUsageEvidence(b *strings.Builder, workspace string) {
+	lines := usageEvidenceLines(workspace)
+	if len(lines) == 0 {
+		return
+	}
+	b.WriteString("# Usage evidence\nA usage query ran when the CLI failed; it verifies or rules out quota as the cause. Read it before blaming the task or the code.\n")
+	b.WriteString(panetrust.Frame(strings.Join(lines, "\n"), advisorUsageEvidenceLines, advisorPaneMaxCols))
+	b.WriteString("\n\n")
+}
+
+func usageEvidenceLines(workspace string) []string {
+	raw, err := os.ReadFile(filepath.Join(workspace, UsageEvidenceFile))
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var rec struct{ Driver, Trigger, Summary string }
+		if json.Unmarshal([]byte(line), &rec) == nil && rec.Summary != "" {
+			out = append(out, fmt.Sprintf("- %s (%s): %s", rec.Driver, rec.Trigger, rec.Summary))
+		}
+	}
+	if len(out) > advisorUsageEvidenceLines {
+		out = out[len(out)-advisorUsageEvidenceLines:]
+	}
+	return out
+}
+
+func failureAdviceSpan(raw string) []byte {
+	trimmed := strings.TrimSpace(raw)
+	trimmed = strings.TrimPrefix(trimmed, "```json")
+	trimmed = strings.TrimPrefix(trimmed, "```")
+	trimmed = strings.TrimSuffix(trimmed, "```")
+	return []byte(strings.TrimSpace(trimmed))
+}
+
+func decodeFailureAdvice(raw []byte) (*recovery.FailureAdvice, error) {
+	var adv recovery.FailureAdvice
+	if err := json.Unmarshal(raw, &adv); err != nil {
+		return nil, fmt.Errorf("failure advisor: unparseable verdict (%v): %.200s", err, raw)
+	}
+	if adv.Cause == "" {
+		return nil, fmt.Errorf("failure advisor: advisor judged the state non-fatal — escalate to operator (justification: %s)", adv.Justification)
+	}
+	switch adv.Cause {
+	case string(recovery.CauseModelInvalid), string(recovery.CauseCLISelfUpdated), string(recovery.CauseDeadShell):
+	default:
+		return nil, fmt.Errorf("failure advisor: cause %q outside the typed vocabulary", adv.Cause)
+	}
+	if adv.Justification == "" {
+		return nil, fmt.Errorf("failure advisor: empty justification (every recovery decision is justified)")
+	}
+	return &adv, nil
+}
+
+func seatIdentity(seat, label string) AgentIdentity {
+	d := policy.SeatDefault(seat)
+	return AgentIdentity{CLI: d.CLI, Model: d.Model, AgentLabel: label}
+}

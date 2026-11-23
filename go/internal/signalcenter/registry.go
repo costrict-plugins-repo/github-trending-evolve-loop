@@ -1,0 +1,119 @@
+package signalcenter
+
+import (
+	"sort"
+	"sync"
+)
+
+type CodeDoc struct {
+	Code Code
+	Doc  string
+}
+
+type Conflict struct {
+	Code        Code
+	Module      Module
+	OtherModule Module
+	Doc         string
+	OtherDoc    string
+}
+
+type registry struct {
+	mu        sync.RWMutex
+	owner     map[Code]Module
+	docs      map[Code]string
+	conflicts []Conflict
+}
+
+var codes = &registry{owner: map[Code]Module{}, docs: map[Code]string{}}
+
+func init() {
+	for c, doc := range map[Code]string{
+		CodeUnknownModule:    "an event named a module outside the closed set; raw value in fields.raw_module",
+		CodeUnknownKind:      "an event named a kind outside the closed set; raw value in fields.raw_kind",
+		CodeUnknownSeverity:  "an event carried a severity outside INFO/WARN/INCIDENT; raw value in fields.raw_severity",
+		CodeMissingCode:      "a WARN or INCIDENT event carried no code",
+		CodeUnregisteredCode: "an event carried a code its module never registered; raw value in fields.raw_code",
+		CodeMissingReason:    "an event carried no reason",
+		CodeBadOrigin:        "an event's origin is not a Func or Type.Method name; raw value in fields.raw_origin",
+		CodeListenerPanicked: "a listener panicked and was unsubscribed; the panic value is in the reason",
+		CodeSinkDropped:      "the durable sink had no path for N events (fields.dropped) before this write",
+	} {
+		RegisterCode(ModuleSignalCenter, c, doc)
+	}
+	for c, doc := range map[Code]string{
+		"CONVERGENCE_NO_PROGRESS":     "a fix round did not lower the open-finding mass at the blocking bar; fields.round, mass_prev, mass and bar give the comparison",
+		"CONVERGENCE_REPAIR_DAMAGE":   "a fix round broke more than it repaired; fields.round, damage (findings the round introduced) and repairs (findings it closed)",
+		"CONVERGENCE_CONCENTRATION":   "open findings gathered in one component; fields.component, share, prev_share and window give the concentration over the window of rounds",
+		"CONVERGENCE_DEFERRED":        "findings were deferred to follow-ups; fields.count is the number deferred and fields.followups the follow-ups to open",
+		"CONVERGENCE_FILED":           "findings were filed instead of fixed; fields.late, capability and info count the late, capability and info findings",
+		"CONVERGENCE_SPLIT":           "the decision split a component out of the loop; fields.component is the component and fields.followup the follow-up that carries it",
+		"CONVERGENCE_ACCEPTED_LIMITS": "a component landed with its limits accepted; fields.component is the component and fields.certificate its fail-safe certificate",
+		"CONVERGENCE_STOP":            "the decision stopped the loop; fields.round, open (findings still open) and land_round (the round the policy planned to land)",
+		"CONVERGENCE_DISPUTED":        "findings are disputed; fields.count and critical count them and fields.adjudicator names who decides",
+		"CONVERGENCE_NO_HEADROOM":     "the model tier of a role has no higher tier to raise to. fields.role, family, from (current tier), and to (next tier, or none)",
+	} {
+		RegisterCode(ModuleConvergence, c, doc)
+	}
+	RegisterCode(ModuleLoop, CodeLoopLost, "a reader saw a loop process end without its loop.exit event. A reader makes this record, and no log holds it. Fields: fields.pid, run_id, exit (crash or unknown), historical (true if the loop stopped before the reader looked)")
+	RegisterCode(ModuleLatency, CodeLatencyBudgetExceeded, "two waves in a row breached a bound of the wave latency check. fields.waves lists them, fields.reasons names the breached rules, and fields.item the filed item")
+	RegisterCode(ModuleHost, CodeHostDiskLow, "free disk space on the host volume is below the pause line, so the cycle start waits before it dispatches. fields.free_pct, pause_pct and path give the reading, and fields.outcome is paused (the first wait) or gave_up (the maximum pause from preflight.disk_guard.max_pause_s passed and the cycle start stopped)")
+	RegisterCode(ModuleLog, CodeLogAccessShadow, "at log_access shadow, a phase read a log layer that its phase.json log_access does not declare, and the read went on. fields.layer (D0 to D3), declared (the layers of log_access) and verb (the evolve logs verb) give the read")
+	RegisterCode(ModuleHost, CodeHostVerifyLockWait, "a verification run asked for the host verification lock. fields.source names the caller (build-floor or acs-suite), fields.wait_ms the time that it waited, and fields.outcome is acquired or unserialized (the wait bound passed or the lock failed, so the run went on without the lock)")
+	RegisterCode(ModuleCI, CodeCIRunRed, "a watched CI run completed with a conclusion other than success; fields.sha, workflow, conclusion, run_id and run_url name the run")
+	RegisterCode(ModuleAudit, CodeAuditCascadeShadow, "at audit_cascade.stage shadow, the audit records if enforce escalates this cycle's audit. fields.would_escalate (true or false) and fields.changed_files (changed file count)")
+	RegisterCode(ModuleParallelEval, CodeParallelEvaluateShadow, "at parallel_evaluate.stage shadow, the orchestrator computed the parallel evaluate batch of enforce and dispatched it serially. fields.batch lists the phases in batch order")
+}
+
+func RegisterCode(m Module, c Code, doc string) { codes.register(m, c, doc) }
+
+func (r *registry) register(m Module, c Code, doc string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var badReason string
+	switch {
+	case !c.Valid():
+		badReason = "malformed code (want MODULE_SNAKE_CASE)"
+	case !c.BelongsTo(m):
+		badReason = "prefix does not belong to " + string(m)
+	}
+	if badReason != "" {
+		r.conflicts = append(r.conflicts, Conflict{Code: c, Module: m, OtherModule: m, Doc: doc, OtherDoc: badReason})
+		return
+	}
+	if owner, ok := r.owner[c]; ok {
+		if owner == m && r.docs[c] == doc {
+			return
+		}
+		r.conflicts = append(r.conflicts, Conflict{Code: c, Module: owner, OtherModule: m, Doc: r.docs[c], OtherDoc: doc})
+		return
+	}
+	r.owner[c] = m
+	r.docs[c] = doc
+}
+
+func IsRegistered(c Code) (Module, bool) {
+	codes.mu.RLock()
+	defer codes.mu.RUnlock()
+	m, ok := codes.owner[c]
+	return m, ok
+}
+
+func RegisteredCodes() map[Module][]CodeDoc {
+	codes.mu.RLock()
+	defer codes.mu.RUnlock()
+	out := map[Module][]CodeDoc{}
+	for c, m := range codes.owner {
+		out[m] = append(out[m], CodeDoc{Code: c, Doc: codes.docs[c]})
+	}
+	for m := range out {
+		sort.Slice(out[m], func(i, j int) bool { return out[m][i].Code < out[m][j].Code })
+	}
+	return out
+}
+
+func RegistryConflicts() []Conflict {
+	codes.mu.RLock()
+	defer codes.mu.RUnlock()
+	return append([]Conflict(nil), codes.conflicts...)
+}

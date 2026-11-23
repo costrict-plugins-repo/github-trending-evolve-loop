@@ -1,0 +1,45 @@
+{
+  "name": "api-contract-design",
+  "archetype": "plan",
+  "agent": "evolve-api-contract-design",
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/scout-report.md"
+    ],
+    "signals": [
+      "scout.goal_type"
+    ]
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/api-contract.md"
+    ],
+    "signals": [
+      "contract.surfaces"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Surfaces",
+      "Interface Definitions",
+      "Invariants",
+      "Verdict"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "feature"
+      },
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "api-design"
+      }
+    ]
+  },
+  "after": "triage",
+  "optional": true
+}

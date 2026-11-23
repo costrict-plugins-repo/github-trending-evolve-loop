@@ -1,0 +1,38 @@
+{
+  "name": "dependency-map",
+  "catalog": "on-demand",
+  "archetype": "evaluate",
+  "agent": "evolve-dependency-map",
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/scout-report.md"
+    ],
+    "signals": []
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/dependency-map-report.md"
+    ],
+    "signals": [
+      "depmap.count",
+      "depmap.blocker_count"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Dependencies",
+      "Critical Path",
+      "Blockers"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "project-management"
+      }
+    ]
+  },
+  "after": "triage"
+}

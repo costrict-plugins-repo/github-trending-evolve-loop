@@ -1,0 +1,180 @@
+package swarm
+
+import (
+	"context"
+	"errors"
+	"testing"
+)
+
+func fakeServer(names ...string) SessionLister {
+	return func(_ context.Context) ([]string, error) { return names, nil }
+}
+
+func aliveSet(pids ...int) PidLiveness {
+	live := map[int]bool{}
+	for _, p := range pids {
+		live[p] = true
+	}
+	return func(pid int) bool { return live[pid] }
+}
+
+func recordingTmuxKiller() (TmuxKiller, *[]string) {
+	var killed []string
+	k := func(_ context.Context, s string) error {
+		killed = append(killed, s)
+		return nil
+	}
+	return k, &killed
+}
+
+func TestReapOrphanSockets(t *testing.T) {
+	t.Parallel()
+	var list SocketLister = func() ([]string, error) {
+		return []string{"evolve-bridge-p111", "evolve-bridge-p222", "evolve-bridge", "evolve-bridge-codex-c0-probe-pid5"}, nil
+	}
+	var killed []string
+	var kill ServerKiller = func(_ context.Context, s string) error { killed = append(killed, s); return nil }
+
+	rep := ReapOrphanSockets(context.Background(), list, aliveSet(222), kill)
+
+	if len(killed) != 1 || killed[0] != "evolve-bridge-p111" {
+		t.Fatalf("killed=%v, want only the dead per-run socket evolve-bridge-p111 (default + probe must be untouched)", killed)
+	}
+	if rep.SkippedLive != 1 {
+		t.Fatalf("SkippedLive=%d, want 1 (the live p222 owner)", rep.SkippedLive)
+	}
+}
+
+func TestReapOrphanSockets_ListErrorIsSafe(t *testing.T) {
+	t.Parallel()
+	list := func() ([]string, error) { return nil, errors.New("no socket dir") }
+	var killed []string
+	kill := func(_ context.Context, s string) error { killed = append(killed, s); return nil }
+	rep := ReapOrphanSockets(context.Background(), list, aliveSet(), kill)
+	if len(killed) != 0 || len(rep.Errors) != 1 {
+		t.Fatalf("list error must kill nothing + record 1 error; killed=%v rep=%+v", killed, rep)
+	}
+}
+
+func TestSessionPID(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		session string
+		wantPID int
+		wantOK  bool
+	}{
+		{"build session", "evolve-bridge-r01KVZ0PV-c394-build-pid60161-nm-1782380224", 60161, true},
+		{"recipe probe", "evolve-recipe-c0-usage-probe-pid165-n4-1782342570", 165, true},
+		{"plain probe", "evolve-bridge-c0-probe-pid98167-n1-1782380671", 98167, true},
+		{"pid at end", "evolve-bridge-codex-c0-probe-pid50395", 50395, true},
+		{"no pid token (test session)", "evolve-bridge-it-iperm-71243", 0, false},
+		{"no pid token at all", "evolve-bridge-something-else", 0, false},
+		{"zero pid refused", "evolve-bridge-c1-x-pid0-n1-1", 0, false},
+		{"rapid is not pid", "evolve-bridge-rapid7-c1-build", 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			pid, ok := SessionPID(tc.session)
+			if ok != tc.wantOK || pid != tc.wantPID {
+				t.Fatalf("SessionPID(%q) = (%d,%v), want (%d,%v)", tc.session, pid, ok, tc.wantPID, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestReapOrphans_KillsDeadKeepsLive(t *testing.T) {
+	t.Parallel()
+	const deadOrphan = "evolve-bridge-rDEAD0000-c394-build-pid60161-nm-1"
+	const liveRun = "evolve-bridge-rLIVE1111-c5-build-pid4242-na-2"
+	list := fakeServer(deadOrphan, liveRun)
+	kill, killed := recordingTmuxKiller()
+
+	rep := ReapOrphanSessions(context.Background(), list, aliveSet(4242), kill)
+
+	if len(*killed) != 1 || (*killed)[0] != deadOrphan {
+		t.Fatalf("killed=%v, want exactly the dead orphan %q", *killed, deadOrphan)
+	}
+	for _, s := range *killed {
+		if s == liveRun {
+			t.Fatal("reaped a LIVE concurrent run's session — killer-B class regression")
+		}
+	}
+	if rep.SkippedLive != 1 {
+		t.Fatalf("SkippedLive=%d, want 1 (the live run)", rep.SkippedLive)
+	}
+	if len(rep.Killed) != 1 {
+		t.Fatalf("rep.Killed=%v, want 1", rep.Killed)
+	}
+}
+
+func TestReapOrphans_SafetySkips(t *testing.T) {
+	t.Parallel()
+	foreign := "some-other-tmux-session"
+	empty := ""
+	noPID := "evolve-bridge-something-else"
+	deadBridge := "evolve-bridge-c1-build-pid900-n1-1"
+	deadRecipe := "evolve-recipe-c0-usage-probe-pid901-n1-1"
+	list := fakeServer(foreign, empty, noPID, deadBridge, deadRecipe)
+	kill, killed := recordingTmuxKiller()
+
+	rep := ReapOrphanSessions(context.Background(), list, aliveSet(), kill)
+
+	if rep.SkippedForeign != 2 {
+		t.Fatalf("SkippedForeign=%d, want 2 (foreign + empty)", rep.SkippedForeign)
+	}
+	if rep.SkippedUnparseable != 1 {
+		t.Fatalf("SkippedUnparseable=%d, want 1 (a session with no pid token)", rep.SkippedUnparseable)
+	}
+	if len(*killed) != 2 {
+		t.Fatalf("killed=%v, want exactly the 2 dead evolve sessions", *killed)
+	}
+	for _, s := range *killed {
+		if s == foreign || s == empty || s == noPID {
+			t.Fatalf("killed an unsafe session %q — safety gate broken", s)
+		}
+	}
+}
+
+func TestReapOrphans_KillErrorContinues(t *testing.T) {
+	t.Parallel()
+	const bad = "evolve-bridge-c1-build-pid111-n1-1"
+	const good = "evolve-bridge-c1-audit-pid222-n1-2"
+	list := fakeServer(bad, good)
+	var killed []string
+	kill := func(_ context.Context, s string) error {
+		if s == bad {
+			return errors.New("tmux boom")
+		}
+		killed = append(killed, s)
+		return nil
+	}
+
+	rep := ReapOrphanSessions(context.Background(), list, aliveSet(), kill)
+
+	if len(rep.Errors) != 1 {
+		t.Fatalf("Errors=%v, want 1", rep.Errors)
+	}
+	if len(killed) != 1 || killed[0] != good {
+		t.Fatalf("killed=%v, want the good session despite the bad one erroring", killed)
+	}
+	if len(rep.Killed) != 1 || rep.Killed[0] != good {
+		t.Fatalf("rep.Killed=%v, want only the successfully-killed session", rep.Killed)
+	}
+}
+
+func TestReapOrphans_ListErrorIsSafe(t *testing.T) {
+	t.Parallel()
+	list := func(_ context.Context) ([]string, error) { return nil, errors.New("no server") }
+	kill, killed := recordingTmuxKiller()
+
+	rep := ReapOrphanSessions(context.Background(), list, aliveSet(), kill)
+
+	if len(*killed) != 0 {
+		t.Fatalf("killed=%v on list error, want none", *killed)
+	}
+	if len(rep.Errors) != 1 {
+		t.Fatalf("Errors=%v, want 1 list error", rep.Errors)
+	}
+}

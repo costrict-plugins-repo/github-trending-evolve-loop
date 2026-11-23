@@ -1,0 +1,654 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/gittest"
+	"github.com/mickeyyaya/evolve-loop/go/internal/stelint"
+)
+
+const steFixtureStandard = "# The standard\n\n## " + stelint.WordTableHeading + "\n\n| Do not write | Write |\n|---|---|\n| utilize | use |\n| via | through |\n"
+
+func writeSteFiles(t *testing.T, root string, files map[string]string) {
+	t.Helper()
+	for path, body := range files {
+		full := filepath.Join(root, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func steFixtureRoot(t *testing.T, files map[string]string) string {
+	t.Helper()
+	root := t.TempDir()
+	writeSteFiles(t, root, map[string]string{stelint.StandardPath: steFixtureStandard})
+	writeSteFiles(t, root, files)
+	return root
+}
+
+func runDocsCLI(args ...string) (int, string, string) {
+	var stdout, stderr bytes.Buffer
+	code := dispatch(append([]string{"docs"}, args...), nil, &stdout, &stderr)
+	return code, stdout.String(), stderr.String()
+}
+
+func TestDocs_ListsItsVerbs(t *testing.T) {
+	t.Parallel()
+	for _, args := range [][]string{nil, {"--help"}, {"-h"}, {"help"}} {
+		code, stdout, _ := runDocsCLI(args...)
+		if code != 0 || !strings.Contains(stdout, "ste-lint") || !strings.Contains(stdout, "--strict") {
+			t.Errorf("evolve docs %v: code %d, stdout %q; want the verb list", args, code, stdout)
+		}
+	}
+}
+
+func TestDocs_AnUnknownVerbIsAUsageError(t *testing.T) {
+	t.Parallel()
+	code, _, stderr := runDocsCLI("nope")
+	if code != exitUsage || !strings.Contains(stderr, `"nope"`) || !strings.Contains(stderr, "ste-lint") {
+		t.Fatalf("code %d, stderr %q; want %d naming the verb and listing ste-lint", code, stderr, exitUsage)
+	}
+}
+
+func TestDocsSteLint_BadFlagsExitTen(t *testing.T) {
+	t.Parallel()
+	for name, args := range map[string][]string{
+		"an unknown flag":           {"--bogus"},
+		"--changed with no value":   {"--changed"},
+		"--changed with a flag":     {"--changed", "--json"},
+		"--changed twice":           {"--changed", "a", "--changed", "b"},
+		"--changed with paths":      {"--changed", "HEAD", "docs/a.md"},
+		"a flag with a stray value": {"--json=yes"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			code, _, stderr := runDocsCLI(append([]string{"ste-lint"}, args...)...)
+			if code != exitUsage || !strings.Contains(stderr, "usage: evolve docs ste-lint") {
+				t.Fatalf("code %d, stderr %q; want %d with the usage", code, stderr, exitUsage)
+			}
+		})
+	}
+}
+
+func TestDocsSteLint_TheDefaultScopeWarnsAndExitsZero(t *testing.T) {
+	t.Parallel()
+	root := steFixtureRoot(t, map[string]string{
+		"docs/a.md":   "Text.\n\nWe utilize it.\n",
+		"README.md":   "Go via it.\n",
+		"CLAUDE.md":   "Clean text.\n",
+		"other/b.md":  "We utilize it.\n",
+		"docs/x.txt":  "We utilize it.\n",
+		"skills/s.md": "We utilize it.\n",
+	})
+
+	code, stdout, stderr := runDocsCLI("ste-lint", "--project-root", root)
+
+	want := "README.md:1 STE-WORD replace \"via\" with \"through\"\n" +
+		"docs/a.md:3 STE-WORD replace \"utilize\" with \"use\"\n" +
+		"ste-lint: 2 finding(s) in 2 file(s); 4 file(s) checked\n"
+	if code != 0 || stdout != want {
+		t.Fatalf("code %d, stdout:\n%s\nwant:\n%s\nstderr: %s", code, stdout, want, stderr)
+	}
+}
+
+func TestDocsSteLint_StrictExitsOneOnlyWithFindings(t *testing.T) {
+	t.Parallel()
+	dirty := steFixtureRoot(t, map[string]string{"docs/a.md": "We utilize it.\n"})
+	clean := steFixtureRoot(t, map[string]string{"docs/a.md": "Clean text.\n"})
+
+	if code, _, _ := runDocsCLI("ste-lint", "--strict", "--project-root", dirty); code != 1 {
+		t.Errorf("--strict with findings: code %d, want 1", code)
+	}
+	if code, stdout, _ := runDocsCLI("ste-lint", "--strict", "--project-root", clean); code != 0 || !strings.Contains(stdout, "ste-lint: 0 finding(s) in 0 file(s); 2 file(s) checked") {
+		t.Errorf("--strict when clean: code %d, stdout %q, want 0", code, stdout)
+	}
+	if code, _, _ := runDocsCLI("ste-lint", "--project-root", dirty); code != 0 {
+		t.Errorf("without --strict: code %d, want 0", code)
+	}
+}
+
+type decodedSteReport struct {
+	FilesChecked      int             `json:"files_checked"`
+	FilesWithFindings int             `json:"files_with_findings"`
+	FindingCount      int             `json:"finding_count"`
+	ByRule            map[string]int  `json:"by_rule"`
+	Findings          []decodedSteRow `json:"findings"`
+	Skipped           []decodedSteRow `json:"skipped"`
+}
+
+type decodedSteRow struct {
+	Path    string `json:"path"`
+	Line    int    `json:"line"`
+	Rule    string `json:"rule"`
+	Message string `json:"message"`
+	Excerpt string `json:"excerpt"`
+}
+
+func TestDocsSteLint_JSONShape(t *testing.T) {
+	t.Parallel()
+	root := steFixtureRoot(t, map[string]string{
+		"docs/a.md":   "We utilize it.\n\n" + strings.Repeat("word ", 30) + "end.\n",
+		"docs/gen.md": "<!-- Code generated by a tool. DO NOT EDIT. -->\nWe utilize it.\n",
+	})
+
+	code, stdout, stderr := runDocsCLI("ste-lint", "--json", "--project-root", root)
+
+	var got decodedSteReport
+	if err := json.Unmarshal(oneEnvelope(t, stdout).Data, &got); err != nil || code != 0 {
+		t.Fatalf("code %d, decode %v, stdout %q, stderr %q", code, err, stdout, stderr)
+	}
+	if got.FilesChecked != 3 || got.FilesWithFindings != 1 || got.FindingCount != 2 {
+		t.Errorf("counts = %+v, want 3 checked, 1 with findings, 2 findings", got)
+	}
+	if !reflect.DeepEqual(got.ByRule, map[string]int{stelint.RuleWord: 1, stelint.RuleSentence: 1}) {
+		t.Errorf("by_rule = %v", got.ByRule)
+	}
+	want := decodedSteRow{Path: "docs/a.md", Line: 1, Rule: stelint.RuleWord, Message: `replace "utilize" with "use"`, Excerpt: "utilize"}
+	if len(got.Findings) != 2 || got.Findings[0] != want || got.Findings[1].Line != 3 || got.Findings[1].Rule != stelint.RuleSentence {
+		t.Errorf("findings = %+v, want %+v first", got.Findings, want)
+	}
+	if len(got.Skipped) != 1 || got.Skipped[0].Path != "docs/gen.md" || got.Skipped[0].Rule != stelint.RuleSkippedGenerated {
+		t.Errorf("skipped = %+v, want the generated file", got.Skipped)
+	}
+}
+
+func TestDocsSteLint_AnEmptyResultIsEmptyJSONLists(t *testing.T) {
+	t.Parallel()
+	root := steFixtureRoot(t, map[string]string{"docs/a.md": "Clean text.\n"})
+
+	_, stdout, _ := runDocsCLI("ste-lint", "--json", "--project-root", root)
+
+	data := string(oneEnvelope(t, stdout).Data)
+	if !strings.Contains(data, `"findings":[]`) || !strings.Contains(data, `"skipped":[]`) || !strings.Contains(data, `"by_rule":{}`) {
+		t.Fatalf("data %q must carry empty lists, not null", data)
+	}
+}
+
+func TestDocsSteLint_AnUnreadableStandardExitsTwo(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	writeSteFiles(t, root, map[string]string{"docs/a.md": "Text.\n"})
+
+	code, _, stderr := runDocsCLI("ste-lint", "--project-root", root)
+
+	if code != exitIO || !strings.Contains(stderr, stelint.StandardPath) {
+		t.Fatalf("code %d, stderr %q; want %d naming the standard", code, stderr, exitIO)
+	}
+}
+
+func TestDocsSteLint_AnUnreadableFileExitsTwoAfterTheOthers(t *testing.T) {
+	t.Parallel()
+	root := steFixtureRoot(t, map[string]string{"docs/a.md": "We utilize it.\n", "go/internal/p/bad.go": "package p\nfunc {"})
+
+	code, stdout, stderr := runDocsCLI("ste-lint", "--project-root", root, filepath.Join(root, "docs", "gone.md"), filepath.Join(root, "docs", "a.md"))
+	goCode, _, goStderr := runDocsCLI("ste-lint", "--go", "--project-root", root)
+
+	if code != exitIO || !strings.Contains(stderr, "gone.md") || !strings.Contains(stdout, "docs/a.md:1 STE-WORD") {
+		t.Errorf("code %d, stdout %q, stderr %q; want %d, the missing file named and the other file checked", code, stdout, stderr, exitIO)
+	}
+	if goCode != exitIO || !strings.Contains(goStderr, "bad.go") {
+		t.Errorf("go mode: code %d, stderr %q; want %d naming the unparsable file", goCode, goStderr, exitIO)
+	}
+}
+
+func TestDocsSteLint_ExplicitPathsTakeFilesAndDirectories(t *testing.T) {
+	t.Parallel()
+	root := steFixtureRoot(t, map[string]string{
+		"notes/a.md":     "We utilize it.\n",
+		"notes/sub/b.md": "Go via it.\n",
+		"notes/c.txt":    "We utilize it.\n",
+		"other/d.txt":    "Go via it.\n",
+		"docs/e.md":      "We utilize it.\n",
+	})
+
+	code, stdout, _ := runDocsCLI("ste-lint", "--project-root", root, filepath.Join(root, "notes"), filepath.Join(root, "other", "d.txt"))
+
+	want := "notes/a.md:1 STE-WORD replace \"utilize\" with \"use\"\n" +
+		"notes/sub/b.md:1 STE-WORD replace \"via\" with \"through\"\n" +
+		"other/d.txt:1 STE-WORD replace \"via\" with \"through\"\n" +
+		"ste-lint: 3 finding(s) in 3 file(s); 3 file(s) checked\n"
+	if code != 0 || stdout != want {
+		t.Fatalf("code %d, stdout:\n%s\nwant:\n%s", code, stdout, want)
+	}
+}
+
+func TestDocsSteLint_ChangedChecksTheChangedDocsInScope(t *testing.T) {
+	t.Parallel()
+	repo := gittest.Fixture(t)
+	writeSteFiles(t, repo.Dir, map[string]string{stelint.StandardPath: steFixtureStandard, "docs/old.md": "We utilize it.\n", "README.md": "Clean.\n"})
+	repo.Git("add", "-A")
+	repo.Git("commit", "-q", "-m", "base")
+	base := repo.Git("rev-parse", "HEAD")
+	writeSteFiles(t, repo.Dir, map[string]string{"docs/new.md": "We utilize it.\n"})
+	repo.Git("add", "-A")
+	repo.Git("commit", "-q", "-m", "new doc")
+	writeSteFiles(t, repo.Dir, map[string]string{"README.md": "Go via it.\n", "docs/draft.md": "Go via it.\n", "docs/my draft.md": "Go via it.\n", "other/x.md": "We utilize it.\n"})
+
+	code, stdout, stderr := runDocsCLI("ste-lint", "--changed", base, "--project-root", repo.Dir)
+
+	want := "README.md:1 STE-WORD replace \"via\" with \"through\"\n" +
+		"docs/draft.md:1 STE-WORD replace \"via\" with \"through\"\n" +
+		"docs/my draft.md:1 STE-WORD replace \"via\" with \"through\"\n" +
+		"docs/new.md:1 STE-WORD replace \"utilize\" with \"use\"\n" +
+		"ste-lint: 4 finding(s) in 4 file(s); 4 file(s) checked\n"
+	if code != 0 || stdout != want {
+		t.Fatalf("code %d, stdout:\n%s\nwant:\n%s\nstderr: %s", code, stdout, want, stderr)
+	}
+}
+
+func TestDocsSteLint_ChangedWithAnUnknownRefExitsTwo(t *testing.T) {
+	t.Parallel()
+	repo := gittest.Fixture(t)
+	writeSteFiles(t, repo.Dir, map[string]string{stelint.StandardPath: steFixtureStandard})
+	repo.Git("add", "-A")
+	repo.Git("commit", "-q", "-m", "base")
+
+	code, _, stderr := runDocsCLI("ste-lint", "--changed", "no-such-ref", "--project-root", repo.Dir)
+
+	if code != exitIO || !strings.Contains(stderr, "no-such-ref") {
+		t.Fatalf("code %d, stderr %q; want %d naming the ref", code, stderr, exitIO)
+	}
+}
+
+func TestDocsSteLint_GoModeChecksProductionGo(t *testing.T) {
+	t.Parallel()
+	src := "package p\n\nimport \"errors\"\n\nvar e = errors.New(\"we utilize it\")\n"
+	root := steFixtureRoot(t, map[string]string{
+		"go/internal/p/a.go":          src,
+		"go/internal/p/a_test.go":     src,
+		"go/acs/x/a.go":               src,
+		"go/internal/p/testdata/t.go": src,
+		"go/internal/p/README.md":     "We utilize it.\n",
+		"docs/a.md":                   "We utilize it.\n",
+		"go/internal/p/gen.go":        "// Code generated by a tool. DO NOT EDIT.\n\n" + src,
+	})
+
+	code, stdout, _ := runDocsCLI("ste-lint", "--go", "--project-root", root)
+
+	want := "go/internal/p/a.go:5 STE-WORD replace \"utilize\" with \"use\"\n" +
+		"go/internal/p/gen.go:1 STE-SKIPPED-GENERATED a generator writes this file; the lint does not check it\n" +
+		"ste-lint: 1 finding(s) in 1 file(s); 2 file(s) checked\n"
+	if code != 0 || stdout != want {
+		t.Fatalf("code %d, stdout:\n%s\nwant:\n%s", code, stdout, want)
+	}
+}
+
+func TestDocsSteLint_FindsTheStandardAtTheRepositoryRootFromASubdirectory(t *testing.T) {
+	repo := gittest.Fixture(t)
+	writeSteFiles(t, repo.Dir, map[string]string{
+		stelint.StandardPath:     steFixtureStandard,
+		"docs/a.md":              "We utilize it.\n",
+		"go/internal/p/p.go":     "package p\n",
+		"go/internal/p/notes.md": "We utilize it.\n",
+	})
+	repo.Git("add", "-A")
+	repo.Git("commit", "-q", "-m", "base")
+	t.Setenv("EVOLVE_PROJECT_ROOT", "")
+	t.Setenv("EVOLVE_WORKTREE_ROOT", "")
+	want := "docs/a.md:1 STE-WORD replace \"utilize\" with \"use\"\nste-lint: 1 finding(s) in 1 file(s); 2 file(s) checked\n"
+	for _, sub := range []string{"go", filepath.Join("go", "internal", "p")} {
+		t.Run(filepath.ToSlash(sub), func(t *testing.T) {
+			chdirForTest(t, filepath.Join(repo.Dir, sub))
+
+			code, stdout, stderr := runDocsCLI("ste-lint")
+
+			if code != 0 || stdout != want {
+				t.Fatalf("from %s: code %d, stdout %q, stderr %q; want %q", sub, code, stdout, stderr, want)
+			}
+		})
+	}
+}
+
+func TestDocsSteLint_AnEnvironmentRootWinsOverTheGitRoot(t *testing.T) {
+	repo := gittest.Fixture(t)
+	writeSteFiles(t, repo.Dir, map[string]string{stelint.StandardPath: steFixtureStandard, "docs/a.md": "We utilize it.\n"})
+	other := steFixtureRoot(t, map[string]string{"docs/b.md": "Go via it.\n"})
+	chdirForTest(t, repo.Dir)
+	t.Setenv("EVOLVE_PROJECT_ROOT", "")
+	t.Setenv("EVOLVE_WORKTREE_ROOT", other)
+
+	code, stdout, _ := runDocsCLI("ste-lint")
+
+	if code != 0 || !strings.HasPrefix(stdout, "docs/b.md:1 STE-WORD") {
+		t.Fatalf("code %d, stdout %q; want the EVOLVE_WORKTREE_ROOT tree checked", code, stdout)
+	}
+
+	explicit := steFixtureRoot(t, map[string]string{"docs/c.md": "We utilize it.\n"})
+	code, stdout, _ = runDocsCLI("ste-lint", "--project-root", explicit)
+
+	if code != 0 || !strings.HasPrefix(stdout, "docs/c.md:1 STE-WORD") {
+		t.Fatalf("code %d, stdout %q; want the --project-root tree checked over EVOLVE_WORKTREE_ROOT", code, stdout)
+	}
+}
+
+func TestDocsSteLint_ChangedFromALinkedWorktreeChecksTheWorktreeAndNotTheProjectRoot(t *testing.T) {
+	repo := gittest.Fixture(t)
+	writeSteFiles(t, repo.Dir, map[string]string{stelint.StandardPath: steFixtureStandard, "docs/a.md": "Clean.\n"})
+	repo.Git("add", "-A")
+	repo.Git("commit", "-q", "-m", "base")
+	base := repo.Git("rev-parse", "HEAD")
+	worktree := filepath.Join(t.TempDir(), "cycle")
+	repo.Git("worktree", "add", "-q", "-b", "cycle", worktree, base)
+	writeSteFiles(t, worktree, map[string]string{"docs/a.md": "We utilize it.\n"})
+	chdirForTest(t, filepath.Join(worktree, "docs"))
+	t.Setenv("EVOLVE_PROJECT_ROOT", repo.Dir)
+	t.Setenv("EVOLVE_WORKTREE_ROOT", "")
+
+	code, stdout, stderr := runDocsCLI("ste-lint", "--changed", base)
+
+	want := "docs/a.md:1 STE-WORD replace \"utilize\" with \"use\"\nste-lint: 1 finding(s) in 1 file(s); 1 file(s) checked\n"
+	if code != 0 || stdout != want {
+		t.Fatalf("code %d, stdout %q, stderr %q; want the worktree doc checked: %q", code, stdout, stderr, want)
+	}
+}
+
+func TestDocsSteLint_OutsideAGitTreeTheProjectRootEnvironmentIsTheRoot(t *testing.T) {
+	dir := steFixtureRoot(t, map[string]string{"docs/a.md": "Clean.\n"})
+	project := steFixtureRoot(t, map[string]string{"docs/b.md": "Go via it.\n"})
+	chdirForTest(t, dir)
+	relProject, err := filepath.Rel(dir, project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("EVOLVE_PROJECT_ROOT", relProject)
+	t.Setenv("EVOLVE_WORKTREE_ROOT", "")
+	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(dir))
+
+	code, stdout, stderr := runDocsCLI("ste-lint")
+
+	if code != 0 || !strings.HasPrefix(stdout, "docs/b.md:1 STE-WORD") {
+		t.Fatalf("code %d, stdout %q, stderr %q; want the EVOLVE_PROJECT_ROOT tree checked", code, stdout, stderr)
+	}
+}
+
+func TestDocsSteLint_OutsideAGitTreeWithoutARootIsAnError(t *testing.T) {
+	dir := steFixtureRoot(t, map[string]string{"docs/a.md": "We utilize it.\n"})
+	chdirForTest(t, dir)
+	t.Setenv("EVOLVE_PROJECT_ROOT", "")
+	t.Setenv("EVOLVE_WORKTREE_ROOT", "")
+	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(dir))
+
+	code, _, stderr := runDocsCLI("ste-lint")
+
+	if code != exitIO || !strings.Contains(stderr, "--project-root") {
+		t.Fatalf("code %d, stderr %q; want %d asking for --project-root", code, stderr, exitIO)
+	}
+}
+
+func TestDocsSteLint_ChangedSkipsADeletedDoc(t *testing.T) {
+	t.Parallel()
+	repo := gittest.Fixture(t)
+	writeSteFiles(t, repo.Dir, map[string]string{stelint.StandardPath: steFixtureStandard, "docs/old.md": "We utilize it.\n"})
+	repo.Git("add", "-A")
+	repo.Git("commit", "-q", "-m", "base")
+	base := repo.Git("rev-parse", "HEAD")
+	repo.Git("rm", "-q", "docs/old.md")
+
+	code, stdout, stderr := runDocsCLI("ste-lint", "--changed", base, "--project-root", repo.Dir)
+
+	if code != 0 || !strings.Contains(stdout, "0 file(s) checked") {
+		t.Fatalf("code %d, stdout %q, stderr %q; want exit 0 and no file checked", code, stdout, stderr)
+	}
+}
+
+func TestDocsSteLint_ANamedDotDirectoryIsWalked(t *testing.T) {
+	t.Parallel()
+	root := steFixtureRoot(t, map[string]string{".notes/a.md": "We utilize it.\n"})
+
+	code, stdout, _ := runDocsCLI("ste-lint", "--project-root", root, filepath.Join(root, ".notes"))
+
+	if code != 0 || !strings.Contains(stdout, ".notes/a.md:1 STE-WORD") {
+		t.Fatalf("code %d, stdout %q; want the named directory checked", code, stdout)
+	}
+}
+
+func TestDocsSteLint_ChangedKeepsANonASCIIPath(t *testing.T) {
+	t.Parallel()
+	repo := gittest.Fixture(t)
+	writeSteFiles(t, repo.Dir, map[string]string{stelint.StandardPath: steFixtureStandard})
+	repo.Git("add", "-A")
+	repo.Git("commit", "-q", "-m", "base")
+	base := repo.Git("rev-parse", "HEAD")
+	writeSteFiles(t, repo.Dir, map[string]string{"docs/café.md": "We utilize it.\n"})
+
+	code, stdout, stderr := runDocsCLI("ste-lint", "--changed", base, "--project-root", repo.Dir)
+
+	if code != 0 || !strings.Contains(stdout, "docs/café.md:1 STE-WORD") {
+		t.Fatalf("code %d, stdout %q, stderr %q; want the non-ASCII doc checked", code, stdout, stderr)
+	}
+}
+
+func TestDocs_TheVerbListCarriesTheSteLintUsage(t *testing.T) {
+	t.Parallel()
+	_, stdout, _ := runDocsCLI()
+	if !strings.Contains(stdout, strings.TrimPrefix(steLintUsage, "usage: evolve ")) {
+		t.Fatalf("the verb list %q does not carry the ste-lint usage %q", stdout, steLintUsage)
+	}
+}
+
+func TestDocsSteLint_HelpPrintsTheUsageBeforeItReadsTheRoot(t *testing.T) {
+	t.Parallel()
+	for _, flag := range []string{"--help", "-h"} {
+		t.Run(flag, func(t *testing.T) {
+			code, stdout, stderr := runDocsCLI("ste-lint", flag, "--project-root", filepath.Join(t.TempDir(), "missing"))
+
+			if code != 0 || stdout != steLintUsage+"\n" || stderr != "" {
+				t.Fatalf("code %d, stdout %q, stderr %q; want 0 and only the usage", code, stdout, stderr)
+			}
+		})
+	}
+}
+
+func TestDocsSteLint_AReportWriteFailureExitsTwo(t *testing.T) {
+	t.Parallel()
+	root := steFixtureRoot(t, map[string]string{"docs/a.md": "We utilize it.\n"})
+	for name, extra := range map[string][]string{"text": nil, "json": {"--json"}} {
+		t.Run(name, func(t *testing.T) {
+			var stderr bytes.Buffer
+
+			code := runSteLint(append([]string{"--project-root", root}, extra...), &failingWriter{}, &stderr)
+
+			if code != exitIO || stderr.String() != steLintPrefix+"broken pipe\n" {
+				t.Fatalf("code %d, stderr %q; want %d naming the write error", code, stderr.String(), exitIO)
+			}
+		})
+	}
+}
+
+func TestSteLintReport_WriteJSONIsTheIndentedReportAndANewline(t *testing.T) {
+	t.Parallel()
+	r := steLintReport{ByRule: map[string]int{stelint.RuleWord: 1}, Skipped: []steLintRow{}}
+	r.add("docs/<a>&b.md", []stelint.Finding{{Line: 2, Rule: stelint.RuleWord, Message: `replace "x" with "y"`, Excerpt: "x"}})
+	want, err := json.MarshalIndent(r, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+
+	if err := r.writeJSON(&out); err != nil {
+		t.Fatalf("writeJSON: %v", err)
+	}
+
+	if out.String() != string(want)+"\n" {
+		t.Fatalf("writeJSON =\n%s\nwant\n%s", out.String(), want)
+	}
+	if !strings.Contains(out.String(), `"path": "docs/\u003ca\u003e\u0026b.md"`) || strings.Contains(out.String(), `"rows"`) {
+		t.Errorf("the JSON must escape the path and hide the text rows:\n%s", out.String())
+	}
+}
+
+func TestScopeSteTargets_AMissingRootIsAnError(t *testing.T) {
+	t.Parallel()
+	_, err := scopeSteTargets(filepath.Join(t.TempDir(), "missing"), steDocsMode)
+
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("err = %v, want fs.ErrNotExist", err)
+	}
+}
+
+func TestScopeSteTargets_AMissingScopeDirectoryLeavesTheRootFiles(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	writeSteFiles(t, root, map[string]string{"README.md": "x\n", "main.go": "package main\n", "go.mod": "module m\n"})
+
+	docs, docsErr := scopeSteTargets(root, steDocsMode)
+	goFiles, goErr := scopeSteTargets(root, steGoMode)
+
+	if docsErr != nil || !reflect.DeepEqual(docs, []steTarget{{abs: filepath.Join(root, "README.md"), display: "README.md"}}) {
+		t.Errorf("docs = %+v, %v; want README.md only", docs, docsErr)
+	}
+	if goErr != nil || len(goFiles) != 0 {
+		t.Errorf("go = %+v, %v; want no target outside go/", goFiles, goErr)
+	}
+}
+
+func unreadableDir(t *testing.T, dir string) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("root reads every directory")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+}
+
+func TestDocsSteLint_AnUnreadableDirectoryExitsTwo(t *testing.T) {
+	t.Parallel()
+	root := steFixtureRoot(t, map[string]string{"docs/a.md": "We utilize it.\n", "notes/b.md": "Go via it.\n"})
+	unreadableDir(t, filepath.Join(root, "docs", "locked"))
+	unreadableDir(t, filepath.Join(root, "notes", "locked"))
+
+	scopeCode, scopeOut, scopeErr := runDocsCLI("ste-lint", "--project-root", root)
+	pathCode, pathOut, pathErr := runDocsCLI("ste-lint", "--project-root", root, filepath.Join(root, "notes"))
+
+	if scopeCode != exitIO || scopeOut != "" || !strings.Contains(scopeErr, "locked") || !strings.Contains(scopeErr, "permission denied") {
+		t.Errorf("scope: code %d, stdout %q, stderr %q; want %d naming the locked directory", scopeCode, scopeOut, scopeErr, exitIO)
+	}
+	if pathCode != exitIO || pathOut != "" || !strings.Contains(pathErr, "locked") || !strings.Contains(pathErr, "permission denied") {
+		t.Errorf("path: code %d, stdout %q, stderr %q; want %d naming the locked directory", pathCode, pathOut, pathErr, exitIO)
+	}
+}
+
+func TestExplicitSteTargets_AnUnresolvablePathIsAnError(t *testing.T) {
+	cwdGone := errors.New("getwd: no such file or directory")
+	saved := steAbs
+	steAbs = func(string) (string, error) { return "", cwdGone }
+	t.Cleanup(func() { steAbs = saved })
+
+	got, err := explicitSteTargets(t.TempDir(), []string{"docs/a.md"}, steDocsMode)
+
+	if !errors.Is(err, cwdGone) || got != nil {
+		t.Fatalf("targets %+v, err %v; want no targets and the resolve error", got, err)
+	}
+}
+
+func TestExplicitSteTargets_FallsBackToProjectRootWhenNotInCwd(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	rel := filepath.Join("docs", "target.md")
+	target := filepath.Join(root, rel)
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("text"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := explicitSteTargets(root, []string{filepath.ToSlash(rel)}, steDocsMode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].abs != target || got[0].display != "docs/target.md" {
+		t.Fatalf("explicitSteTargets = %+v, want abs %q and display docs/target.md", got, target)
+	}
+}
+
+func TestSteDisplay_IsRootRelativeOnlyInsideTheRoot(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	outside := filepath.Join(filepath.Dir(root), "elsewhere", "a.md")
+	for name, tc := range map[string]struct{ abs, want string }{
+		"a file in the root":       {filepath.Join(root, "README.md"), "README.md"},
+		"a nested file":            {filepath.Join(root, "docs", "sub", "a.md"), "docs/sub/a.md"},
+		"a unicode name":           {filepath.Join(root, "docs", "café notes.md"), "docs/café notes.md"},
+		"the root itself":          {root, "."},
+		"a file outside the root":  {outside, filepath.ToSlash(outside)},
+		"a parent of the root":     {filepath.Dir(root), filepath.ToSlash(filepath.Dir(root))},
+		"a relative path is as is": {filepath.Join("docs", "a.md"), "docs/a.md"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := steDisplay(root, tc.abs); got != tc.want {
+				t.Fatalf("steDisplay(%q, %q) = %q, want %q", root, tc.abs, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSteDisplay_ARelativeRootIsResolvedFromTheWorkingDirectory(t *testing.T) {
+	t.Parallel()
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := steDisplay(".", filepath.Join(cwd, "docs", "a.md"))
+
+	if got != "docs/a.md" {
+		t.Fatalf("steDisplay(\".\", cwd/docs/a.md) = %q, want docs/a.md", got)
+	}
+}
+
+func TestDocsSteLint_AnExplicitFileOutsideTheRootShowsItsAbsolutePath(t *testing.T) {
+	t.Parallel()
+	root := steFixtureRoot(t, nil)
+	outside := filepath.Join(t.TempDir(), "x.md")
+	writeSteFiles(t, filepath.Dir(outside), map[string]string{"x.md": "We utilize it.\n"})
+
+	code, stdout, _ := runDocsCLI("ste-lint", "--project-root", root, outside)
+
+	if want := filepath.ToSlash(outside) + ":1 STE-WORD"; code != 0 || !strings.HasPrefix(stdout, want) {
+		t.Fatalf("code %d, stdout %q; want it to start with %q", code, stdout, want)
+	}
+}
+
+func TestSteDisplay_RootFilesNamedWithTwoLeadingDotsStayRelative(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	outside := filepath.Join(filepath.Dir(root), "outside.md")
+	for name, tc := range map[string]struct{ abs, want string }{
+		"dot-dot-prefixed root file": {filepath.Join(root, "..notes.md"), "..notes.md"},
+		"dot-dot-prefixed nested":    {filepath.Join(root, "docs", "..a.md"), "docs/..a.md"},
+		"plain root file":            {filepath.Join(root, "a.md"), "a.md"},
+		"file outside the root":      {outside, filepath.ToSlash(outside)},
+	} {
+		if got := steDisplay(root, tc.abs); got != tc.want {
+			t.Errorf("%s: steDisplay = %q, want %q", name, got, tc.want)
+		}
+	}
+}
+
+func TestDocsSteLint_ADotDotPrefixedRootFileShowsItsRelativePath(t *testing.T) {
+	t.Parallel()
+	root := steFixtureRoot(t, map[string]string{"..notes.md": "We utilize it.\n"})
+
+	code, stdout, _ := runDocsCLI("ste-lint", "--project-root", root, filepath.Join(root, "..notes.md"))
+
+	if code != 0 || !strings.HasPrefix(stdout, "..notes.md:1 STE-WORD") {
+		t.Fatalf("code %d, stdout %q; want a finding shown as ..notes.md:1", code, stdout)
+	}
+}

@@ -1,0 +1,24 @@
+{
+  "name": "security-scan",
+  "archetype": "evaluate",
+  "outputs": {
+    "signals": [
+      "security.severity_max"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Findings"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "build.files_touched",
+        "op": "gt",
+        "value": 0
+      }
+    ]
+  },
+  "after": "build"
+}

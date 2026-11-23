@@ -1,0 +1,30 @@
+{
+  "acceptance": [
+    "A red-first test through the real window rule: lock wait over the bound gives no widening, and lock wait under the bound gives the old result.",
+    "A shadow record shows the window would not widen while the lock wait of the last window is over its bound.",
+    "wave status shows the total lock wait of the wave.",
+    "Wave 186 (2026-11-21): HOST_VERIFY_LOCK_WAIT is written only to runs/cycle-N/signals.ndjson, so wave-level readers saw 0; it is also published to the global signal log. Waits were 280 to 701 s with one 900 s unserialized; the design evaluates a lock with K slots against one holder."
+  ],
+  "continuation": {
+    "worktree": "~/ai/claude/evolve-loop/runtime/.evolve/worktrees/cycle-cd3ae73e-2602",
+    "branch": "cycle-cd3ae73e-2602",
+    "snapshot_sha": "27b7d35f12166785aefb3e7a8d50332548972f84",
+    "base_sha": "1b3c402fc62975e2c5f4debbb03f822bbc0316bc",
+    "findings_path": "~/ai/claude/evolve-loop/runtime/.evolve/runs/cycle-2602/audit-fail-reason.json",
+    "cycle": 2602
+  },
+  "created_at": "2026-11-21T15:24:19Z",
+  "files": [
+    "go/internal/signalcenter/registry.go",
+    "go/internal/verifylock/observer.go",
+    "docs/architecture/packages/internal-verifylock.md"
+  ],
+  "fix": "Sum fields.wait_ms of the HOST_VERIFY_LOCK_WAIT signals of the last window. Add the sum as a pressure input of the window rule, with a bound in policy data. Do not widen the window while the sum is over its bound. Run it in shadow first and record the would-not-widen decisions.",
+  "id": "lock-wait-feeds-the-fleet-window",
+  "kind": "bug",
+  "origin": "console",
+  "priority_class": "performance",
+  "summary": "The host-adaptive window reads CPU and memory only. In wave 185 the host looked idle while 7 of 8 lanes waited at the host verification lock, so the window would add lanes. Each acquire now emits HOST_VERIFY_LOCK_WAIT with fields.wait_ms, source and outcome (plan docs/plans/verify-lock-holder-budget-2026-11.md), but nothing reads it.",
+  "title": "The host-adaptive fleet window reads the verification lock wait as a pressure input",
+  "weight": 0.7
+}

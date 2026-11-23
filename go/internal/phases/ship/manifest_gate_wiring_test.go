@@ -1,0 +1,76 @@
+package ship
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/config"
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+	"github.com/mickeyyaya/evolve-loop/go/internal/policy"
+)
+
+func noopRunner(ctx context.Context, name, cwd string, args, env []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+	return 0, nil
+}
+
+func TestShipOptions_ThreadsManifestGate(t *testing.T) {
+	t.Parallel()
+	req := core.PhaseRequest{
+		Cycle:       1064,
+		ProjectRoot: "/repo",
+		Workspace:   "/repo/.evolve/runs/cycle-1064",
+		RunID:       "run-abc",
+		Env:         map[string]string{"EVOLVE_PLUGIN_ROOT": "/plugin"},
+	}
+	for _, tc := range []struct{ name, gate, want string }{
+		{"enforce flows through", "enforce", "enforce"},
+		{"shadow flows through", "shadow", "shadow"},
+		{"unset stays empty (shadow)", "", ""},
+	} {
+		p := New(Config{Runner: noopRunner, PhaseIO: config.StageEnforce, ManifestGate: tc.gate})
+		opts := p.shipOptions(req, "evolve-cycle 1064")
+		if opts.ManifestGate != tc.want {
+			t.Errorf("%s: Options.ManifestGate = %q, want %q", tc.name, opts.ManifestGate, tc.want)
+		}
+		if opts.ProjectRoot != req.ProjectRoot || opts.WorkspacePath != req.Workspace ||
+			opts.RunID != req.RunID || opts.PluginRoot != "/plugin" ||
+			opts.CommitMessage != "evolve-cycle 1064" || opts.Class != ClassCycle ||
+			opts.PhaseIO != config.StageEnforce {
+			t.Errorf("%s: translation regressed: %+v", tc.name, opts)
+		}
+	}
+}
+
+func TestManifestGate_PolicyToBlockEndToEnd(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		policyRaw string
+		wantBlock bool
+	}{
+		{"enforce blocks", `{"gates":{"manifest_gate":"enforce"}}`, true},
+		{"default shadow does not block", `{}`, false},
+	} {
+		var pol policy.Policy
+		if err := json.Unmarshal([]byte(tc.policyRaw), &pol); err != nil {
+			t.Fatalf("%s: unmarshal policy: %v", tc.name, err)
+		}
+		resolved := pol.GatesConfig().ManifestGate
+
+		opts := manifestLeakOpts(t)
+		opts.ManifestGate = New(Config{Runner: noopRunner, ManifestGate: resolved}).
+			shipOptions(core.PhaseRequest{ProjectRoot: opts.ProjectRoot, Workspace: opts.WorkspacePath}, "msg").ManifestGate
+
+		err := reconcileManifest(context.Background(), opts, &RunResult{}, "wt", "main", "cycle")
+		if tc.wantBlock {
+			se, ok := core.AsShipError(err)
+			if !ok || se.Code != core.CodeManifestGate {
+				t.Errorf("%s: want a MANIFEST_GATE block from policy=%q, got err=%v", tc.name, resolved, err)
+			}
+		} else if err != nil {
+			t.Errorf("%s: policy=%q must not block, got %v", tc.name, resolved, err)
+		}
+	}
+}

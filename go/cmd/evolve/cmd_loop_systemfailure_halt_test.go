@@ -1,0 +1,128 @@
+package main
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/cyclestate"
+	"github.com/mickeyyaya/evolve-loop/go/internal/fleet"
+)
+
+func TestCycleRunExitCode_HaltsOnSystemFailureRegardlessOfVerdict(t *testing.T) {
+	t.Parallel()
+	halted := cyclestate.CycleResult{
+		FinalVerdict:  "PASS",
+		SystemFailure: &cyclestate.SystemFailureSignal{Category: "verdict-incoherence", Level: "system", Halt: true},
+	}
+	if got := cycleRunExitCode(halted); got != systemFailureHaltExitCode {
+		t.Errorf("cycleRunExitCode(SystemFailure.Halt=true, verdict=PASS) = %d, want %d", got, systemFailureHaltExitCode)
+	}
+
+	haltedFail := cyclestate.CycleResult{
+		FinalVerdict:  "FAIL",
+		SystemFailure: &cyclestate.SystemFailureSignal{Category: "verdict-incoherence", Level: "system", Halt: true},
+	}
+	if got := cycleRunExitCode(haltedFail); got != systemFailureHaltExitCode {
+		t.Errorf("cycleRunExitCode(SystemFailure.Halt=true, verdict=FAIL) = %d, want %d (halt takes priority)", got, systemFailureHaltExitCode)
+	}
+}
+
+func TestCycleRunExitCode_NoSystemFailure_FollowsOrdinaryVerdictMapping(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		res  cyclestate.CycleResult
+		want int
+	}{
+		{"nil-signal-fail", cyclestate.CycleResult{FinalVerdict: "FAIL"}, 2},
+		{"nil-signal-pass", cyclestate.CycleResult{FinalVerdict: "PASS"}, 0},
+		{"nil-signal-warn", cyclestate.CycleResult{FinalVerdict: "WARN"}, 0},
+		{"signal-present-not-halt", cyclestate.CycleResult{
+			FinalVerdict:  "FAIL",
+			SystemFailure: &cyclestate.SystemFailureSignal{Category: "infra-transient", Level: "system", Halt: false},
+		}, 2},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := cycleRunExitCode(c.res); got != c.want {
+				t.Errorf("cycleRunExitCode(%s) = %d, want %d (must be unchanged: existing rc=2/0 mapping)", c.name, got, c.want)
+			}
+		})
+	}
+}
+
+func TestHaltOnSystemFailure_WritesDossierAndP0AndReturnsHaltExitCode(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	evolveDir := filepath.Join(root, ".evolve")
+	if err := os.MkdirAll(evolveDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sf := &cyclestate.SystemFailureSignal{
+		Category: "verdict-incoherence",
+		Level:    "system",
+		Evidence: "recorded=FAIL but audit=PASS and acs=PASS",
+		Halt:     true,
+	}
+
+	got := haltOnSystemFailure(evolveDir, root, 956, filepath.Join(root, ".evolve/runs/cycle-956"), sf, os.Stderr, nil, systemFailureRule)
+	if got != systemFailureHaltExitCode {
+		t.Errorf("haltOnSystemFailure return = %d, want %d", got, systemFailureHaltExitCode)
+	}
+
+	escB, err := os.ReadFile(filepath.Join(evolveDir, "pipeline-escalation.json"))
+	if err != nil {
+		t.Fatalf("pipeline-escalation.json not written: %v", err)
+	}
+	var esc map[string]any
+	if err := json.Unmarshal(escB, &esc); err != nil {
+		t.Fatalf("escalation not valid JSON: %v", err)
+	}
+	if esc["category"] != "verdict-incoherence" {
+		t.Errorf("escalation category = %v, want verdict-incoherence", esc["category"])
+	}
+
+	inboxPath := filepath.Join(root, ".evolve", "inbox", "pipeline-defect-verdict-incoherence-cycle956.json")
+	if _, err := os.Stat(inboxPath); err != nil {
+		t.Errorf("P0 pipeline-repair inbox item not filed at %s: %v", inboxPath, err)
+	}
+}
+
+func TestAnyLaneHaltedForSystemFailure_DetectsHaltExitCodeAmongLanes(t *testing.T) {
+	t.Parallel()
+	results := []fleet.Result{
+		{Index: 0, ExitCode: 0},
+		{Index: 1, ExitCode: systemFailureHaltExitCode},
+		{Index: 2, ExitCode: 0},
+	}
+	if !anyLaneHaltedForSystemFailure(results) {
+		t.Error("anyLaneHaltedForSystemFailure = false, want true when one lane exits with the system-failure halt code")
+	}
+}
+
+func TestAnyLaneHaltedForSystemFailure_OrdinaryLaneFailuresDoNotHalt(t *testing.T) {
+	t.Parallel()
+	results := []fleet.Result{
+		{Index: 0, ExitCode: 2},
+		{Index: 1, ExitCode: 1},
+		{Index: 2, ExitCode: -1, Err: errTestLaneFailed},
+	}
+	if anyLaneHaltedForSystemFailure(results) {
+		t.Error("anyLaneHaltedForSystemFailure = true, want false — ordinary lane failures must not trigger a batch halt")
+	}
+}
+
+func TestAnyLaneHaltedForSystemFailure_EmptyResultsIsFalse(t *testing.T) {
+	t.Parallel()
+	if anyLaneHaltedForSystemFailure(nil) {
+		t.Error("anyLaneHaltedForSystemFailure(nil) = true, want false")
+	}
+}
+
+var errTestLaneFailed = &laneTestError{"simulated lane launch error"}
+
+type laneTestError struct{ msg string }
+
+func (e *laneTestError) Error() string { return e.msg }

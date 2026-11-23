@@ -1,0 +1,537 @@
+package router
+
+import (
+	"bytes"
+	"cmp"
+	"encoding/json"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/changedpkgs"
+	"github.com/mickeyyaya/evolve-loop/go/internal/phasecontract"
+)
+
+func Digest(workspace string, completed []string) (RoutingSignals, error) {
+	info, err := os.Stat(workspace)
+	if err != nil {
+		return RoutingSignals{}, fmt.Errorf("router digest: workspace: %w", err)
+	}
+	if !info.IsDir() {
+		return RoutingSignals{}, fmt.Errorf("router digest: workspace %s is not a directory", workspace)
+	}
+	var sig RoutingSignals
+	done := toSet(completed)
+	owners := signalOwners(completed)
+	stage := digestFlowStage(workspace)
+
+	if done["scout"] {
+		digestScout(workspace, &sig, owners, stage)
+	}
+	if done["triage"] {
+		digestTriagePhase(workspace, &sig, owners, stage)
+	}
+	if done["build"] {
+		digestBuildPhase(workspace, &sig, owners)
+	}
+	if done["audit"] {
+		digestAuditPhase(workspace, &sig, owners)
+	}
+	if done["ship"] {
+		sig.Ship.Class = ShipClassCycle
+	}
+	sig.RunDir.ArtifactBytes = runDirArtifactBytes(workspace, &sig.DigestDegraded)
+	for _, phase := range completed {
+		if !spineHandoffPhases[phase] {
+			sig.foldHandoffSignals(workspace, phase, owners)
+		}
+	}
+	for _, phase := range completed {
+		sig.foldFailureSentinel(workspace, phase)
+	}
+	return sig, nil
+}
+
+const (
+	ShipClassCycle     = "cycle"
+	failureClassSignal = "failure_class"
+	defectCountSignal  = "defect_count"
+)
+
+var spineHandoffPhases = map[string]bool{"scout": true, "triage": true, "build": true, "audit": true}
+
+func (s *RoutingSignals) foldHandoffSignals(workspace, phase string, owners map[string]bool) {
+	if raw, ok := readFirstTracked(workspace, &s.DigestDegraded, "handoff-"+phase+".json"); ok {
+		s.foldGeneric(phase, unwrapPayload(raw), owners)
+	}
+}
+
+func signalOwners(completed []string) map[string]bool {
+	owners := toSet(completed)
+	for phase := range spineHandoffPhases {
+		owners[phase] = true
+	}
+	for field := range typedFields {
+		if namespace, _, dotted := strings.Cut(field, "."); dotted {
+			owners[namespace] = true
+		}
+	}
+	return owners
+}
+
+func handoffMayWrite(phase, key string, owners map[string]bool) bool {
+	namespace, signal, _ := strings.Cut(key, ".")
+	if signal == failureClassSignal || signal == defectCountSignal {
+		return false
+	}
+	return namespace == phase || !owners[namespace]
+}
+
+func runDirArtifactBytes(workspace string, degraded *[]string) int64 {
+	var total int64
+	cleanWorkspace := filepath.Clean(workspace)
+	err := filepath.WalkDir(workspace, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || !d.Type().IsRegular() {
+			return err
+		}
+		if filepath.Clean(filepath.Dir(path)) != cleanWorkspace || !isReportArtifact(d.Name()) {
+			return nil
+		}
+		info, err := d.Info()
+		if err == nil {
+			total += info.Size()
+		}
+		return err
+	})
+	if err != nil {
+		*degraded = append(*degraded, "run_dir: artifact bytes: "+err.Error())
+	}
+	return total
+}
+
+func isReportArtifact(name string) bool {
+	return strings.HasSuffix(name, "-report.md") || (strings.HasPrefix(name, "handoff-") && strings.HasSuffix(name, ".json"))
+}
+
+func digestFlowStage(workspace string) phasecontract.FlowStage {
+	root, ok := projectRootFromWorkspace(workspace)
+	if !ok {
+		return phasecontract.FlowStageLegacy
+	}
+	return phasecontract.FlowStageAt(root, os.Stderr)
+}
+
+type ProseFallback struct {
+	Seat    string
+	Path    string
+	Stage   phasecontract.FlowStage
+	Refused bool
+}
+
+func (s *RoutingSignals) admitProse(seat, path string, stage phasecontract.FlowStage) bool {
+	refused := stage == phasecontract.FlowStageEnforce
+	s.ProseFallbacks = append(s.ProseFallbacks, ProseFallback{Seat: seat, Path: path, Stage: stage, Refused: refused})
+	if refused {
+		s.DigestDegraded = append(s.DigestDegraded, seat+": handoff absent, and the I-8 stage enforce refuses the report-prose fallback")
+	}
+	return !refused
+}
+
+func digestScout(workspace string, sig *RoutingSignals, owners map[string]bool, stage phasecontract.FlowStage) {
+	if raw, ok := readFirstTracked(workspace, &sig.DigestDegraded, "handoff-scout.json"); ok {
+		raw = unwrapPayload(raw)
+		sig.Scout = extractScout(raw)
+		sig.foldGeneric("scout", raw, owners)
+	} else {
+		sig.Scout = scoutFromReportFallback(workspace, sig, stage)
+	}
+}
+
+func digestTriagePhase(workspace string, sig *RoutingSignals, owners map[string]bool, stage phasecontract.FlowStage) {
+	if raw, ok := readFirstTracked(workspace, &sig.DigestDegraded, "handoff-triage.json"); ok {
+		raw = unwrapPayload(raw)
+		sig.Triage = extractTriage(raw)
+		sig.foldGeneric("triage", raw, owners)
+	} else {
+		sig.Triage = triageFromReportFallback(workspace, sig, stage)
+	}
+	if decision, ok := digestTriageDecision(workspace, &sig.DigestDegraded); ok {
+		sig.Triage.CommittedCount = decision.committedCount
+		sig.Triage.commitmentKnown = true
+		sig.Triage.UnifiedSize = decision.unifiedSize
+		sig.Triage.UnifiedMemberCount = decision.unifiedMemberCount
+	}
+}
+
+func digestBuildPhase(workspace string, sig *RoutingSignals, owners map[string]bool) {
+	if raw, ok := readFirstTracked(workspace, &sig.DigestDegraded, "handoff-build.json", "handoff-builder.json"); ok {
+		raw = unwrapPayload(raw)
+		sig.Build = extractBuild(raw)
+		sig.foldGeneric("build", raw, owners)
+	} else {
+		sig.Build = buildFromGitFallback(workspace, &sig.DigestDegraded)
+	}
+}
+
+func digestAuditPhase(workspace string, sig *RoutingSignals, owners map[string]bool) {
+	if raw, ok := readFirstTracked(workspace, &sig.DigestDegraded, "handoff-audit.json", "handoff-auditor.json"); ok {
+		raw = unwrapPayload(raw)
+		sig.Audit = extractAudit(raw)
+		sig.foldGeneric("audit", raw, owners)
+	} else {
+		sig.Audit = auditFromACSVerdictFallback(workspace, &sig.DigestDegraded)
+	}
+}
+
+type triageDecisionDigest struct {
+	committedCount     int
+	unifiedSize        string
+	unifiedMemberCount int
+}
+
+func digestTriageDecision(workspace string, degraded *[]string) (triageDecisionDigest, bool) {
+	raw, err := os.ReadFile(filepath.Join(workspace, "triage-decision.json"))
+	if os.IsNotExist(err) {
+		return triageDecisionDigest{}, false
+	}
+	if err != nil {
+		*degraded = append(*degraded, "triage: decision read: "+err.Error())
+		return triageDecisionDigest{}, false
+	}
+	var decision map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &decision); err != nil {
+		*degraded = append(*degraded, "triage: decision parse: "+err.Error())
+		return triageDecisionDigest{}, false
+	}
+	topN, ok := decision["top_n"]
+	if !ok {
+		return triageDecisionDigest{}, false
+	}
+	topN = bytes.TrimSpace(topN)
+	if len(topN) == 0 || topN[0] != '[' {
+		*degraded = append(*degraded, "triage: decision top_n must be an array")
+		return triageDecisionDigest{}, false
+	}
+	var tasks []json.RawMessage
+	if err := json.Unmarshal(topN, &tasks); err != nil {
+		*degraded = append(*degraded, "triage: decision top_n parse: "+err.Error())
+		return triageDecisionDigest{}, false
+	}
+	result := triageDecisionDigest{committedCount: len(tasks)}
+	if projection, ok := decision["unified_projection"]; ok {
+		var value struct {
+			Size        string `json:"size"`
+			MemberCount int    `json:"member_count"`
+		}
+		if err := json.Unmarshal(projection, &value); err != nil || (value.Size != "small" && value.Size != "large") || value.MemberCount < 2 {
+			*degraded = append(*degraded, "triage: invalid unified projection")
+		} else {
+			result.unifiedSize = value.Size
+			result.unifiedMemberCount = value.MemberCount
+		}
+	}
+	return result, true
+}
+
+func unwrapPayload(raw []byte) []byte {
+	var env struct {
+		Payload json.RawMessage `json:"payload"`
+	}
+	if err := json.Unmarshal(raw, &env); err == nil && len(env.Payload) > 0 {
+		return env.Payload
+	}
+	return raw
+}
+
+func (s *RoutingSignals) foldFailureSentinel(workspace, phase string) {
+	fb, ok := phasecontract.ReadFailureBlock(workspace, phase)
+	if !ok {
+		return
+	}
+	if s.Generic == nil {
+		s.Generic = make(map[string]any, 2)
+	}
+	s.Generic[phase+"."+failureClassSignal] = fb.Class
+	s.Generic[phase+"."+defectCountSignal] = float64(len(fb.Defects))
+}
+
+func (s *RoutingSignals) foldGeneric(phase string, raw []byte, owners map[string]bool) {
+	var doc struct {
+		Signals map[string]any `json:"signals"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil || len(doc.Signals) == 0 {
+		return
+	}
+	if s.Generic == nil {
+		s.Generic = make(map[string]any, len(doc.Signals))
+	}
+	for k, v := range doc.Signals {
+		if !strings.Contains(k, ".") {
+			k = phase + "." + k
+		}
+		if handoffMayWrite(phase, k, owners) {
+			s.Generic[k] = v
+		}
+	}
+}
+
+func toSet(xs []string) map[string]bool {
+	m := make(map[string]bool, len(xs))
+	for _, x := range xs {
+		m[x] = true
+	}
+	return m
+}
+
+func readFirstTracked(dir string, degraded *[]string, candidates ...string) ([]byte, bool) {
+	for _, name := range candidates {
+		raw, err := os.ReadFile(filepath.Join(dir, name))
+		if err == nil {
+			return raw, true
+		}
+		if !os.IsNotExist(err) {
+			*degraded = append(*degraded, name+": "+err.Error())
+		}
+	}
+	return nil, false
+}
+
+func buildFromGitFallback(workspace string, degraded *[]string) BuildSignals {
+	root, ok := projectRootFromWorkspace(workspace)
+	if !ok {
+		*degraded = append(*degraded, "build: workspace path not in <root>/.evolve/runs/cycle-<N> form, cannot derive git fallback")
+		return BuildSignals{}
+	}
+	pkgs, derivable := changedpkgs.FromGitChecked(root, "HEAD")
+	if !derivable {
+		*degraded = append(*degraded, "build: handoff absent and git-derived changed-package set is underivable (no repo / git failure)")
+		return BuildSignals{}
+	}
+	changedPackageCount := len(pkgs)
+	return BuildSignals{Present: true, FilesTouched: changedPackageCount}
+}
+
+func scoutFromReportFallback(workspace string, sig *RoutingSignals, stage phasecontract.FlowStage) ScoutSignals {
+	path := filepath.Join(workspace, phasecontract.ArtifactName("scout"))
+	md, present := readReportFallback(path, "scout", &sig.DigestDegraded)
+	if !present || !sig.admitProse("scout", path, stage) {
+		return ScoutSignals{}
+	}
+	return ScoutSignals{
+		Present:         true,
+		GoalType:        reportHeaderValue(md, HeaderGoalType),
+		DeliverableKind: NormalizeDeliverableKind(reportHeaderValue(md, HeaderDeliverableKind)),
+		ItemCount:       selectedTaskCount(md),
+	}
+}
+
+func selectedTaskCount(md string) int {
+	tasksHeadings := phasecontract.SelectedTasks.Accepted
+	inTasks, count := false, 0
+	for _, line := range strings.Split(md, "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(trimmed, "## "):
+			inTasks = slices.ContainsFunc(tasksHeadings, func(h string) bool { return strings.HasPrefix(trimmed, h) })
+		case inTasks && strings.HasPrefix(trimmed, "### "):
+			count++
+		}
+	}
+	return count
+}
+
+const (
+	HeaderGoalType        = "goal_type:"
+	HeaderDeliverableKind = "deliverable_kind:"
+	HeaderCycleSize       = "cycle_size_estimate:"
+)
+
+func readReportFallback(path, role string, degraded *[]string) (string, bool) {
+	raw, err := os.ReadFile(path)
+	switch {
+	case err == nil && len(raw) > 0:
+		return string(raw), true
+	case err == nil:
+		return "", false
+	case os.IsNotExist(err):
+		return "", false
+	default:
+		*degraded = append(*degraded, role+": report fallback read: "+err.Error())
+		return "", false
+	}
+}
+
+func triageFromReportFallback(workspace string, sig *RoutingSignals, stage phasecontract.FlowStage) TriageSignals {
+	path := filepath.Join(workspace, phasecontract.ArtifactName("triage"))
+	md, present := readReportFallback(path, "triage", &sig.DigestDegraded)
+	if !present || !sig.admitProse("triage", path, stage) {
+		return TriageSignals{}
+	}
+	return TriageSignals{
+		Present:         true,
+		CycleSize:       reportHeaderValue(md, HeaderCycleSize),
+		DeliverableKind: NormalizeDeliverableKind(reportHeaderValue(md, HeaderDeliverableKind)),
+	}
+}
+
+func reportHeaderValue(md, prefix string) string {
+	for _, line := range strings.Split(md, "\n") {
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), prefix); ok {
+			return strings.TrimSpace(rest)
+		}
+	}
+	return ""
+}
+
+func auditFromACSVerdictFallback(workspace string, degraded *[]string) AuditSignals {
+	raw, err := os.ReadFile(filepath.Join(workspace, "acs-verdict.json"))
+	if err != nil {
+		if !os.IsNotExist(err) {
+			*degraded = append(*degraded, "audit: acs-verdict fallback read: "+err.Error())
+		}
+		return AuditSignals{}
+	}
+	a := extractAudit(raw)
+	if !a.Present {
+		*degraded = append(*degraded, "audit: acs-verdict.json present but unparseable (fallback)")
+		return a
+	}
+	if a.Verdict == "" {
+		*degraded = append(*degraded, "audit: acs-verdict.json has no verdict field (schema drift?) — degraded, not clean")
+		return AuditSignals{}
+	}
+	return a
+}
+
+func projectRootFromWorkspace(workspace string) (string, bool) {
+	dir := filepath.Clean(workspace)
+	if !strings.HasPrefix(filepath.Base(dir), "cycle-") {
+		return "", false
+	}
+	runsDir := filepath.Dir(dir)
+	if filepath.Base(runsDir) != "runs" {
+		return "", false
+	}
+	evolveDir := filepath.Dir(runsDir)
+	if filepath.Base(evolveDir) != ".evolve" {
+		return "", false
+	}
+	return filepath.Dir(evolveDir), true
+}
+
+func extractScout(raw []byte) ScoutSignals {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &top); err != nil {
+		return ScoutSignals{}
+	}
+	s := ScoutSignals{Present: true}
+	_ = json.Unmarshal(top["cycle_size_estimate"], &s.CycleSizeEstimate)
+	_ = json.Unmarshal(top["goal_type"], &s.GoalType)
+	var kind string
+	_ = json.Unmarshal(top["deliverable_kind"], &kind)
+	s.DeliverableKind = NormalizeDeliverableKind(kind)
+	_ = json.Unmarshal(top["carryover_count"], &s.CarryoverCount)
+	_ = json.Unmarshal(top["backlog_size"], &s.BacklogSize)
+	_ = json.Unmarshal(top["run_dir.artifact_bytes"], &s.ArtifactBytes)
+	for k := range top {
+		if strings.HasPrefix(k, "item") && hasDigitAfterPrefix(k, "item") {
+			s.ItemCount++
+		}
+	}
+	return s
+}
+
+func hasDigitAfterPrefix(s, prefix string) bool {
+	if len(s) <= len(prefix) {
+		return false
+	}
+	c := s[len(prefix)]
+	return c >= '0' && c <= '9'
+}
+
+func extractTriage(raw []byte) TriageSignals {
+	var d struct {
+		CycleSize     string   `json:"cycle_size"`
+		ScoutEstimate string   `json:"cycle_size_estimate"`
+		PhaseSkip     []string `json:"phase_skip"`
+		Kind          string   `json:"deliverable_kind"`
+	}
+	if err := json.Unmarshal(raw, &d); err != nil {
+		return TriageSignals{}
+	}
+	return TriageSignals{CycleSize: cmp.Or(d.CycleSize, d.ScoutEstimate), PhaseSkip: d.PhaseSkip, DeliverableKind: NormalizeDeliverableKind(d.Kind), Present: true}
+}
+
+func extractBuild(raw []byte) BuildSignals {
+	var d struct {
+		Verdict   string `json:"verdict"`
+		DiffLOC   int    `json:"diff_loc"`
+		ACSResult struct {
+			Green      int `json:"green"`
+			Red        int `json:"red"`
+			Total      int `json:"total"`
+			ThisCycle  int `json:"this_cycle"`
+			Regression int `json:"regression"`
+		} `json:"acs_result"`
+		Thrusts []struct {
+			Severity      string   `json:"severity"`
+			FilesModified []string `json:"files_modified"`
+			FilesNew      []string `json:"files_new"`
+		} `json:"thrusts"`
+	}
+	if err := json.Unmarshal(raw, &d); err != nil {
+		return BuildSignals{}
+	}
+	b := BuildSignals{
+		Verdict:       d.Verdict,
+		ACSGreen:      d.ACSResult.Green,
+		ACSRed:        d.ACSResult.Red,
+		ACSTotal:      d.ACSResult.Total,
+		ACSThisCycle:  d.ACSResult.ThisCycle,
+		ACSRegression: d.ACSResult.Regression,
+		DiffLOC:       d.DiffLOC,
+		Present:       true,
+	}
+	files := map[string]bool{}
+	for _, th := range d.Thrusts {
+		if sev := ParseSeverity(th.Severity); sev > b.SeverityMax {
+			b.SeverityMax = sev
+		}
+		for _, f := range th.FilesModified {
+			files[f] = true
+		}
+		for _, f := range th.FilesNew {
+			files[f] = true
+		}
+	}
+	b.FilesTouched = len(files)
+	return b
+}
+
+func extractAudit(raw []byte) AuditSignals {
+	var d struct {
+		Verdict    string  `json:"verdict"`
+		Confidence float64 `json:"confidence"`
+		RedCount   int     `json:"red_count"`
+		Defects    []struct {
+			Severity string `json:"severity"`
+		} `json:"defects"`
+	}
+	if err := json.Unmarshal(raw, &d); err != nil {
+		return AuditSignals{}
+	}
+	a := AuditSignals{
+		Verdict:           d.Verdict,
+		Confidence:        d.Confidence,
+		RedCount:          d.RedCount,
+		DefectsBySeverity: map[Severity]int{},
+		Present:           true,
+	}
+	for _, df := range d.Defects {
+		a.DefectsBySeverity[ParseSeverity(df.Severity)]++
+	}
+	return a
+}

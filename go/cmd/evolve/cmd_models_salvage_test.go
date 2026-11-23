@@ -1,0 +1,119 @@
+package main
+
+import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func salvageNow() time.Time { return time.Date(2026, 8, 5, 23, 0, 0, 0, time.UTC) }
+
+func TestSalvageProbeDiagnostics_DurableBeforeTeardown(t *testing.T) {
+	t.Parallel()
+	scratch, evolveDir := t.TempDir(), t.TempDir()
+	writeFile := func(dir, name, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile(scratch, "escalation-report.json", `{"reason":"quota wall"}`)
+	writeFile(scratch, "model-classifier-launch-error.txt", "boom stderr")
+	writeFile(scratch, "llm-calls.ndjson", `{"call_id":"call-2","phase":"model-probe","cli":"codex","call":2}`+"\n")
+	writeFile(scratch, "model-classifier-artifact.txt", "not a diagnostic — must not be salvaged")
+	durable := filepath.Join(evolveDir, "models-probe")
+	if err := os.MkdirAll(durable, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(durable, "llm-calls.ndjson", `{"call_id":"call-1","phase":"model-probe","cli":"claude-p","call":1}`+"\n")
+
+	var log bytes.Buffer
+	salvageProbeDiagnostics(scratch, evolveDir, "", salvageNow, &log)
+	salvageProbeDiagnostics(scratch, evolveDir, "", salvageNow, &log)
+
+	esc, err := os.ReadFile(filepath.Join(durable, "escalation-report-20260805T230000Z.json"))
+	if err != nil || string(esc) != `{"reason":"quota wall"}` {
+		t.Errorf("escalation report not salvaged timestamped: %v %q", err, esc)
+	}
+	if _, err := os.Stat(filepath.Join(durable, "model-classifier-launch-error.txt")); err != nil {
+		t.Errorf("launch-error not salvaged: %v", err)
+	}
+	ledger, err := os.ReadFile(filepath.Join(durable, "llm-calls.ndjson"))
+	if err != nil || string(ledger) != `{"call_id":"call-1","phase":"model-probe","cli":"claude-p","call":1}`+"\n"+
+		`{"call_id":"call-2","phase":"model-probe","cli":"codex","call":2}`+"\n" {
+		t.Errorf("ledger not appended: %v %q", err, ledger)
+	}
+	if _, err := os.Stat(filepath.Join(durable, "model-classifier-artifact.txt")); !os.IsNotExist(err) {
+		t.Error("artifact file salvaged — only diagnostics belong in the durable dir")
+	}
+	for _, want := range []string{"escalation-report-20260805T230000Z.json", "launch-error"} {
+		if !strings.Contains(log.String(), want) {
+			t.Errorf("salvage did not WARN about %q; log:\n%s", want, log.String())
+		}
+	}
+}
+
+func TestSalvageProbeDiagnostics_QuietWhenNothingToSalvage(t *testing.T) {
+	t.Parallel()
+	scratch, evolveDir := t.TempDir(), t.TempDir()
+	var log bytes.Buffer
+	salvageProbeDiagnostics(scratch, evolveDir, "", salvageNow, &log)
+	if _, err := os.Stat(filepath.Join(evolveDir, "models-probe")); !os.IsNotExist(err) {
+		t.Error("durable dir created with nothing to salvage")
+	}
+	if log.Len() != 0 {
+		t.Errorf("unexpected log output: %s", log.String())
+	}
+}
+
+func TestSalvageProbeDiagnostics_PathCannotInjectLogLines(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	scratch := filepath.Join(root, "scratch")
+	evolveDir := filepath.Join(root, "evolve\n[bridge] forged\u202e")
+	if err := os.MkdirAll(scratch, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scratch, "escalation-report.json"), []byte(`{"reason":"quota"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var log bytes.Buffer
+	salvageProbeDiagnostics(scratch, evolveDir, "", salvageNow, &log)
+	got := log.String()
+	if strings.Count(got, "\n") != 1 || strings.ContainsRune(got, '\u202e') {
+		t.Fatalf("salvage path injected a log line or formatting control: %q", got)
+	}
+	if !strings.Contains(got, `destination="`) || !strings.Contains(got, `evolve\n[bridge] forged\u202e`) {
+		t.Fatalf("salvage warning lacks escaped destination context: %q", got)
+	}
+}
+
+func TestSalvageProbeDiagnostics_TagsKeepConcurrentFamiliesDistinct(t *testing.T) {
+	t.Parallel()
+	evolveDir := t.TempDir()
+	durable := filepath.Join(evolveDir, "models-probe")
+	for _, tag := range []string{"codex", "claude"} {
+		scratch := t.TempDir()
+		if err := os.WriteFile(filepath.Join(scratch, "escalation-report.json"), []byte(`{"family":"`+tag+`"}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(scratch, "models-launch-error.txt"), []byte(tag+" boom"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		var log bytes.Buffer
+		salvageProbeDiagnostics(scratch, evolveDir, tag, salvageNow, &log)
+	}
+	for _, tag := range []string{"codex", "claude"} {
+		esc, err := os.ReadFile(filepath.Join(durable, "escalation-report-20260805T230000Z-"+tag+".json"))
+		if err != nil || string(esc) != `{"family":"`+tag+`"}` {
+			t.Errorf("%s escalation lost to a same-second sibling: %v %q", tag, err, esc)
+		}
+		if _, err := os.Stat(filepath.Join(durable, tag+"-models-launch-error.txt")); err != nil {
+			t.Errorf("%s launch-error lost to the shared Agent-models name: %v", tag, err)
+		}
+	}
+}

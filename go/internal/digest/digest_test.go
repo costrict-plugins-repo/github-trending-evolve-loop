@@ -1,0 +1,124 @@
+package digest
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestProjectDigest(t *testing.T) {
+	t.Run("extracts only the tagged role's content", func(t *testing.T) {
+		source := []byte("Untagged intro.\n" +
+			"<!-- digest:role=scout -->\nScout body.\n<!-- /digest -->\n" +
+			"<!-- digest:role=build -->\nBuild body.\n<!-- /digest -->\n" +
+			"Untagged tail.\n")
+
+		got, err := ProjectDigest(source, "scout")
+		if err != nil {
+			t.Fatalf("ProjectDigest returned error: %v", err)
+		}
+		out := string(got)
+		if !strings.Contains(out, "Scout body.") {
+			t.Errorf("missing own role's content; got %q", out)
+		}
+		if strings.Contains(out, "Build body.") || strings.Contains(out, "Untagged") {
+			t.Errorf("leaked non-matching content; got %q", out)
+		}
+	})
+
+	t.Run("multi-role marker matches every listed role", func(t *testing.T) {
+		source := []byte("<!-- digest:role=scout,build -->\nShared body.\n<!-- /digest -->\n")
+
+		for _, role := range []string{"scout", "build"} {
+			got, err := ProjectDigest(source, role)
+			if err != nil {
+				t.Fatalf("ProjectDigest(%q) returned error: %v", role, err)
+			}
+			if !strings.Contains(string(got), "Shared body.") {
+				t.Errorf("role %q should match a multi-role marker listing it; got %q", role, got)
+			}
+		}
+
+		got, err := ProjectDigest(source, "ship")
+		if err != nil {
+			t.Fatalf("ProjectDigest(ship) returned error: %v", err)
+		}
+		if len(strings.TrimSpace(string(got))) != 0 {
+			t.Errorf("role=ship is not listed on the marker, want empty digest, got %q", got)
+		}
+	})
+
+	t.Run("byte reduction on an excluded-heavy fixture", func(t *testing.T) {
+		excluded := strings.Repeat("Cross-cutting content scout never acts on.\n", 40)
+		source := []byte("<!-- digest:role=build -->\n" + excluded + "<!-- /digest -->\n" +
+			"<!-- digest:role=scout -->\nScout needs only this line.\n<!-- /digest -->\n")
+
+		got, err := ProjectDigest(source, "scout")
+		if err != nil {
+			t.Fatalf("ProjectDigest returned error: %v", err)
+		}
+		if len(got) >= len(source)/2 {
+			t.Errorf("len(digest)=%d not < 50%% of len(source)=%d", len(got), len(source))
+		}
+	})
+
+	t.Run("no matching block yields empty, not full source", func(t *testing.T) {
+		source := []byte("<!-- digest:role=scout -->\nScout only.\n<!-- /digest -->\n")
+
+		got, err := ProjectDigest(source, "ship")
+		if err != nil {
+			t.Fatalf("ProjectDigest returned error: %v", err)
+		}
+		if len(strings.TrimSpace(string(got))) != 0 {
+			t.Errorf("want empty digest for unmatched role, got %q", got)
+		}
+	})
+
+	t.Run("unterminated marker is a hard error", func(t *testing.T) {
+		source := []byte("<!-- digest:role=scout -->\nnever closes\n")
+
+		if _, err := ProjectDigest(source, "scout"); err == nil {
+			t.Errorf("want non-nil error for unterminated marker, got nil")
+		}
+	})
+
+	t.Run("source with no markers yields empty digest", func(t *testing.T) {
+		got, err := ProjectDigest([]byte("plain text, no markers at all\n"), "scout")
+		if err != nil {
+			t.Fatalf("ProjectDigest returned error: %v", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("want empty digest for a source with no markers, got %q", got)
+		}
+	})
+}
+
+func TestMaterializeAndShadowRecord(t *testing.T) {
+	matchedSource := []byte("<!-- digest:role=scout -->\nscout\n<!-- /digest -->\nexcluded")
+	matched := Materialize(matchedSource, "scout")
+	if got, want := matched.Outcome, OutcomeMatched; got != want {
+		t.Fatalf("Materialize matched outcome = %q, want %q", got, want)
+	}
+	if matched.Err != nil || string(matched.Digest) != "\nscout\n" {
+		t.Errorf("Materialize matched result = %+v, want scout digest without error", matched)
+	}
+	var record ShadowRecord = NewShadowRecord(matchedSource, matched)
+	if record.FullBytes != len(matchedSource) || record.DigestBytes != len(matched.Digest) || !record.Parity || record.Outcome != OutcomeMatched {
+		t.Errorf("NewShadowRecord matched = %+v, want exact byte counts and parity", record)
+	}
+
+	noMatch := Materialize(matchedSource, "audit")
+	if noMatch.Outcome != OutcomeNoMatch || len(noMatch.Digest) != 0 || noMatch.Err != nil {
+		t.Errorf("Materialize no-match = %+v, want empty OutcomeNoMatch", noMatch)
+	}
+	if got := NewShadowRecord(matchedSource, noMatch); got.Parity {
+		t.Errorf("NewShadowRecord no-match = %+v, want parity=false", got)
+	}
+
+	malformed := Materialize([]byte("<!-- digest:role=scout -->\nbroken"), "scout")
+	if malformed.Outcome != OutcomeMalformed || malformed.Err == nil || malformed.Digest != nil {
+		t.Errorf("Materialize malformed = %+v, want nil digest and classified error", malformed)
+	}
+	if got := NewShadowRecord([]byte("broken"), Result{Outcome: OutcomeMatched, Digest: []byte("not smaller")}); got.Parity {
+		t.Errorf("NewShadowRecord non-reducing = %+v, want parity=false", got)
+	}
+}

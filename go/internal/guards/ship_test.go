@@ -1,0 +1,104 @@
+package guards
+
+import (
+	"context"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+)
+
+func TestShip_Name(t *testing.T) {
+	g := NewShip(false)
+	if g.Name() != "ship" {
+		t.Errorf("name=%q", g.Name())
+	}
+}
+
+func TestShip_DeniesBareGitCommit(t *testing.T) {
+	g := NewShip(false)
+	cases := []string{
+		"git commit -m 'msg'",
+		"git push origin main",
+		"git push --force",
+		"gh release create v1.0.0",
+		"gh release edit v1.0.0 --notes 'x'",
+	}
+	for _, cmd := range cases {
+		dec := g.Decide(context.Background(), core.GuardInput{
+			ToolName:  "Bash",
+			ToolInput: map[string]any{"command": cmd},
+		})
+		if dec.Allow {
+			t.Errorf("%q allowed (must deny)", cmd)
+		}
+	}
+}
+
+func TestShip_DeniesPipedShipVerbs(t *testing.T) {
+	g := NewShip(false)
+	for _, cmd := range []string{
+		`echo y | git commit -m 'x'`,
+		`bash -c "git commit -m 'x'"`,
+	} {
+		dec := g.Decide(context.Background(), core.GuardInput{
+			ToolName:  "Bash",
+			ToolInput: map[string]any{"command": cmd},
+		})
+		if dec.Allow {
+			t.Errorf("%q allowed (bypass attempt)", cmd)
+		}
+	}
+}
+
+func TestShip_BypassAllows(t *testing.T) {
+	g := NewShip(true)
+	dec := g.Decide(context.Background(), core.GuardInput{
+		ToolName:  "Bash",
+		ToolInput: map[string]any{"command": "git commit -m 'x'"},
+	})
+	if !dec.Allow {
+		t.Errorf("bypass env must allow, got: %s", dec.Reason)
+	}
+}
+
+func TestShip_AllowsNonShipBash(t *testing.T) {
+	g := NewShip(false)
+	cases := []string{
+		"ls",
+		"git status",
+		"git log -1",
+		"git diff",
+		"go test ./...",
+		"echo 'commit time'",
+	}
+	for _, cmd := range cases {
+		dec := g.Decide(context.Background(), core.GuardInput{
+			ToolName:  "Bash",
+			ToolInput: map[string]any{"command": cmd},
+		})
+		if !dec.Allow {
+			t.Errorf("%q denied: %s", cmd, dec.Reason)
+		}
+	}
+}
+
+func TestShip_MissingCommandAllows(t *testing.T) {
+	g := NewShip(false)
+	dec := g.Decide(context.Background(), core.GuardInput{
+		ToolName:  "Bash",
+		ToolInput: map[string]any{},
+	})
+	if !dec.Allow {
+		t.Errorf("missing command must allow: %s", dec.Reason)
+	}
+}
+
+func TestShip_NonBashToolPassesThrough(t *testing.T) {
+	g := NewShip(false)
+	for _, tool := range []string{"Edit", "Write", "Read"} {
+		dec := g.Decide(context.Background(), core.GuardInput{ToolName: tool})
+		if !dec.Allow {
+			t.Errorf("tool=%s denied: %s", tool, dec.Reason)
+		}
+	}
+}

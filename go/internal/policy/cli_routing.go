@@ -1,0 +1,161 @@
+package policy
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+)
+
+type CLIRouting struct {
+	CLIs       []string             `json:"clis,omitempty"`
+	Default    []string             `json:"default,omitempty"`
+	Work       map[string][]string  `json:"work,omitempty"`
+	Agents     map[string]AgentRule `json:"agents,omitempty"`
+	Tiers      map[string]TierRule  `json:"tiers,omitempty"`
+	AfterChain string               `json:"after_chain,omitempty"`
+	Floors     Floors               `json:"floors,omitempty"`
+}
+
+type AgentRule struct {
+	CLI         []string `json:"cli,omitempty"`
+	Model       string   `json:"model,omitempty"`
+	Effort      string   `json:"effort,omitempty"`
+	Order       string   `json:"order,omitempty"`
+	HeadroomPct int      `json:"headroom_pct,omitempty"`
+	MaxTier     string   `json:"max_tier,omitempty"`
+	MaxEffort   string   `json:"max_effort,omitempty"`
+}
+
+type TierRule struct {
+	CLIs     []string `json:"clis,omitempty"`
+	Effort   string   `json:"effort,omitempty"`
+	SharePct int      `json:"share_pct,omitempty"`
+}
+
+func (c *CLIRouting) UnmarshalJSON(raw []byte) error {
+	type block CLIRouting
+	var decoded block
+	if err := decodeStrict(raw, &decoded); err != nil {
+		return fmt.Errorf("cli_routing: %w", err)
+	}
+	*c = CLIRouting(decoded)
+	return nil
+}
+
+func (r *AgentRule) UnmarshalJSON(raw []byte) error {
+	trimmed := bytes.TrimSpace(raw)
+	if isJSONNull(trimmed) {
+		return agentRuleError(errNullRoutingValue)
+	}
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		var chain []string
+		if err := json.Unmarshal(trimmed, &chain); err != nil {
+			return agentRuleError(err)
+		}
+		*r = AgentRule{CLI: chain}
+		return nil
+	}
+	type rule AgentRule
+	var decoded rule
+	if err := decodeStrict(trimmed, &decoded); err != nil {
+		return agentRuleError(err)
+	}
+	if err := validateRuleEffort(decoded.Effort); err != nil {
+		return agentRuleError(err)
+	}
+	*r = AgentRule(decoded)
+	return nil
+}
+
+func (r *TierRule) UnmarshalJSON(raw []byte) error {
+	trimmed := bytes.TrimSpace(raw)
+	if isJSONNull(trimmed) {
+		return tierRuleError(errNullRoutingValue)
+	}
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		var chain []string
+		if err := json.Unmarshal(trimmed, &chain); err != nil {
+			return tierRuleError(err)
+		}
+		*r = TierRule{CLIs: chain}
+		return nil
+	}
+	type rule TierRule
+	var decoded rule
+	if err := decodeStrict(trimmed, &decoded); err != nil {
+		return tierRuleError(err)
+	}
+	if err := validateRuleEffort(decoded.Effort); err != nil {
+		return tierRuleError(err)
+	}
+	*r = TierRule(decoded)
+	return nil
+}
+
+func validateRuleEffort(effort string) error {
+	if effort == "" {
+		return nil
+	}
+	return ValidateEffort(effort)
+}
+
+func (r TierRule) MarshalJSON() ([]byte, error) {
+	if len(r.CLIs) == 0 && r.SharePct != 0 {
+		return nil, tierRuleError(errShareWithoutCLIs)
+	}
+	if len(r.CLIs) == 0 && r.Effort == "" {
+		return nil, tierRuleError(errEmptyTierRule)
+	}
+	if r.Effort == "" && r.SharePct == 0 {
+		return json.Marshal(r.CLIs)
+	}
+	type rule TierRule
+	return json.Marshal(rule(r))
+}
+
+func tierRuleError(err error) error {
+	return fmt.Errorf(`tier rule: want an array of CLIs or {"clis": [...], "effort": "<level>", "share_pct": <1-99>}: %w`, err)
+}
+
+func agentRuleError(err error) error {
+	return fmt.Errorf(`agent rule: want an array of CLIs or {"cli": [...], "model": "<tier>"}: %w`, err)
+}
+
+func decodeStrict(raw []byte, into any) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	return dec.Decode(into)
+}
+
+var errShareWithoutCLIs = errors.New("share_pct needs clis: the first family of the tier chain takes the share")
+
+var errEmptyTierRule = errors.New("an empty rule names no CLI and no effort; remove the key instead")
+
+var errNullRoutingValue = errors.New("null is not a routing value; remove the key instead")
+
+func isJSONNull(raw []byte) bool {
+	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+}
+
+func refuseNullCLIRouting(raw []byte) error {
+	var probe struct {
+		Block json.RawMessage `json:"cli_routing"`
+	}
+	if json.Unmarshal(raw, &probe) != nil || !isJSONNull(probe.Block) {
+		return nil
+	}
+	return fmt.Errorf("cli_routing: %w", errNullRoutingValue)
+}
+
+func (c CLIRouting) MarshalJSON() ([]byte, error) {
+	type block CLIRouting
+	out := struct {
+		block
+		Floors *Floors `json:"floors,omitempty"`
+	}{block: block(c)}
+	if c.Floors != nil {
+		out.Floors = &c.Floors
+	}
+	return json.Marshal(out)
+}

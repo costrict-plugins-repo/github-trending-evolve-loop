@@ -1,0 +1,326 @@
+package checkpoint
+
+import (
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/clihealth"
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+	"github.com/mickeyyaya/evolve-loop/go/internal/quotareset"
+)
+
+func quotaCheckpointFixture(t *testing.T) (root string, cs core.CycleState) {
+	t.Helper()
+	root = t.TempDir()
+	seedCycleState(t, root, "")
+	workspace := filepath.Join(root, ".evolve", "runs", "cycle-656")
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return root, core.CycleState{
+		CycleID:       656,
+		Phase:         "build",
+		WorkspacePath: workspace,
+	}
+}
+
+func readQuotaWakeAt(t *testing.T, root string) (at, source string) {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(root, ".evolve", "cycle-state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state struct {
+		Checkpoint struct {
+			Reason           string `json:"reason"`
+			QuotaResetAt     string `json:"quotaResetAt"`
+			QuotaResetSource string `json:"quotaResetSource"`
+		} `json:"checkpoint"`
+	}
+	if err := json.Unmarshal(b, &state); err != nil {
+		t.Fatal(err)
+	}
+	if state.Checkpoint.Reason != string(ReasonQuotaLikely) {
+		t.Fatalf("checkpoint reason = %q, want %q", state.Checkpoint.Reason, ReasonQuotaLikely)
+	}
+	return state.Checkpoint.QuotaResetAt, state.Checkpoint.QuotaResetSource
+}
+
+func TestQuotaBoundaryCheckpointer_UsesWorkspaceHint(t *testing.T) {
+	root, cs := quotaCheckpointFixture(t)
+	if err := os.WriteFile(filepath.Join(cs.WorkspacePath, "quota-reset-hint.txt"), []byte("resets 4:10pm\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.Local)
+	if err := core.QuotaBoundaryCheckpointer(cs, root, now); err != nil {
+		t.Fatalf("checkpointer: %v", err)
+	}
+	at, source := readQuotaWakeAt(t, root)
+	if source != "parsed" {
+		t.Errorf("quotaResetSource = %q, want \"parsed\" — the scraped hint must beat the estimate", source)
+	}
+	if wake, err := time.Parse("2006-01-02T15:04:05-0700", at); err != nil {
+		t.Fatalf("quotaResetAt %q unparseable: %v", at, err)
+	} else if wake.Hour() != 16 || wake.Minute() != 10 {
+		t.Errorf("wake-at = %s, want the hint's 16:10", at)
+	}
+}
+
+func TestQuotaBoundaryCheckpointer_HonoursOperatorOverride(t *testing.T) {
+	root, cs := quotaCheckpointFixture(t)
+	if err := os.WriteFile(filepath.Join(cs.WorkspacePath, "quota-reset-hint.txt"), []byte("resets 4:10pm\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const override = "2026-07-30T23:45:00Z"
+	if err := os.WriteFile(filepath.Join(root, ".evolve", "policy.json"),
+		[]byte(`{"quota_reset":{"reset_at":"`+override+`"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.QuotaBoundaryCheckpointer(cs, root, time.Now()); err != nil {
+		t.Fatalf("checkpointer: %v", err)
+	}
+	at, source := readQuotaWakeAt(t, root)
+	if at != override || source != "operator-override" {
+		t.Errorf("(at, source) = (%q, %q), want (%q, \"operator-override\")", at, source, override)
+	}
+}
+
+func TestPhaseBoundaryCheckpointer_DoesNotFabricateWakeAt(t *testing.T) {
+	root := t.TempDir()
+	seedCycleState(t, root, "")
+	cs := core.CycleState{CycleID: 657, Phase: "audit", WorkspacePath: filepath.Join(root, ".evolve", "runs", "cycle-657")}
+	if err := core.PhaseBoundaryCheckpointer(cs, root, time.Now()); err != nil {
+		t.Fatalf("phase-boundary checkpointer: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(root, ".evolve", "cycle-state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state struct {
+		Checkpoint struct {
+			Reason           string `json:"reason"`
+			QuotaResetAt     string `json:"quotaResetAt"`
+			QuotaResetSource string `json:"quotaResetSource"`
+		} `json:"checkpoint"`
+	}
+	if err := json.Unmarshal(b, &state); err != nil {
+		t.Fatal(err)
+	}
+	if state.Checkpoint.Reason != string(ReasonPhaseComplete) {
+		t.Fatalf("reason = %q, want phase-complete", state.Checkpoint.Reason)
+	}
+	if state.Checkpoint.QuotaResetAt != "" || state.Checkpoint.QuotaResetSource != "" {
+		t.Errorf("phase-complete checkpoint fabricated a wake-at: at=%q source=%q",
+			state.Checkpoint.QuotaResetAt, state.Checkpoint.QuotaResetSource)
+	}
+}
+
+func TestQuotaBoundaryCheckpointer_TheEarliestActiveBenchSetsTheWakeAt(t *testing.T) {
+	root, cs := quotaCheckpointFixture(t)
+	now := time.Date(2026, 10, 9, 18, 42, 13, 0, time.Local)
+	store := clihealth.NewStore(root, func() time.Time { return now })
+	for family, reset := range map[string]time.Time{"agy-claude": now.Add(89 * time.Hour), "codex": now.Add(3 * time.Hour)} {
+		if _, err := store.BenchWallUntil(family, clihealth.Wall{Pattern: "exhausted", Reset: reset}); err != nil {
+			t.Fatalf("bench %s: %v", family, err)
+		}
+	}
+	want := store.Active()["codex"].BenchedUntil
+	cs.QuotaWall = quotaWallOf("agy-claude-tmux", "codex-tmux")
+
+	if err := core.QuotaBoundaryCheckpointer(cs, root, now); err != nil {
+		t.Fatalf("checkpointer: %v", err)
+	}
+
+	at, source := readQuotaWakeAt(t, root)
+	wake, err := time.Parse("2006-01-02T15:04:05-0700", at)
+	if err != nil {
+		t.Fatalf("quotaResetAt %q unparseable: %v", at, err)
+	}
+	if source != "bench" || !wake.Equal(want.Truncate(time.Second)) {
+		t.Errorf("wake-at=%s source=%q, want %s from the bench: the first family back sets the resume, not a default", at, source, want)
+	}
+}
+
+func TestWithQuotaReset_AnEstimatorErrorRecordsUnavailableAndNoWakeAt(t *testing.T) {
+	saved := computeQuotaReset
+	t.Cleanup(func() { computeQuotaReset = saved })
+	computeQuotaReset = func(string, quotareset.Options) (quotareset.Result, error) {
+		return quotareset.Result{}, errors.New("estimator down")
+	}
+
+	cp := withQuotaReset(Checkpoint{}, core.CycleState{WorkspacePath: t.TempDir()}, t.TempDir(), time.Date(2026, 10, 9, 18, 42, 13, 0, time.Local))
+
+	if cp.QuotaResetSource != "unavailable" || cp.QuotaResetAt != "" {
+		t.Errorf("source=%q at=%q, want unavailable with no wake-at: a failed estimate never invents a time", cp.QuotaResetSource, cp.QuotaResetAt)
+	}
+}
+
+type pauseRecord struct {
+	QuotaResetAt          string `json:"quotaResetAt"`
+	QuotaResetSource      string `json:"quotaResetSource"`
+	AutoResumeMaxAttempts int    `json:"autoResumeMaxAttempts"`
+	OperatorAction        string `json:"operatorAction"`
+}
+
+func readPause(t *testing.T, root string) pauseRecord {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(root, ".evolve", "cycle-state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state struct {
+		Checkpoint pauseRecord `json:"checkpoint"`
+	}
+	if err := json.Unmarshal(b, &state); err != nil {
+		t.Fatal(err)
+	}
+	return state.Checkpoint
+}
+
+func withUsageReset(t *testing.T, fn func(projectRoot string, families []string, now time.Time) (time.Time, bool)) {
+	t.Helper()
+	saved := UsageReset
+	t.Cleanup(func() { UsageReset = saved })
+	UsageReset = fn
+}
+
+func TestQuotaBoundaryCheckpointer_AnUnknownResetIsNotAutoResumableAndNamesTheOperatorAction(t *testing.T) {
+	withUsageReset(t, nil)
+	root, cs := quotaCheckpointFixture(t)
+	cs.QuotaWall = quotaWallOf("claude-tmux")
+
+	if err := core.QuotaBoundaryCheckpointer(cs, root, time.Date(2026, 10, 9, 18, 42, 13, 0, time.Local)); err != nil {
+		t.Fatalf("checkpointer: %v", err)
+	}
+
+	got := readPause(t, root)
+	if got.QuotaResetSource != "unknown" || got.QuotaResetAt != "" || got.AutoResumeMaxAttempts != 0 || got.OperatorAction == "" {
+		t.Errorf("pause=%+v, want source unknown, no wake-at, no auto-resume and an operator action: an unknown reset is never a scheduled wake", got)
+	}
+}
+
+func TestQuotaBoundaryCheckpointer_ABenchThatIsNoQuotaResetOfTheWalkIsNoEvidence(t *testing.T) {
+	now := time.Date(2026, 10, 9, 18, 42, 13, 0, time.Local)
+	for _, tc := range []struct {
+		name  string
+		bench func(root string) error
+	}{
+		{"a credential bench", func(root string) error {
+			_, err := clihealth.NewStore(root, func() time.Time { return now }).BenchWall("claude", clihealth.CredentialPattern, "Please log in")
+			return err
+		}},
+		{"a boot-timeout strike", func(root string) error {
+			s := clihealth.NewStore(root, func() time.Time { return now })
+			if _, err := s.RecordBootStrike("claude"); err != nil {
+				return err
+			}
+			_, err := s.RecordBootStrike("claude")
+			return err
+		}},
+		{"a quota bench of a family outside the walk", func(root string) error {
+			_, err := clihealth.NewStore(root, func() time.Time { return now }).BenchWallUntil("codex", clihealth.Wall{Pattern: "rate_limit", Reset: now.Add(time.Hour)})
+			return err
+		}},
+		{"a quota bench that already lapsed", func(root string) error {
+			past := clihealth.NewStore(root, func() time.Time { return now.Add(-10 * time.Hour) })
+			_, err := past.BenchWallUntil("claude", clihealth.Wall{Pattern: "rate_limit", Reset: now.Add(-9 * time.Hour)})
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withUsageReset(t, nil)
+			root, cs := quotaCheckpointFixture(t)
+			cs.QuotaWall = quotaWallOf("claude-tmux")
+			if err := tc.bench(root); err != nil {
+				t.Fatalf("seed bench: %v", err)
+			}
+
+			if err := core.QuotaBoundaryCheckpointer(cs, root, now); err != nil {
+				t.Fatalf("checkpointer: %v", err)
+			}
+
+			if got := readPause(t, root); got.QuotaResetSource != "unknown" {
+				t.Errorf("source=%q at=%q, want unknown: %s is not the reset of a walled family", got.QuotaResetSource, got.QuotaResetAt, tc.name)
+			}
+		})
+	}
+}
+
+func TestQuotaBoundaryCheckpointer_TheUsageQuerySuppliesTheResetOfTheWalkedFamilies(t *testing.T) {
+	now := time.Date(2026, 10, 9, 18, 42, 13, 0, time.Local)
+	reset := now.Add(89 * time.Hour)
+	var asked []string
+	withUsageReset(t, func(_ string, families []string, _ time.Time) (time.Time, bool) {
+		asked = families
+		return reset, true
+	})
+	root, cs := quotaCheckpointFixture(t)
+	cs.QuotaWall = quotaWallOf("claude-tmux", "agy-claude-tmux")
+
+	if err := core.QuotaBoundaryCheckpointer(cs, root, now); err != nil {
+		t.Fatalf("checkpointer: %v", err)
+	}
+
+	got := readPause(t, root)
+	if got.QuotaResetSource != "usage" || got.AutoResumeMaxAttempts != DefaultAutoResumeAttempts || got.OperatorAction != "" {
+		t.Errorf("pause=%+v, want an auto-resumable usage reset", got)
+	}
+	if strings.Join(asked, ",") != "claude,agy-claude" {
+		t.Errorf("usage query asked for %v, want the walked families claude,agy-claude", asked)
+	}
+}
+
+func quotaWallOf(clis ...string) []core.FamilyEnd {
+	var w core.Wall
+	for _, c := range clis {
+		w = w.Observe(core.FamilyEnd{CLI: c, Pattern: "rate_limit"})
+	}
+	return w.Ends
+}
+
+func TestQuotaBoundaryCheckpointer_StoresTheWallRowsForALaterReader(t *testing.T) {
+	root, cs := quotaCheckpointFixture(t)
+	now := time.Date(2026, 10, 9, 18, 42, 13, 0, time.Local)
+	cs.QuotaWall = []core.FamilyEnd{{CLI: "claude", Pattern: "auth_recheck"}, {CLI: "agy", Pattern: "rate_limit"}}
+
+	if err := core.QuotaBoundaryCheckpointer(cs, root, now); err != nil {
+		t.Fatalf("checkpointer: %v", err)
+	}
+
+	b, err := os.ReadFile(filepath.Join(root, ".evolve", "cycle-state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state struct {
+		Checkpoint struct {
+			QuotaWall []core.FamilyEnd `json:"quotaWall"`
+		} `json:"checkpoint"`
+	}
+	if err := json.Unmarshal(b, &state); err != nil {
+		t.Fatal(err)
+	}
+	if got := state.Checkpoint.QuotaWall; len(got) != 2 || got[0].Pattern != "auth_recheck" || got[1].CLI != "agy" {
+		t.Errorf("the checkpoint is the home of the fact for a later process: %+v", got)
+	}
+}
+
+func TestQuotaBoundaryCheckpointer_AnUnknownResetWithALoginRowNamesTheLoginNotQuota(t *testing.T) {
+	withUsageReset(t, nil)
+	root, cs := quotaCheckpointFixture(t)
+	cs.QuotaWall = core.Wall{}.Observe(core.FamilyEnd{CLI: "claude-tmux", Pattern: "auth_recheck"}).Ends
+
+	if err := core.QuotaBoundaryCheckpointer(cs, root, time.Date(2026, 10, 9, 18, 42, 13, 0, time.Local)); err != nil {
+		t.Fatalf("checkpointer: %v", err)
+	}
+
+	got := readPause(t, root)
+	want := "open claude and run /login. Then evolve loop --resume."
+	if got.OperatorAction != want || got.AutoResumeMaxAttempts != 0 {
+		t.Errorf("operator action=%q auto-resume=%d, want %q and no auto-resume", got.OperatorAction, got.AutoResumeMaxAttempts, want)
+	}
+}

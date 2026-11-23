@@ -1,0 +1,35 @@
+{
+  "name": "behavior-baseline",
+  "archetype": "evaluate",
+  "agent": "evolve-behavior-baseline",
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/scout-report.md"
+    ],
+    "signals": []
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/behavior-baseline.md"
+    ],
+    "signals": [
+      "behavior.preserved",
+      "behavior.delta_count"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Baseline"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "refactor"
+      }
+    ]
+  },
+  "after": "tdd"
+}

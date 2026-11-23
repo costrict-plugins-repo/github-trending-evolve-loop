@@ -1,0 +1,4 @@
+[inbox-mover] promoted: task-a.json → quarantine/
+[inbox-mover] quarantined: task-a.json (task-level failure #2 >= ceiling 2) ← processing/cycle-5/
+[inbox-mover] released: task-b.json ← processing/cycle-5/
+[inbox-mover] release-cycle: 2 file(s) released from cycle-5

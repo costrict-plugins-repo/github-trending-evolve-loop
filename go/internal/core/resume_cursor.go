@@ -1,0 +1,51 @@
+package core
+
+type resumeCursor struct {
+	current       Phase
+	lastVerdict   string
+	scheduledNext Phase
+	termination   triageTermination
+	first         bool
+	reachedEnd    bool
+}
+
+func newResumeCursor(start Phase) resumeCursor {
+	return resumeCursor{current: start, lastVerdict: VerdictPASS, first: true}
+}
+
+func (c *resumeCursor) next(o *Orchestrator, cs CycleState, projectRoot string) (Phase, error) {
+	if c.first {
+		c.first = false
+		return c.current, nil
+	}
+	if c.current == PhaseTriage {
+		c.termination = o.triageTermination(projectRoot, cs.WorkspacePath, cs.CycleID, cs.CompletedPhases, c.lastVerdict)
+		if c.termination.stop {
+			return PhaseEnd, nil
+		}
+	}
+	if c.scheduledNext != "" {
+		next := c.scheduledNext
+		c.scheduledNext = ""
+		return next, nil
+	}
+	return o.resolveResumeNext(cs, c.current, c.lastVerdict)
+}
+
+func (c *resumeCursor) advance(phase Phase, verdict string) {
+	c.current = phase
+	c.lastVerdict = verdict
+}
+
+func (c *resumeCursor) schedule(next Phase) {
+	c.scheduledNext = next
+}
+
+func (c *resumeCursor) rerouteFromShip(to Phase) {
+	c.current = PhaseShip
+	c.scheduledNext = to
+}
+
+func (c *resumeCursor) finish() {
+	c.reachedEnd = true
+}

@@ -1,0 +1,63 @@
+# internal/lanebudget
+
+> The spec: "The lane CPU budget" in §12 of [wave-orchestrator](../wave-orchestrator.md). The plan: component O9 of [the wave orchestrator plan](../../plans/wave-orchestrator-2026-10.md). The width key: [internal-ipcenv](internal-ipcenv.md).
+
+## Purpose
+
+`internal/lanebudget` gives each `go test` that a fleet lane runs one share of the host CPUs. The share is `max(1, host CPUs / fleet width)`. Without it, each lane's `go test` uses all the CPUs of the host. Then 4 lanes put a load of 15–18 on 14 CPUs (spec §12, F12.1). A console run has no fleet width, so the package changes nothing there.
+
+## Design
+
+- **`Procs(hostCPUs, width)`** is the formula. A width below 1 means "no lane" and gives 0. Otherwise the result is the CPU count divided by the width, with a floor of 1. Example: `Procs(14, 4)` is 3, and `Procs(2, 8)` is 1.
+- **`Current()`** falls back to `EVOLVE_FLEET_WIDTH` (`ipcenv.FleetWidthKey`) from the environment of this process and the CPU count from `runtime.NumCPU`. Each lane is a separate process (`execCycleLaunch` in `cmd/evolve/cmd_fleet.go`), so the width that it reads is its own. An absent or garbage width gives 0.
+- **`WriteLiveWidth(path, pid, width)`** writes `{"pid", "width"}` atomically. A width below 1 is stored as 1. The pool calls it at each lane start and each lane end (`TestWriteLiveWidth_RoundTripsThroughCurrent`, `TestWriteLiveWidth_AnUnwritablePathIsAnError`).
+- **The live width.** `Current()` first reads the spawn width. A run with no spawn width is a console run and gets 0, also when a live file exists. Then `Current()` reads the file that `EVOLVE_FLEET_LIVE_WIDTH` (`ipcenv.FleetLiveWidthKey`) names. The file must be valid, with a width of 1 or more and a live pool pid. Then the share is `Procs(hostCPUs, live width)`.
+  - Otherwise `Current()` uses the spawn width, as before. A missing key gives the old result.
+  - The package checks the pid through the injected `processAlive`, which calls `runlease.PIDAlive`. Tests never signal a real process.
+  - Each test that sets `FleetWidthKey` also clears `FleetLiveWidthKey`. So a test run inside a live lane does not take the share of the pool (`core`, `acssuite`, `acsrunner`, `commitgate`, `ciparitygate`, `ship`, `ciparity`, `cmd/evolve`).
+  - Pinned by `TestCurrent_ALoneLaneGetsTheHostCPUs`, `TestCurrent_ReadsTheLiveWidthNotThePoolLimit`, `TestCurrent_ADeadPoolFileFallsBackToTheSpawnWidth`, `TestCurrent_AnUnusableLiveFileFallsBackToTheSpawnWidth`, `TestCurrent_ALiveFileWithNoSpawnWidthStaysAConsoleRun` and `TestProcessAlive_IsTheRunLeaseCheck`.
+- **`Args(args)`** adds `-p N` and `-parallel N` after the `test` word of a `go test` argv. It keeps a `-p` or `-parallel` that the caller already set. It does not change an argv that does not start with `test`, and it does not write into the array of the caller.
+- **`ArgsFor(procs, args)`** is `Args` with the share given by the caller. `Args(args)` is `ArgsFor(Current(), args)`. A share of 0 changes nothing.
+  - A caller can run several `go test` children at the same time. It gives each child its part of `Current()`. Then the children together ask for no more than one share. Pinned by `TestArgsFor_AGoTestGetsTheGivenShareNotTheLaneShare`, `TestArgsFor_AZeroShareLeavesTheArgvAlone` and `TestArgsFor_OnlyAGoTestArgvChanges`.
+- **The holder share.** The run that holds the host verification lock ([internal-verifylock](internal-verifylock.md)) is the only locked run of the host. The other lanes run their unlocked package runs at the lane share. So the holder can use the rest of the host. `HolderProcs(hostCPUs, width)` gives `max(lane share, hostCPUs - (width - 1) * lane share)`. A width below 1 gives 0.
+  - Example: 14 CPUs and width 8 give 7. Width 4 gives 5. Width 1 gives 14.
+  - The plan: [verify-lock-holder-budget-2026-11](../../plans/verify-lock-holder-budget-2026-11.md). The retakes under `integration-tier.lock` keep the lane share (decision D8).
+  - `Holder()` reads the width like `Current()` does, through one shared `laneWidth()`.
+  - `ShareFor(held)` is the one entry for a caller. `ShareFor(true)` gives `Holder()` and `ShareFor(false)` gives `Current()`. A caller asks only after it knows if it holds the lock, and passes the value to `ArgsFor`, `EnvFor` or `scopeShare`. A run without the lock never gets the holder share.
+  - The share sets `-p`, `-parallel` and `GOMAXPROCS` to the same number. So it caps each flag. It is not a count of busy CPUs.
+  - Pinned by `TestHolderProcs_TheHolderGetsTheHostLessTheShareOfTheOtherLanes`, `TestHolderProcs_NeverFallsBelowTheLaneShare`, `TestShareFor_AHolderGetsTheHolderShareAndAnyOtherRunTheLaneShare`, `TestShareFor_AHolderOnTheConsoleStaysUnbudgeted` and `TestHolder_ReadsTheLiveWidthLikeCurrent`.
+- **`Env(env)`** adds `GOMAXPROCS=N` at the end of the child environment, so it wins over an inherited value. A nil `env` means "inherit", as in `exec.Cmd`, so `Env(nil)` starts from `os.Environ()`. Give it the environment after `ipcenv.Scrub`: the scrub removes the `EVOLVE_` keys but keeps `GOMAXPROCS`.
+- **`EnvFor(procs, env)`** is `Env` with the share given by the caller. `Env(env)` is `EnvFor(Current(), env)` (pinned by `TestEnvFor_AChildGetsGOMAXPROCSOfTheGivenShare`, `TestEnvFor_AZeroShareLeavesTheEnvAlone` and `TestEnvFor_ANilEnvInheritsTheProcessEnvironment`).
+- **`Runner(run)`** wraps a `sysexec.RunFunc`. It applies `Args` and `Env` to each `go test` call and passes every other call through. Put it inside a wrapper that replaces the environment (`sysexec.WithEnv` with `ciparitygate.TierEnv()`), so that the replaced environment still gets `GOMAXPROCS`.
+- **Why all three values.** `-p` bounds the packages that run at the same time, and `-parallel` bounds the parallel tests in one binary. They multiply. Only `GOMAXPROCS` bounds the compiler, the linker and the CPU use inside each test binary.
+
+## The call sites
+
+| Site | How it goes through the budget |
+|---|---|
+| `phases/ship/repocontract.go` (`repoContractTestArgs`, `runGoTestJSON`) | `Args` and `Env`. The importer backstop of `repocontract_importers.go` runs through the same two functions. |
+| `acssuite/acssuite.go` (`defaultGoExec`, `acquireSuiteLock`), `acssuite/golane.go` (`runScopes`) | `ArgsFor` and `EnvFor` with the share split among the scopes that run at once (`scopeShare`). The share comes from `ShareFor` after the lock acquire, and it also sizes the slots. |
+| `acsrunner/runner.go` (`Run`, `execCommand`) | `Args` and `Env` |
+| `core/task_contract.go` (`go test -list`) | `Args` and `Env`: the list run still compiles the package |
+| `core/build_floor_reviewer.go` (`coverTestArgs`, `runCoverPass`) | `ArgsFor` and `EnvFor` with the `share` of the cover plan. The first pass holds the lock and takes `ShareFor(true)`. A run without the lock, and the retake after the lock is released, keep `Current()`. |
+| `core/phase_bindings_selfcheck.go` (`unitTestArgs`, `taggedTestArgs` and their runners) | `Args` and `Env` |
+| `phases/audit/ciparitygate/tier.go` | `Current` replaces the fixed 4 in a lane, and `Runner` adds `GOMAXPROCS` |
+| `phases/audit/ciparitygate/command.go` (acs-durable) and `apicover.go` | `Runner` |
+| `ciparity/ciparity.go` (`CoverageTestArgs`) | `Args` |
+| `commitgate/lanes.go` (the Go lane) | `Runner`, through `Options.budgeted` |
+| `cmd/evolve/cmd_composition_wiring.go` (`composedGateRun.gate`) | `Env`: the `make` target runs `go test` for the build, test, acs and apicover gates |
+
+`releasepreflight/releasepreflight.go` is exempt: it runs only on the console, before a release. `gotooltest/cache.go` runs `go build`, not `go test`, and only from test code, which already runs under the budget of its parent.
+
+The composed-tree gates give `GOMAXPROCS` to `make`. The go command takes its default `-p` from `GOMAXPROCS`, and `-test.parallel` follows the same value. So the suite of a gate stays in the lane share. This deviates from `CIEnv` on purpose, and it moves the gate closer to CI, because the GitHub runners have 2 to 4 CPUs. The console `make build` calls in `cmd_wave.go` and `cmd_loop_boot_refresh.go` are exempt. They run on the console, never in a lane.
+
+The console measured the cost on 2026-11-14, on a host with 14 CPUs and a live wave. The race suite of `make test` took 984 s at `GOMAXPROCS=3`. Its slowest package, `cmd/evolve`, took 568 s, near the default timeout of 10 minutes for one test binary. So the `test` target passes `-timeout $(TEST_TIMEOUT)` (20 minutes) to `go test`.
+
+## Invariants
+
+- The formula and the two "no lane" answers: `TestProcs_DividesTheHostAmongTheLanes`, `TestCurrent_ReadsTheFleetWidthOfThisProcess`.
+- A console run gets no flag and no `GOMAXPROCS`: `TestArgs_AConsoleRunIsUnchanged`, `TestEnv_AConsoleRunIsUnchanged`.
+- A composed gate gets `GOMAXPROCS` in a lane and no limit on the console: `TestRunComposedGates_ALaneGateGetsItsCPUShare`, `TestRunComposedGates_AConsoleGateGetsNoCPULimit`.
+- The coverage pass and the ACS suite use the holder share only with the lock: `TestBuildFloorCover_TheRunThatHoldsTheHostLockGetsTheHolderBudget`, `TestBuildFloorCover_ARunThatLostTheHostLockKeepsTheLaneBudget`, `TestBuildFloorCover_TheRetakeOutsideTheLockKeepsTheLaneBudget`, `TestRun_TheSuiteThatHoldsTheHostLockSplitsTheHolderShare` and `TestRun_ASuiteThatLostTheHostLockKeepsTheLaneShare`.
+- Each function under `go/internal` or `go/cmd` that runs `make` calls `lanebudget.Env`, or its file is in `laneBudgetMakeExempt` with a reason: `TestEveryMakeRunGoesThroughTheLaneBudget`. The guard finds any call that has the literal `"make"` as its first or second argument.
+- Each non-test file under `go/internal` or `go/cmd` that builds a `go test` argv imports this package: `TestEveryGoTestArgvGoesThroughTheLaneBudget` in `go/test/structure`. The test finds a `[]string{"test", …}` literal and a call with the arguments `"go", "test"`. It does not prove that each argv in the file goes through the budget, only that the file uses it. Each site has its own test that runs it in a lane.

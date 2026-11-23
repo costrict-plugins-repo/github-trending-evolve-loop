@@ -1,0 +1,75 @@
+package policy_test
+
+import (
+	"reflect"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/policy"
+)
+
+func TestACSTimeoutConfig_Resolution(t *testing.T) {
+	cases := []struct {
+		name string
+		pol  policy.Policy
+		want policy.ACSConfig
+	}{
+		{
+			"absent-defaults-zero",
+			policy.Policy{},
+			policy.ACSConfig{GoTimeoutS: 0},
+		},
+		{
+			"empty-block-defaults-zero",
+			policy.Policy{ACS: &policy.ACSConfig{}},
+			policy.ACSConfig{GoTimeoutS: 0},
+		},
+		{
+			"go-timeout-s-set",
+			policy.Policy{ACS: &policy.ACSConfig{GoTimeoutS: 120}},
+			policy.ACSConfig{GoTimeoutS: 120},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.pol.ACSTimeoutConfig()
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("ACSTimeoutConfig() = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoad_ACSBlock(t *testing.T) {
+	cases := []struct {
+		name string
+		json string
+		want policy.ACSConfig
+	}{
+		{
+			"absent-block-zero",
+			`{}`,
+			policy.ACSConfig{GoTimeoutS: 0},
+		},
+		{
+			"go-timeout-s-120",
+			`{"acs":{"go_timeout_s":120}}`,
+			policy.ACSConfig{GoTimeoutS: 120},
+		},
+		{
+			"predicate-env-names-operator-keys",
+			`{"acs":{"predicate_env":["EVOLVE_FLAG_CAMPAIGN"]}}`,
+			policy.ACSConfig{PredicateEnv: []string{"EVOLVE_FLAG_CAMPAIGN"}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pol, err := policy.Load(writeTempPolicy(t, tc.json))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if got := pol.ACSTimeoutConfig(); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("after Load, ACSTimeoutConfig() = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}

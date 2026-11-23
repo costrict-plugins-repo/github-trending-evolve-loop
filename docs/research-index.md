@@ -1,0 +1,938 @@
+# Research Index
+
+> Reference documents available to evolve-loop. The split:
+>
+> - **Active references** (5 files; 4 in `docs/private/research/archived-2026-05-19/`,
+>   `eval-grader-best-practices.md` at `docs/`) — cited by runtime
+>   personas/skills/scripts. (`docs/research/` itself now holds the merged
+>   research tree — see the 2026-08-05 section below.)
+> - **Archived references** (42 files, in `docs/private/research/`) — for
+>   contributor reference; explicitly excluded from agent context through the
+>   trust kernel (deny_subpaths + Layer-B filter). See
+>   [docs/architecture/private-context-policy.md](architecture/private-context-policy.md)
+>   for the convention.
+
+---
+
+## Summary Statistics
+
+| Bucket | Path | Documents | LOC |
+|---|---|---|---|
+| Active | `docs/private/research/archived-2026-05-19/` + `docs/` | 5 | 1,220 |
+| Archived | `docs/private/research/` | 42 | 7,737 |
+| **Total available** | — | **47** | **8,957** |
+
+---
+
+## Active Reference Documents
+
+These load into agent runtime context. Cited by the listed runtime artifact.
+
+| Doc | Purpose | Used By |
+|-----|---------|---------|
+| [accuracy-self-correction.md](private/research/archived-2026-05-19/accuracy-self-correction.md) | CoT verification and anti-conformity checks | evolve-auditor.md |
+| [eval-grader-best-practices.md](eval-grader-best-practices.md) | Eval grader precision and mutation resistance | eval-runner.md |
+| [evaluator-research.md](private/research/archived-2026-05-19/evaluator-research.md) | Evaluator agent design rationale — 14 papers, 8 benchmarks | evaluator/SKILL.md |
+| [performance-profiling.md](private/research/archived-2026-05-19/performance-profiling.md) | Token attribution and cost baselines | docs/index.md |
+| [token-optimization-guide.md](private/research/archived-2026-05-19/token-optimization-guide.md) | Per-cycle token + cost optimization | docs/index.md |
+
+---
+
+## Archived Research (in `docs/private/research/`)
+
+Restored verbatim from commit `35b31c4^` (cycle 13's parent). Cycle 13
+correctly deleted these from runtime context per Liu and others (2023) "Lost in
+the Middle"; v9.1.x re-introduced them as developer-only reference under
+`docs/private/`. Agents never see these during cycles. Contributors
+read them directly.
+
+Grouped by theme:
+
+### Agent architecture & capabilities
+
+| File | Topic |
+|---|---|
+| [agent-capability-benchmarking.md](private/research/agent-capability-benchmarking.md) | Capability measurement frameworks |
+| [agent-role-specialization.md](private/research/agent-role-specialization.md) | Role decomposition patterns |
+| [agent-skill-composition.md](private/research/agent-skill-composition.md) | Skill composition + selection |
+| [agent-state-persistence.md](private/research/agent-state-persistence.md) | State models, durable execution patterns |
+| [agent-testing-frameworks.md](private/research/agent-testing-frameworks.md) | Test harness patterns for agents |
+| [emergent-agent-behaviors.md](private/research/emergent-agent-behaviors.md) | Emergence + unintended capabilities |
+| [agent-lifecycle-management.md](private/research/agent-lifecycle-management.md) | Lifecycle stages + transitions |
+
+### Multi-agent systems & coordination
+
+| File | Topic |
+|---|---|
+| [agent-collaboration-games.md](private/research/agent-collaboration-games.md) | Multi-agent interaction games |
+| [agent-orchestration-anti-patterns.md](private/research/agent-orchestration-anti-patterns.md) | Anti-patterns in orchestration |
+| [multi-agent-blackboard.md](private/research/multi-agent-blackboard.md) | Blackboard / shared-state pattern |
+| [reasoning-orchestration-patterns.md](private/research/reasoning-orchestration-patterns.md) | Reasoning chains across agents |
+
+### Autonomous loops & self-improvement
+
+| File | Topic |
+|---|---|
+| [autonomous-experiment-loops.md](private/research/autonomous-experiment-loops.md) | Self-improving loop protocols |
+| [self-evolving-tool-creation.md](private/research/self-evolving-tool-creation.md) | Tool/gene library evolution |
+| [self-healing-agents.md](private/research/self-healing-agents.md) | Recovery + self-repair |
+| [prompt-evolution-optimization.md](private/research/prompt-evolution-optimization.md) | Promptbreeder-style evolution |
+
+### Economics & deployment
+
+| File | Topic |
+|---|---|
+| [agent-economics.md](private/research/agent-economics.md) | Unit economics, cost amplification |
+| [agent-deployment-patterns.md](private/research/agent-deployment-patterns.md) | Production deployment shapes |
+| [agent-config-versioning.md](private/research/agent-config-versioning.md) | Config versioning + migration |
+| [token-cost-optimization.md](private/research/token-cost-optimization.md) | Token-budget patterns |
+
+### Trust, safety, governance
+
+| File | Topic |
+|---|---|
+| [agent-governance-compliance.md](private/research/agent-governance-compliance.md) | Compliance + governance frameworks |
+| [agent-interpretability.md](private/research/agent-interpretability.md) | Interpretability techniques |
+| [agent-output-validation.md](private/research/agent-output-validation.md) | Output validation strategies |
+| [agent-sandboxing-patterns.md](private/research/agent-sandboxing-patterns.md) | Sandboxing approaches |
+| [reward-hacking-prevention.md](private/research/reward-hacking-prevention.md) | Reward-hacking detection + prevention |
+| [hitl-trust-calibration.md](private/research/hitl-trust-calibration.md) | Human-in-the-loop trust calibration |
+
+### Memory, context, retrieval
+
+| File | Topic |
+|---|---|
+| [memory-consolidation-pipeline.md](private/research/memory-consolidation-pipeline.md) | Memory consolidation across cycles |
+| [agentic-rag-patterns.md](private/research/agentic-rag-patterns.md) | RAG patterns for agents |
+| [context-engineering-patterns.md](private/research/context-engineering-patterns.md) | Context engineering techniques |
+| [long-context-agent-strategies.md](private/research/long-context-agent-strategies.md) | Long-context utilization |
+| [knowledge-distillation-agents.md](private/research/knowledge-distillation-agents.md) | Distillation for agent systems |
+
+### Interfaces & ecosystem
+
+| File | Topic |
+|---|---|
+| [agentic-ide-integration.md](private/research/agentic-ide-integration.md) | IDE integration patterns |
+| [agent-interoperability-protocols.md](private/research/agent-interoperability-protocols.md) | A2A / MCP-style protocols |
+| [agentic-systems-roadmap.md](private/research/agentic-systems-roadmap.md) | Ecosystem roadmap notes |
+| [ai-code-review-agents.md](private/research/ai-code-review-agents.md) | Code review agent designs |
+| [workflow-dag-patterns.md](private/research/workflow-dag-patterns.md) | Workflow DAG patterns |
+
+### Code generation & refactoring
+
+| File | Topic |
+|---|---|
+| [code-correctness-verification.md](private/research/code-correctness-verification.md) | Correctness verification |
+| [constrained-decoding-patterns.md](private/research/constrained-decoding-patterns.md) | Constrained decoding |
+| [refactoring-llm-research.md](private/research/refactoring-llm-research.md) | LLM-driven refactoring research |
+| [refactoring-pipeline-architecture.md](private/research/refactoring-pipeline-architecture.md) | Refactoring pipeline shape |
+| [refactoring-tools-landscape.md](private/research/refactoring-tools-landscape.md) | Tool landscape |
+| [synthetic-data-generation.md](private/research/synthetic-data-generation.md) | Synthetic data techniques |
+| [agent-failure-tracing.md](private/research/agent-failure-tracing.md) | Failure tracing + classification |
+
+## Merged 2026-08-05 (from kb/research and knowledge-base/research)
+
+Research packages: [code-audit-2026-07](research/code-audit-2026-07/README.md) ·
+[deliverable-alignment-2026-08](research/deliverable-alignment-2026-08/README.md) ·
+[failed-loop-analysis-2026-07](research/failed-loop-analysis-2026-07/README.md) ·
+[graph-engineering-2026-08](research/graph-engineering-2026-08/README.md) ·
+[llm-output-stability-2026-07](research/llm-output-stability-2026-07/README.md) ·
+[merge-concurrency-2026](research/merge-concurrency-2026/README.md) ·
+[token-concurrency-2026](research/token-concurrency-2026/README.md) ·
+[token-optimization-2026](research/token-optimization-2026/README.md) —
+plus three note dirs without READMEs: `research/coding-craft-2026/`,
+`research/fable-simulation-2026/`, `research/tmux-live-capture-2026-06-04/`.
+
+The architecture reviewer's comparison with five popular online review prompts,
+blind-judged on three scenarios (2026-09-28), is
+[research/coding-craft-2026/architecture-reviewer-comparison.md](research/coding-craft-2026/architecture-reviewer-comparison.md).
+
+Plus 12 single-file notes from knowledge-base/research (lessons-and-resolutions,
+verdict-classifier drift, flag-reduction design, token histories, and others) — see
+`docs/research/`.
+
+**Dated entries.** The sections below the chronicle come from one file for each entry in [research-index/](research-index/). To add an entry, add a file there and run `evolve docs index generate`. Do not edit the generated region by hand. After a rebase, `evolve pr refresh` writes it again ([plan P3](plans/pr-merge-latency-2026-10.md)).
+
+**The engineering chronicle** — workstream-level narratives (problem /
+approaches / decision / results / retro) — lives at
+[docs/chronicle/](chronicle/README.md).
+
+<!-- GENERATED:research-index BEGIN — do not edit by hand; run `evolve docs index generate` -->
+
+## 2026-09-02 — ship-rate hardening + pipeline dashboard
+
+| Document | What it is |
+|---|---|
+| [research/ship-rate-harness-reliability-2026-09-02.md](research/ship-rate-harness-reliability-2026-09-02.md) | Synthesis: measured ship rate (19.6 %, 0/11 streak), eleven source-verified architectural gaps, failure-bucket census, eight ranked proposals (R1/R2 implemented, R3–R8 filed). |
+| [research/ship-rate-harness-reliability-2026-09-02-sources.md](research/ship-rate-harness-reliability-2026-09-02-sources.md) | Literature survey, 60 sources: SWE-agent ACI ablations, self-repair limits, architect/editor split, best-of-N with verifiers, over-claiming incentives, deterministic hooks, verifier isolation, cascades. |
+| [research/pipeline-dashboard-patterns-2026-09-02.md](research/pipeline-dashboard-patterns-2026-09-02.md) | UI/observability patterns (~45 sources) behind ADR-0095: trace/session model, lanes not trees, immutable retry rounds, Sentry-style fingerprint groups, SSE mechanics for a Go single binary. |
+| [superpowers/specs/2026-09-02-ship-rate-harness-and-pipeline-dashboard-design.md](superpowers/specs/2026-09-02-ship-rate-harness-and-pipeline-dashboard-design.md) | The design spec (both sub-projects, TDD protocol, named patterns, clean-code limits). |
+
+## 2026-09-30 — comment policy, whole-tree tests, inbox and CLI coverage
+
+| Document | What it records |
+|---|---|
+| [research/cli-coverage-inventory-2026-09-30.md](research/cli-coverage-inventory-2026-09-30.md) | The inventory checks 147 core functions against the published `evolve` CLI. The CLI runs 64 fully, 36 partly, and 47 not at all. Each row has file:line evidence. The inventory gave 50 CLI requests (PR #750). |
+| [reports/inbox-review-2026-09-30.md](reports/inbox-review-2026-09-30.md) | The queue planned 0 batches from 183 items. A six-agent check against main gave a verdict for each item. A drain then opened the queue to 29 batches (PRs #745, #747). |
+| [reports/comment-round-12-findings-2026-09-30.md](reports/comment-round-12-findings-2026-09-30.md) | The 43 findings of comment reduction round 12 (PR #749), including two `scopedelta` security holes, and the inbox item that carries each. |
+| [reports/comment-strip-clean-code-review-2026-09-30.md](reports/comment-strip-clean-code-review-2026-09-30.md) | A Clean Code review of 64 stripped production files. No file reads fully without its comments. Two thirds of the removed comments carried intent, invariants, or design. The review lists the defects that the comments hid. |
+| [incidents/2026-09-30-a-lane-ship-grew-a-function-past-the-size-ratchet.md](incidents/2026-09-30-a-lane-ship-grew-a-function-past-the-size-ratchet.md) | Cycle 1779's lane ship turned main red through a whole-tree test its change scope never selected; the class fix (PR #751). |
+| [architecture/adr/0110-whole-tree-tests-run-before-main.md](architecture/adr/0110-whole-tree-tests-run-before-main.md) | Decision: every test that reads the whole tree runs before main, and an AST detector keeps the scanner pack complete. |
+| [architecture/adr/0111-code-carries-no-comments.md](architecture/adr/0111-code-carries-no-comments.md) | Decision: code carries no comments. Their content moves to code, tests, design notes, and the history archive. The commit gate refuses an added comment (PRs #746, #749, #753). |
+| [architecture/adr/0114-the-acs-verdict-is-always-written-and-complete.md](architecture/adr/0114-the-acs-verdict-is-always-written-and-complete.md) | Decision: every ACS run writes a complete verdict. A scope that cannot run becomes a named `egps/` harness red with its cause. The lane budget is one shared deadline. Predicates run in a scrubbed environment that the suite owns. |
+| [architecture/adr/0115-commit-gate-keeps-history-and-records-waivers.md](architecture/adr/0115-commit-gate-keeps-history-and-records-waivers.md) | Decision: the commit gate refuses a removed history comment that its change does not record. It records a review waiver as a `Review-waived` trailer. Pure-docs changes keep their review. The added-comment rule does not apply to `docs/`. |
+| [architecture/adr/0116-inbox-curation-verbs.md](architecture/adr/0116-inbox-curation-verbs.md) | Decision: curate inbox items through `evolve inbox show/list/edit/withdraw/verify`. Each item field has one owner: authored, curated, or verb-owned. The gate judges an edit on the fields that it writes. A withdrawal undoes a filing. A premise check is a lifecycle stamp. |
+| [architecture/adr/0117-pre-handoff-probes-run-the-build-floor.md](architecture/adr/0117-pre-handoff-probes-run-the-build-floor.md) | Decision: `evolve selfcheck build` and `evolve phase verify build` run the build handoff floor itself. They use one named check list with the inputs of the cycle. Three cycles (1763, 1764, 1788) failed on a floor check that a probe showed as green. |
+
+## 2026-10-07 — convergence policy (ADR-0126)
+
+| Document | What it records |
+|---|---|
+| [research/review-convergence-limited-rounds-2026-10.md](research/review-convergence-limited-rounds-2026-10.md) | Research: the best policy to converge review feedback in limited rounds. Two rounds capture 76–95% of the gain, so stop on marginal gain and keep the best round (VRR-Stop). LLM reviewers vary across runs, so verify findings and do not search again (OpenCodeReview). More revisions do not converge without less uncertainty (33,596 agent PRs). Google asks for "better, not perfect", and effort rises before the model, for reasoning failures only. The research maps to refinements CR1–CR8. |
+| [incidents/2026-10-07-l2-seven-review-rounds.md](incidents/2026-10-07-l2-seven-review-rounds.md) | The example issue: the L2 routing lane needed seven review fix rounds on the deepest Claude model. Four causes: a review added a capability, a heuristic over an unbounded input, delta checks that hunted instead of verifying, and nothing changing between rounds. |
+| [architecture/convergence-policy.md](architecture/convergence-policy.md) | Design: one pure `convergence.Decide` for every repeat-until-accepted loop. A three-rung ladder: change the feedback, then the strategy, then the scope. Stop on marginal gain, land the best round, and never run a fourth. Output first, with deferrals filed as follow-ups. Headroom is read from the manifests. |
+| [plans/convergence-policy-2026-10.md](plans/convergence-policy-2026-10.md) | Plan: strategies A to C, decisions V-D1 to V-D11, and CQ1. In CQ1 the operator sets top to Opus 5.5 at xhigh effort. Components are V0 to V9 plus V3b, which lands on the console first. The L2 replay is the acceptance test. It lands at round 3 through rung 2. |
+| [architecture/adr/0126-every-iterative-loop-converges-or-escalates.md](architecture/adr/0126-every-iterative-loop-converges-or-escalates.md) | Decision: every iterative loop converges or escalates. The order is feedback, then strategy, then scope. The loop lands the best round and never runs a fourth round. Capability findings below CRITICAL never block. Judges verify after `J_0`. A CRITICAL finding is never deferred. |
+
+## 2026-10-07 — the code-review loop and the audit evaluation contract
+
+| Document | What it records |
+|---|---|
+| [research/audit-evaluation-contract-prior-art-2026-10.md](research/audit-evaluation-contract-prior-art-2026-10.md) | Research: how AI software factories publish the standard of an evaluator to the agents that it judges. The sources are Anthropic, OpenAI, StrongDM, Stripe, and Augment. The 2026 evaluator research includes SpecBench, ImpossibleRubrics, PROCTOR, Agentic Rubrics, and self-preference bias. The verdict: contract before code, public criteria, private instruments, evidence as certificates, and facts over the judge. The research maps to refinements AR1–AR9. |
+| [architecture/review-loop-and-quality-index.md](architecture/review-loop-and-quality-index.md) | Design: the independent `code-review` loop between build and audit, and the ten-dimension quality index the review and the audit share (ADR-0124). |
+| [plans/code-review-phase-2026-10.md](plans/code-review-phase-2026-10.md) | Plan: the code-review phase's strategies (S1–S3), operator decisions, components and landings. |
+| [architecture/adr/0124-code-review-phase.md](architecture/adr/0124-code-review-phase.md) | Decision: an independent code-review loop sits between build and audit, and the audit qualifies its result on one shared quality index. |
+| [architecture/audit-evaluation-contract.md](architecture/audit-evaluation-contract.md) | Design: the published standard of the audit, with dimensions and `G-…` gate criteria that have verifiers and certificates. The `audit-plan` phase writes the expectations of each cycle before build. Delivery uses capped digests. A kernel cross-check holds the final audit to its plan (ADR-0125). |
+| [plans/audit-evaluation-contract-2026-10.md](plans/audit-evaluation-contract-2026-10.md) | Plan: approaches A to C, decisions E-D0 to E-D9, refinements AR1–AR9, and components E0 to E7. The operator made decisions E-D1 to E-D4. E0 has its own docs landing. E1 to E6 land inside landing 2 of the code-review plan. E7 lands at its flip. |
+| [architecture/adr/0125-audit-publishes-its-evaluation-contract.md](architecture/adr/0125-audit-publishes-its-evaluation-contract.md) | Decision: the audit publishes its standard, and before build it publishes the expectations of this cycle. Its verdicts link to published criteria. The criteria are public and the probe instances are private. |
+
+## 2026-10-08 — logging and process hygiene
+
+| Document | What it records |
+|---|---|
+| [research/logging-and-process-cleanup-2026-10.md](research/logging-and-process-cleanup-2026-10.md) | Research: structured logging in Go, log categories and retention, and process-tree cleanup on Linux and macOS. It also covers MCP server shutdown, harness cleanup practice and log reading for agents. Findings F1.1 to F6.8, refinements R1 to R21. |
+| [plans/logging-and-process-hygiene-2026-10.md](plans/logging-and-process-hygiene-2026-10.md) | Plan: the log catalog, a log dir for each loop launch, the ship gate output split and keep-on-fail for raw tool output (lane H1). It also covers process hygiene (H2) and the layered reader (H3, H4). Decisions K1 to K13, each with a status. |
+
+## 2026-10-09 — event channels (ADR-0127)
+
+| Document | What it records |
+|---|---|
+| [research/event-notification-protocol-2026-10.md](research/event-notification-protocol-2026-10.md) | Research: kernel file notification (kqueue, inotify, fsnotify, FSEvents, pidfd) and the cost of local IPC. It also covers topic and channel prior art: Kafka, NATS, Redis Streams, MQTT, D-Bus, Kubernetes and etcd. Findings F1.1 to F7.3, an adopt-or-reject table, refinements R1 to R24. |
+| [architecture/event-channels.md](architecture/event-channels.md) | Design, the spec of record: channel logs with byte cursors, a locked append, two QoS classes and the kernel wake (arm, catch up, wait). It also covers the filter grammar, subscriptions, delivery, consumer groups, retention, the `evolve events` verbs, the exit codes and the limits. |
+| [plans/event-notification-protocol-2026-10.md](plans/event-notification-protocol-2026-10.md) | Plan: the poll audit, three candidate designs with scores, the operator decisions, decisions D1 to D30 and the Signal Center through the channels. It also lists the migrations, and components E0 to E14 with their red tests. |
+| [architecture/adr/0127-push-only-event-channels.md](architecture/adr/0127-push-only-event-channels.md) | Decision: events reach other programs through channel logs that the kernel wakes, never through a poll, with the Signal Center as the one producer path. |
+
+## 2026-10-09 — concurrent cycle landing (ADR-0128)
+
+| Document | What it records |
+|---|---|
+| [research/concurrent-cycle-landing-2026-10.md](research/concurrent-cycle-landing-2026-10.md) | Research: a census of 46 fleet-rebase recoveries, at 24.2 min and 1.49 LLM phases each. It shows why cycle 1843 was not proven identical and why the prefix queue of ADR-0078 is off. It also covers merge queues, agent harnesses, test selection, the cost model and five approaches. Findings F2.1 to F9.3, refinements R1 to R33. |
+| [architecture/fleet-landing-queue.md](architecture/fleet-landing-queue.md) | Design, the spec of record: the durable landing queue, the composition with `merge-tree`, the overlap proof and the tiers T1 to T4. It also covers the scoped gates, the interaction review, ejection, budgets, signals, config keys, failure modes and limits. |
+| [plans/concurrent-cycle-landing-2026-10.md](plans/concurrent-cycle-landing-2026-10.md) | Plan: operator decisions O1 to O13, console decisions CD1 to CD4, decisions D1 to D53, and components Q0 to Q19 with red tests. It also holds the migration from the current ladder, the rollout from shadow to enforce with its metrics, and the risks. |
+| [architecture/adr/0128-landing-queue-tiered-reverification.md](architecture/adr/0128-landing-queue-tiered-reverification.md) | Decision: fleet lanes land through one queue, and their overlap with the peers picks the re-verification. It amends ADR-0078, ADR-0105 and ADR-0049. |
+
+## 2026-10-09 — cycle agent messaging (ADR-0129)
+
+| Document | What it records |
+|---|---|
+| [research/agent-messaging-2026-10.md](research/agent-messaging-2026-10.md) | Research: agent-to-agent protocols (A2A, MCP, Claude Code teams and messages, AutoGen, MetaGPT, CAMEL) and scope (NATS, MQTT, Kafka). It also covers identity under one uid, delivery to a busy LLM agent, safety and scale. Findings F1.1 to F7.5, an adopt-or-reject table, refinements R1 to R24. |
+| [architecture/agent-messaging.md](architecture/agent-messaging.md) | Design, the spec of record: the `msg/1.0` envelope, the address grammar, the identity with the outbox location and the token, and the policy rules. It also covers the flow, the store on the ADR-0127 log, the delivery adapters, the limits, the `evolve msg` verbs, the paths and the threat model. |
+| [plans/agent-messaging-2026-10.md](plans/agent-messaging-2026-10.md) | Plan: operator decisions OD1 to OD4, four candidate designs with scores, decisions D1 to D15 and the skeleton. It also lists the wiring seams, and components M0 to M8 with their tests. |
+| [architecture/adr/0129-cycle-scoped-agent-messaging.md](architecture/adr/0129-cycle-scoped-agent-messaging.md) | Decision: the agents of one cycle send messages through a broker of that cycle, with a general protocol and a scoped policy. It amends ADR-0127 and ADR-0064. |
+
+## 2026-10-09 — a retry carries the evidence of the dispatch that it replaces (ADR-0130)
+
+| Document | What it records |
+|---|---|
+| [research/attempt-postmortem-2026-10.md](research/attempt-postmortem-2026-10.md) | Research: the cycle 1853 chain, the records that the repository writes today, and how agent harnesses carry failure context into a retry. It covers Reflexion, SWE-agent, OpenHands, Claude Code, Aider, LangGraph and same-input retry. Findings F1.1 to F3.10, refinements R1 to R9. |
+| [plans/attempt-postmortem-2026-10.md](plans/attempt-postmortem-2026-10.md) | Plan: four candidate designs with scores, decisions D1 to D18, components P1 to P5, the wiring lane W1 and the repeat guard G1 (R3). |
+| [architecture/adr/0130-a-retry-carries-the-evidence-of-the-attempt-it-replaces.md](architecture/adr/0130-a-retry-carries-the-evidence-of-the-attempt-it-replaces.md) | Decision: each abnormal end of a phase dispatch leaves a postmortem record. The next dispatch or a resume gets a section from the bridge with a do-not-repeat rule. |
+
+## 2026-10-11 — a gate that refuses a changed function below 100%
+
+| Document | What it records |
+|---|---|
+| [plans/cover-changed-gate-2026-10.md](plans/cover-changed-gate-2026-10.md) | Plan: the 14-day coverage audit, the root cause, four candidate designs and decisions D1 to D13 (no allowance list, CI enforcement). It also holds the criteria to move the loop floor from shadow to enforce. |
+
+## 2026-10-12 — the test system: one run, many judges, one home for each helper (ADR-0131)
+
+| Document | What it records |
+|---|---|
+| [research/test-system-efficiency-2026-10.md](research/test-system-efficiency-2026-10.md) | Research: the growth of the suite, the repeats in the local floor, the poles of the integration run and the 10 GB transcript scan. It also covers duplicate helpers and isolation. Current practice: coverage, fake time and test selection. Findings F1.1 to F5.5, refinements R1 to R13. |
+| [architecture/test-system.md](architecture/test-system.md) | Design, the spec of record: the design of one test case, one instrumented run with judges that read it, and the order of seams. It also covers the helper kits, the duplicate ratchet, wall budgets and test lanes. |
+| [plans/test-system-efficiency-2026-10.md](plans/test-system-efficiency-2026-10.md) | Plan: four candidate designs with scores, decisions D1 to D16, and components T0 to T9 with their red tests, order and lane models. |
+| [research/ci-wall-time-2026-10.md](research/ci-wall-time-2026-10.md) | Research: where the 21–25 min CI run goes, measured from one test up to the workflow. The macOS job is the critical path, and three shapes of long pole set the package floors. Findings F3.1 to F3.19, refinements R1 to R10. F3.10 has 16 darwin-sensitive packages, F3.13 the rusage, and F3.16 to F3.19 the two test families that use half of the test CPU. Section 3.1 (2026-10-17) adds F3.20 to F3.35 from the first instrumented run. They show the macOS kernel tax, a race sleep per binary and four C1 defects (R11 to R18). |
+| [plans/ci-wall-time-2026-10.md](plans/ci-wall-time-2026-10.md) | Plan: five candidate designs with weighted scores. The winner is telemetry first, then a scoped CI matrix, then the unit-level poles. A telemetry index catalog for five levels. Decisions D1 to D14, components C0 to C5b. Section 6a ranks components C6 to C14 (decisions D15 to D23) by measured saving, and scores four approaches for C6, the e2e double run. |
+| [architecture/ci-telemetry-and-critical-path.md](architecture/ci-telemetry-and-critical-path.md) | Design: how each CI run records time, resources and load, and how the records join. The report names the critical path and its limiting resource. A worked example. Section 13 specifies C12 (the limit of a package from its own time window) and C13 (macOS CPU samples and a spawn counter). |
+| [architecture/adr/0135-ci-measures-itself-before-it-changes-its-shape.md](architecture/adr/0135-ci-measures-itself-before-it-changes-its-shape.md) | Decision: the CI measures itself first, then each job proves only what it alone can prove. |
+
+| [research/model-tier-policy-2026-10.md](research/model-tier-policy-2026-10.md) | Research: the tier defaults of the phase profiles and the CLI and tier of each phase in cycles 1879 to 1914. It also covers agy's own `/usage` screen with its three quota pools, and quota-aware routing in current practice. Each practice has an adopt or reject decision. |
+| [research/bridge-factory-2026-10.md](research/bridge-factory-2026-10.md) | Research: an audit of every call that queries or acts on an LLM CLI, with file and line (B1 to B12). It also covers the Factory, Service Locator and dependency injection patterns (P6.1 to P6.5). |
+| [architecture/agent-bridge-factory.md](architecture/agent-bridge-factory.md) | Design, the spec of record: the factory `bridge.Resolve`, the DriverSet, capabilities and the manifest `controls` schema. It also covers interfaces that the consumer owns, a worked example, guards and limits. |
+| [plans/model-tier-policy-2026-10.md](plans/model-tier-policy-2026-10.md) | Plan: a purpose and a chain for each model tier across separate quota pools, and Gemini 4 Argon (Medium) for agy at deep and top. Three mechanisms scored; the winner is a catalog tier pin. |
+| [plans/bridge-factory-2026-10.md](plans/bridge-factory-2026-10.md) | Plan: every query and action on an LLM CLI goes through one bridge factory, and the manifest holds the CLI facts. An audit of the bypasses with file and line, three designs scored, components F1 to F6. |
+| [architecture/adr/0137-one-bridge-factory-resolves-every-llm-cli-and-the-manifest-holds-its-facts.md](architecture/adr/0137-one-bridge-factory-resolves-every-llm-cli-and-the-manifest-holds-its-facts.md) | Decision: one bridge factory resolves every LLM CLI, and the manifest holds its facts. |
+| [architecture/adr/0136-each-model-tier-walks-separate-quota-pools-and-agy-runs-argon-medium-at-deep-and-top.md](architecture/adr/0136-each-model-tier-walks-separate-quota-pools-and-agy-runs-argon-medium-at-deep-and-top.md) | Decision: each tier walks separate quota pools, and agy runs Argon (Medium) at deep and top. |
+| [architecture/adr/0131-one-test-run-feeds-every-coverage-gate.md](architecture/adr/0131-one-test-run-feeds-every-coverage-gate.md) | Decision: one instrumented run feeds every coverage gate. A test never reads the host home. Each test helper has one home. |
+
+## 2026-10-12 — one skill writes every document that a person reads (ADR-0132)
+
+| Document | What it records |
+|---|---|
+| [research/docs-write-skill-2026-10.md](research/docs-write-skill-2026-10.md) | Research: the house rules for documents, the conflict of the front matter rule, and the skill preload. It surveys Diátaxis, Google design docs, Rust RFCs, KEPs, ADR collections and The Good Docs Project. Findings F2.1 to F2.8 and P3.1 to P3.7, refinements R1 to R9. |
+| [plans/docs-write-skill-2026-10.md](plans/docs-write-skill-2026-10.md) | Plan: four candidate approaches with scores, the winner (reasoning first) and what it takes from the others. Decisions D1 to D9 and components K0 to K4. |
+| [architecture/adr/0132-documents-are-written-through-one-skill.md](architecture/adr/0132-documents-are-written-through-one-skill.md) | Decision: every document goes through the `docs-write` skill. Each decision cites its evidence and its rejected options. The skill is on by default. |
+
+## 2026-10-12 — the loop watches CLI practice and trims its scaffolding by measure (ADR-0133)
+
+| Document | What it records |
+|---|---|
+| [research/model-capability-practice-2026-10.md](research/model-capability-practice-2026-10.md) | Research: the size and the emphatic words of the phase prompts, the share of console commits, the full-disk stop, and the watch that exists. It also covers the current guidance of Anthropic, OpenAI and Google, and the sources that a watch can read. Findings F2.1 to F3.3 and P4.1 to P4.6, refinements R1 to R7. |
+| [plans/model-capability-practice-2026-10.md](plans/model-capability-practice-2026-10.md) | Plan: four approaches for less scaffolding and four for the practice watch, each with scores, a winner and what it takes from the others. Decisions D1 to D11 and components M0 to M5. |
+| [architecture/adr/0133-the-loop-watches-cli-practice-and-trims-its-scaffolding.md](architecture/adr/0133-the-loop-watches-cli-practice-and-trims-its-scaffolding.md) | Decision: a deterministic watch files a research item when a source changes. Prompt trims are measured, one persona at a time. |
+| [research/practice-claude-code-changelog-2026-10.md](research/practice-claude-code-changelog-2026-10.md) | Research: the Claude Code changelog updates for versions 2.1.299 through 2.1.303 read as data. No persona changes before the M2 baseline. |
+| [research/practice-claude-prompting-guide-2026-10.md](research/practice-claude-prompting-guide-2026-10.md) | Research: the Claude prompting guide updates (XML structure, effort levels, and medication dosing blocks) read as data. No persona changes before the M2 baseline. |
+| [research/practice-gemini-prompting-guide-2026-10.md](research/practice-gemini-prompting-guide-2026-10.md) | Research: the Gemini prompting guide change (Gemini 4 Argon, the end of custom `temperature`, `top_p` and `top_k`) read as data. The loop sends none of these parameters, and no persona changes before the M2 baseline. |
+| [research/practice-agy-cli-changelog-2026-10.md](research/practice-agy-cli-changelog-2026-10.md) | Research: the agy changelog updates for versions 1.3.4 through 1.4.2 read as data. No persona changes before the M2 baseline. |
+| [research/practice-agy-cli-changelog-page-2026-10.md](research/practice-agy-cli-changelog-page-2026-10.md) | Research: the agy changelog page updates for v1.4.0 through v2.24.0 and the snapshot diff of search filter labels read as data. No persona changes before the M2 baseline. |
+| [research/practice-claude-model-release-notes-2026-10.md](research/practice-claude-model-release-notes-2026-10.md) | Research: the Claude model release notes updates for Opus 5.5 fast mode rate limits and research preview status read as data. No persona changes before the M2 baseline. |
+| [research/practice-claude-model-release-notes-2026-11.md](research/practice-claude-model-release-notes-2026-11.md) | Research: the Claude model release notes updates read as data. They cover the Opus 4.8 fast mode deprecation, the usage analytics API and the 128 MB request size. No persona changes before the M2 baseline. |
+| [research/practice-claude-prompting-guide-2026-11.md](research/practice-claude-prompting-guide-2026-11.md) | Research: the Claude prompting guide lines on aggressive capital wording read as data. A proposal for one-persona diets of the builder, the auditor and the scout under ADR-0133, with marker counts as the before measure. No persona changes before the M2 baseline. |
+| [research/practice-agy-cli-changelog-2026-11.md](research/practice-agy-cli-changelog-2026-11.md) | Research: the agy changelog updates for versions 1.4.3 through 1.4.12 read as data. No persona changes before the M2 baseline. |
+| [research/practice-agy-cli-changelog-page-2026-11.md](research/practice-agy-cli-changelog-page-2026-11.md) | Research: the agy changelog page releases v2.28.2 through v2.27.0 read as data. They belong to the desktop app tab, not the CLI. No persona changes before the M2 baseline. |
+| [research/agy-cli-changelog-2026-11.md](research/agy-cli-changelog-2026-11.md) | Research: the agy CLI changelog tab lines on Voice mode, Remote Agents, ACP and v1.4.12 and v1.4.11 read as data. No persona changes before the M2 baseline. |
+| [research/practice-gemini-prompting-guide-2026-11.md](research/practice-gemini-prompting-guide-2026-11.md) | Research: the Gemini prompting guide read as data after the snapshot of 2026-10-14. The item shows only two words. No persona changes before the M2 baseline. |
+
+## 2026-10-13 — fleet landing at scale: 200 concurrent lanes (ADR-0134)
+
+| Document | What it records |
+|---|---|
+| [research/fleet-landing-at-scale-2026-10.md](research/fleet-landing-at-scale-2026-10.md) | Research: why one ship takes five minutes (`cmd/evolve` in the importer backstop). The cost of today's path at N = 2, 20 and 200, and the overlap rate of the import graph. It also surveys merge queues, speculative chains, batches and bisection, content-keyed test selection and git mechanics. Findings F2.1 to F3.5 and P4.1 to P8.4, refinements R1 to R12. |
+| [plans/fleet-landing-at-scale-2026-10.md](plans/fleet-landing-at-scale-2026-10.md) | Plan: five approaches with weighted scores, and the winner with what it takes from the others. The winner is partitioned speculative chains with content-keyed verification and group commit. Decisions D1 to D17 and components S0 to S17 with red tests. The rollout from shadow to enforce, and the simulation at N = 2, 20 and 200. |
+| [architecture/adr/0134-fleet-landings-scale-through-content-keyed-verification-and-group-commit.md](architecture/adr/0134-fleet-landings-scale-through-content-keyed-verification-and-group-commit.md) | Decision (Proposed): a content key proves each package run, and candidates verify before the head. Candidates with no edge land in any order, and one push lands the verified run. It amends ADR-0128. |
+
+## 2026-10-17 — a code index CLI for every phase agent (ADR-0138)
+
+| Document | What it records |
+|---|---|
+| [research/code-index-cli-2026-10.md](research/code-index-cli-2026-10.md) | Research: why the trail-code MCP trial got 0 calls in 20 agy phases, and why Claude Code phases cannot reach it. It also records the index timings and surveys CLI against MCP, code-graph tools and `gopls`. Findings C1 to C8 and P3.1 to P3.5, refinements R1 to R6. |
+| [plans/code-index-cli-2026-10.md](plans/code-index-cli-2026-10.md) | Plan: four designs with weighted scores. The winner is `evolve code` over a swappable backend, with trail-code first. Decisions D1 to D8 and components K1 to K5 with red tests. |
+| [architecture/adr/0138-phase-agents-query-the-code-index-through-an-evolve-cli-not-mcp.md](architecture/adr/0138-phase-agents-query-the-code-index-through-an-evolve-cli-not-mcp.md) | Decision (Proposed): phase agents query the code index through four read-only `evolve code` commands, not MCP. A `Backend` interface keeps a type-checked backend open. |
+| [architecture/code-index-cli.md](architecture/code-index-cli.md) | Spec: the commands and their exit codes, the `Backend` interface, the trail-code adapter, the index lifecycle, the sandbox, the usage log and the prompt text. It has a worked example and the guards. |
+| [conventions/cli-only-no-mcp.md](conventions/cli-only-no-mcp.md) | Convention: no phase, lane or project config uses MCP. Each outside service is reached through a CLI. It names the three guards: the launch flag test, the structure test and the preflight warning. |
+
+## 2026-10-17 — wave orchestrator: at least four lanes, few conflicts, a large fleet (ADR-0139)
+
+| Document | What it records |
+|---|---|
+| [research/wave-orchestrator-2026-10.md](research/wave-orchestrator-2026-10.md) | The quota shrink costs a lane for a family with a fallback. 0 of 230 inbox items reach a lane. A barrier of 4 lanes keeps 66% of the slot time busy. The console-routing census shows the lane supply fell from 41 items to 1 in one month, and gives six remedies. It also has an outside survey. Findings F2.1 to F2.24 and P3.1 to P3.17, refinements R1 to R8. |
+| [plans/wave-orchestrator-2026-10.md](plans/wave-orchestrator-2026-10.md) | Plan: four approaches with weighted scores. The winner is one deterministic orchestrator that supplies, admits by cell, backfills a rolling pool, leases each lane and oversees on events. Decisions D1 to D15 and components O0 to O8 with red tests. |
+| [plans/pool-resupply-2026-10.md](plans/pool-resupply-2026-10.md) | Plan: a free pool slot takes the work that became ready after the run started. Four designs scored; the winner is a `Resupply` port that re-runs the plan source on a lane exit. A deadline stop no longer re-queues the todo in the same run. Decisions D1 to D8. |
+| [architecture/adr/0139-a-wave-orchestrator-supplies-admits-and-backfills-every-lane.md](architecture/adr/0139-a-wave-orchestrator-supplies-admits-and-backfills-every-lane.md) | Decision (Proposed): one Go component owns the run of lanes. It builds ADR-0134 S14 as its admission step and wakes on the ADR-0127 channels. |
+| [architecture/wave-orchestrator.md](architecture/wave-orchestrator.md) | Design, the spec of record: the census, the sizing, the admission by cell, the pool, the lease, the oversight and the window. It gives the measures and the cost of each step as a function of N. The limits: about 6 lanes for the serial landing, 8–12 lanes for one host (estimate), and 139 disjoint Go cells. |
+
+## 2026-10-17 — code-index backends: trail-code, graphify and the type checker, measured (ADR-0140)
+
+| Document | What it records |
+|---|---|
+| [research/code-index-backends-2026-10.md](research/code-index-backends-2026-10.md) | Research: trail-code and graphify 0.9.92 measured against a stdlib Go type checker on 40 symbols and 10 files. For each backend, it gives the precision, the recall, the latency, the output size, the build, the disk and the refresh. It also records graphify's writes and advice text, a grep check of the truth and a CLI prototype of the type-checked index. It also surveys graphify, code-graph tools and type-checked Go options. Findings F2.1 to F2.22 and P3.1 to P3.8, refinements R1 to R7. |
+| [plans/code-index-backends-2026-10.md](plans/code-index-backends-2026-10.md) | Plan: four approaches with weighted scores, under the operator's rule that forbids MCP. The winner is a capability route that a benchmark fills: a type-checked `gotypes` backend for `callers` and `api`, trail-code for `find` and `map`. Decisions D1 to D11, which match the ADR numbers, and components G1 to G5 with red tests. |
+| [architecture/adr/0140-the-type-checker-answers-callers-and-each-query-goes-to-its-best-measured-backend.md](architecture/adr/0140-the-type-checker-answers-callers-and-each-query-goes-to-its-best-measured-backend.md) | Decision (Proposed): the type checker answers `callers` and `api`, and `evolve code bench` decides the backend of each query. graphify stays a bench-only run of its CLI. It relates to ADR-0138. |
+| [architecture/code-index-cli.md](architecture/code-index-cli.md) | Spec, section 9 "Backends and the benchmark": how each backend maps the four queries, the bench and its truth, the capability route and the guards. |
+
+## 2026-10-18 — the phase handoff contract: request, build and check between every phase pair (ADR-0141)
+
+| Document | What it records |
+|---|---|
+| [research/phase-handoff-contract-2026-10.md](research/phase-handoff-contract-2026-10.md) | Research: cycles 1946 and 1950 failed on their request, not on their code. Three of five phase pairs have no check of the output against the ask, and the audit chain is shadow. It also surveys self-checks, independent judges and stop rules. It also covers blocked requests and attestation chains. Findings F1.1 to F1.14 and P2.1 to P2.17, refinements R1 to R10. |
+| [plans/phase-handoff-contract-2026-10.md](plans/phase-handoff-contract-2026-10.md) | Plan: four approaches with weighted scores. The winner is one handoff contract: a request, a ledger, a deterministic check and then a judge, with three exits. Decisions D1 to D12 and components H1 to H12 with red tests. |
+| [architecture/adr/0141-every-phase-handoff-is-a-request-build-check-loop-with-three-exits.md](architecture/adr/0141-every-phase-handoff-is-a-request-build-check-loop-with-three-exits.md) | Decision (Accepted): every phase pair runs a request, build and check loop. The exits are pass, cap and blocked. Only deterministic proof blocks. |
+| [architecture/phase-handoff-contract.md](architecture/phase-handoff-contract.md) | Design, the spec of record: the pairs and their requests, the ledger schema and the two layers of the check. It also gives the exits, the chain in the audit and a worked example on cycle 1950. |
+
+## 2026-10-19 — a proven blocker stops the correction rounds
+
+| Document | What it records |
+|---|---|
+| [plans/build-blocker-exit-2026-10.md](plans/build-blocker-exit-2026-10.md) | Plan: cycles 1946 and 1950 used all their correction rounds on blockers that no lane edit can fix. Three designs with weighted scores. The winner proves each `BLOCKER` claim in the review loop. Decisions D1 to D10 and components K1 to K7 with red tests. |
+| [architecture/blocker-exit.md](architecture/blocker-exit.md) | Spec: the claim grammar, the `BlockerProver` seam, the loop exit, the `blocked-needs-console` ending, the console route and the floor text. |
+
+## 2026-10-19 — a capability failure climbs one bounded retry ladder (ADR-0142)
+
+| Document | What it records |
+|---|---|
+| [research/retry-ladder-2026-10.md](research/retry-ladder-2026-10.md) | Research: about half of the build correction rounds of cycles 1800 to 1970 fail again, and no round raises the tier or the effort. The builder pin turns off the raises that exist. It also surveys model cascades, effort guidance and self-repair limits. Findings F2.1 to F2.12 and F3.1 to F3.10. |
+| [plans/retry-ladder-2026-10.md](plans/retry-ladder-2026-10.md) | Plan: five designs with scores. The winner is one retry ladder with a deterministic classifier, three rungs and a stop rule. Decisions D1 to D14, components L0 to L8 and four open decisions. |
+| [architecture/adr/0142-a-capability-failure-climbs-one-bounded-retry-ladder.md](architecture/adr/0142-a-capability-failure-climbs-one-bounded-retry-ladder.md) | Decision (Proposed): only a capability failure climbs. It takes one effort step and then one tier step. Two tiers that fail on one check stop as a spec failure. |
+| [architecture/retry-ladder.md](architecture/retry-ladder.md) | Design, the spec of record: the flow, the classifier signals and the rungs for each family. It also gives the retry paths, the try record, the policy keys and the signals. |
+
+## 2026-10-19 — a wider wave, a faster build and gates that test once (ADR-0143)
+
+| Document | What it records |
+|---|---|
+| [research/wave-latency-2026-10.md](research/wave-latency-2026-10.md) | Research: waves 130 to 133 used 51% of their slot-hours. A lane that edits `internal/core` held 13 ready items for 71 minutes. Build is 46% of lane time, and the gates are 28%. It also surveys merge queues, test caches, routers and pools. Findings F2.1 to F5.3 and O1 to O11. |
+| [plans/wave-latency-2026-10.md](plans/wave-latency-2026-10.md) | Plan: three levers with scored designs. The choices are optimistic admission, a headroom-aware build order and one verdict store. Decisions D1 to D7 and components W0 to W5. |
+| [architecture/adr/0143-admission-holds-only-shared-edits-and-the-ship-gate-owns-api-drift.md](architecture/adr/0143-admission-holds-only-shared-edits-and-the-ship-gate-owns-api-drift.md) | Decision (Accepted, stage shadow): admission holds only shared edits and the hub, and the composed-tree gate of the ship owns API drift. |
+
+## 2026-10-20 — each rule has one home and loads by audience, path, action or failure (ADR-0145)
+
+| Document | What it records |
+|---|---|
+| [research/guidance-layers-2026-10.md](research/guidance-layers-2026-10.md) | Research: the rules sit in seven kinds of source. The console carries about 316 always-on lines, and phase agents cannot read the memory rules. It also surveys skills, rule tiers, instruction load and rules as code. Findings F2.1 to F2.12 and S1 to S11. |
+| [plans/guidance-layers-2026-10.md](plans/guidance-layers-2026-10.md) | Plan: five designs with scores. The winner is one rule registry that generates every layer, with a check in CI. Decisions D1 to D11, components G0 to G7 and G3a, the migration and eight conflicts for the operator. |
+| [architecture/adr/0145-each-rule-has-one-home-and-loads-by-audience-path-action-or-failure.md](architecture/adr/0145-each-rule-has-one-home-and-loads-by-audience-path-action-or-failure.md) | Decision (Proposed): one registry, five layers, four triggers, and a forced load for every rule that must hold. |
+| [architecture/guidance-layers.md](architecture/guidance-layers.md) | Design, the spec of record: the layers, the budgets, the triggers and their loaders, and the registry schema. It also gives the load of each audience, the situation skills, the checks and a worked example. |
+
+## 2026-10-20 — latency is gated by invariants at merge and by trends on main (ADR-0144)
+
+| Document | What it records |
+|---|---|
+| [research/latency-gates-2026-10.md](research/latency-gates-2026-10.md) | Research: the latency fixes, the existing test tools and current practice for gates on noisy runners (F3.1 to F3.5, G1 to G12). |
+| [plans/latency-gates-2026-10.md](plans/latency-gates-2026-10.md) | Plan: hard gates on behavior, a seeded wave simulation and soft trend gates (D1 to D5, T1 to T7). |
+| [architecture/adr/0144-latency-is-gated-by-invariants-at-merge-and-by-trends-on-main.md](architecture/adr/0144-latency-is-gated-by-invariants-at-merge-and-by-trends-on-main.md) | Decision (Proposed): hard gates never read the wall clock, and measured times file an item after two breaches. |
+
+## 2026-10-20 — a defect that survives two builder rounds is fixed from the finder's spec (ADR-0146)
+
+| Document | What it records |
+|---|---|
+| [research/finder-fix-ownership-2026-10.md](research/finder-fix-ownership-2026-10.md) | Research: the first repair round fixes about 71% of audit failures. It also surveys who finds, writes and approves a fix. Findings F2.1 to F2.4 and R1 to R12. |
+| [plans/finder-fix-ownership-2026-10.md](plans/finder-fix-ownership-2026-10.md) | Plan: five designs with weighted scores. The finder writes the fix spec, a fresh builder applies it, and another check verifies. Decisions D1 to D8 and components F0 to F6. |
+| [architecture/adr/0146-a-defect-that-survives-two-builder-rounds-is-fixed-from-the-finders-spec-and-verified-by-another.md](architecture/adr/0146-a-defect-that-survives-two-builder-rounds-is-fixed-from-the-finders-spec-and-verified-by-another.md) | Decision (Accepted): R1 retry, R2 effort, R3 a fix from the finder's spec, verified by a check that did not write it. |
+
+## 2026-10-20 — a change of documents gets a docs review, not a code review
+
+| Document | What it records |
+|---|---|
+| [research/docs-review-skill-2026-10.md](research/docs-review-skill-2026-10.md) | Research: the commit gate asked a docs-only change for code reviewers. It surveys docs review practice (Diátaxis quality, ADR review, docs-as-code checks). Three approaches are scored. A `docs-review` skill and gate capability win. Findings F2.1 to F2.4, M1 to M7, decisions D1 to D5. |
+
+## 2026-10-20 — the wave orchestrator owns integration and decides when the wave reaches main (ADR-0147)
+
+| Document | What it records |
+|---|---|
+| [research/wave-integration-2026-10.md](research/wave-integration-2026-10.md) | Research: about one lane in four needed a rebase recovery at landing, and `main` moved 100 times in two days. It also surveys merge trains, merge queues, batching and culprit finding. Findings F2.1 to F2.7 and M1 to M16. |
+| [plans/wave-integration-2026-10.md](plans/wave-integration-2026-10.md) | Plan: five designs with scores. The orchestrator orders, composes and tests the deliverables on one integration branch, and flushes a batch as one PR. Decisions D1 to D23, with four test layers L1 to L4, and components I0 to I11. |
+| [architecture/adr/0147-the-wave-orchestrator-owns-integration-and-decides-when-the-wave-reaches-main.md](architecture/adr/0147-the-wave-orchestrator-owns-integration-and-decides-when-the-wave-reaches-main.md) | Decision (Proposed): lanes deliver and do not push `main`; the orchestrator owns the order, the compose, the test and the push. |
+
+## 2026-10-20 — docs, inbox and CI PRs merge in a window; code merges at a boundary (ADR-0148)
+
+| Document | What it records |
+|---|---|
+| [plans/pr-merge-latency-2026-10.md](plans/pr-merge-latency-2026-10.md) | Plan: the merge wait of PRs #979 to #1005, four designs with weighted scores, and components P1 to P5. P1 is shelved. The window stays off until `fleet.integration.stage` is `enforce` (ADR-0147). |
+| [architecture/adr/0148-docs-inbox-and-ci-changes-merge-in-a-window-and-code-merges-at-a-boundary-that-the-console-can-call-early.md](architecture/adr/0148-docs-inbox-and-ci-changes-merge-in-a-window-and-code-merges-at-a-boundary-that-the-console-can-call-early.md) | Decision (Accepted): a window PR merges when green, also in a wave. A code PR merges at a boundary, and the console can call one early. |
+| [architecture/packages/internal-mergewindow.md](architecture/packages/internal-mergewindow.md) | Package note: the merge window rule reads the CI routing table of `required.yml`. |
+
+## 2026-10-20 — a test-writing phase that states FAIL on its own work is retracted (ADR-0149)
+
+| Document | What it records |
+|---|---|
+| [architecture/adr/0149-a-test-writing-phase-that-states-fail-on-its-own-work-is-retracted-to-its-dispatch-tree.md](architecture/adr/0149-a-test-writing-phase-that-states-fail-on-its-own-work-is-retracted-to-its-dispatch-tree.md) | Decision (Proposed): on a stated FAIL, the runner restores every path the phase wrote and keeps its copies. Three options are scored, with the argument that a builder red cannot leave through this path. |
+
+## 2026-10-21 — the deep tier shares its seats between Argon and Claude by budget (ADR-0150)
+
+| Document | What it records |
+|---|---|
+| [research/deep-tier-share-2026-10.md](research/deep-tier-share-2026-10.md) | Research: the Argon burn of 2026-10-17, the usage windows the router can read, and current practice on budget pacing, hash splits and weighted routing. |
+| [plans/deep-tier-share-2026-10.md](plans/deep-tier-share-2026-10.md) | Plan: four designs with scores, the share plus the pace, and components S1 to S6. |
+| [architecture/adr/0150-the-deep-tier-gives-its-first-family-a-fixed-share-of-the-seats-and-paces-it-by-its-week-window.md](architecture/adr/0150-the-deep-tier-gives-its-first-family-a-fixed-share-of-the-seats-and-paces-it-by-its-week-window.md) | Decision: a fixed share by a hash of the seat, and a pace by the week window. |
+| [architecture/deep-tier-share.md](architecture/deep-tier-share.md) | Spec of record: the share stage, the pace and the operator surfaces. |
+
+## 2026-10-21 — the host writes a retrospective document for each recovery and each judgment lesson (ADR-0151)
+
+| Document | What it records |
+|---|---|
+| [research/recovery-retrospective-2026-10.md](research/recovery-retrospective-2026-10.md) | Research: the detector rule finds 12 recoveries in the dossiers, and no record of a recovery exists. The dossier, not the ledger, is the exact record of a try, and a ship is a PASS with a commit. It also surveys Safety-II, blameless postmortems, flaky-test recovery and agent memory from success and failure pairs. Findings F2.1 to F2.13, P3.1 to P3.7. |
+| [plans/recovery-retrospective-2026-10.md](plans/recovery-retrospective-2026-10.md) | Plan: four designs with weighted scores. The host writes the documents from the committed dossiers, at stage `shadow` first. Decisions D1 to D15, components C1 to C6. |
+| [architecture/adr/0151-the-host-writes-a-retrospective-document-for-each-recovery-and-each-judgment-lesson.md](architecture/adr/0151-the-host-writes-a-retrospective-document-for-each-recovery-and-each-judgment-lesson.md) | Decision (Proposed): a recovery and a judgment lesson each get a document and a lesson YAML. A judgment todo leaves the carryover log only when its document is on `main`. |
+| [architecture/recovery-retrospective.md](architecture/recovery-retrospective.md) | Spec of record: the recovery document, the judgment-lesson document, the lesson YAML, the closeout write and the `enforce` stage. |
+| [architecture/packages/internal-recoveryretro.md](architecture/packages/internal-recoveryretro.md) | Package note: the renderers and the one writer, `WriteShadow`. |
+
+## 2026-10-21 — one phase agent runs from the command line with no cycle (ADR-0152)
+
+| Document | What it records |
+|---|---|
+| [research/agent-run-standalone-2026-10.md](research/agent-run-standalone-2026-10.md) | Research: the phase command, the spec runner and the ledger form for manual entries. Current practice: Claude Code `-p`, `codex exec`, Gemini CLI, the OpenAI Agents SDK and LangGraph. |
+| [plans/agent-run-standalone-2026-10.md](plans/agent-run-standalone-2026-10.md) | Plan: four designs with scores, the decisions D1 to D11 and the components A1 to A5. |
+| [architecture/adr/0152-one-phase-agent-runs-from-the-command-line-with-no-cycle-through-the-phase-runner.md](architecture/adr/0152-one-phase-agent-runs-from-the-command-line-with-no-cycle-through-the-phase-runner.md) | Decision: `evolve agent run` through the phase runner, with cycle 0, a temporary workspace and read-only profiles only. |
+| [architecture/agent-run.md](architecture/agent-run.md) | Spec of record: the input and output contracts, the no-cycle rules and the profiles. |
+
+## 2026-10-21 — quality is a panel of separate indexes with intervals that the Signal Center publishes (ADR-0153)
+
+| Document | What it records |
+|---|---|
+| [research/llm-quality-indexes-2026-10.md](research/llm-quality-indexes-2026-10.md) | Research: local baselines from the run records, the ledger, the reviews and Git history. Current practice: pass^k, reward hacks, mutation testing, judge calibration and small-sample statistics. |
+| [plans/llm-quality-indexes-2026-10.md](plans/llm-quality-indexes-2026-10.md) | Plan: five designs with scores, the decisions D1 to D13 and the components Q1 to Q11. |
+| [architecture/adr/0153-quality-is-a-panel-of-separate-indexes-with-intervals-that-the-signal-center-publishes.md](architecture/adr/0153-quality-is-a-panel-of-separate-indexes-with-intervals-that-the-signal-center-publishes.md) | Decision: 21 separate indexes in five layers, with intervals and stages, published through the Signal Center, with no composite score. |
+| [architecture/llm-quality-indexes.md](architecture/llm-quality-indexes.md) | Spec of record: each index with its formula, source, interval, baseline, stage, signal and runbook entry. |
+
+## 2026-10-25 — the pipeline is the only controller, and each agent is an isolated, replaceable worker (ADR-0154), and the loop heals itself inside its boundaries (ADR-0155)
+
+| Document | What it records |
+|---|---|
+| [research/llm-isolation-2026-10.md](research/llm-isolation-2026-10.md) | Research: the gaps G1 to G11 with re-verified file:line evidence. Current practice for hermetic environments, agent sandboxes, mediated communication, OS exec rules, structured outputs and instruction files. |
+| [plans/llm-isolation-2026-10.md](plans/llm-isolation-2026-10.md) | Plan: five designs with scores, the decisions D1 to D20 and the components X1 to X16. |
+| [architecture/adr/0154-the-pipeline-is-the-only-controller-and-each-agent-is-an-isolated-replaceable-worker.md](architecture/adr/0154-the-pipeline-is-the-only-controller-and-each-agent-is-an-isolated-replaceable-worker.md) | Decision: the invariants I-1 to I-9, with lazy access to earlier deliverables and to the lessons of the item lineage. |
+| [architecture/adr/0155-the-loop-heals-itself-inside-its-boundaries-an-agent-proposes-and-the-pipeline-disposes.md](architecture/adr/0155-the-loop-heals-itself-inside-its-boundaries-an-agent-proposes-and-the-pipeline-disposes.md) | Decision: the invariants I-10 to I-14. An orchestrator agent proposes from a closed catalog, and the pipeline disposes. |
+| [architecture/llm-isolation.md](architecture/llm-isolation.md) | Spec of record: the agent cell, the artifact index and the sandbox rules. Also the routing data, the manifest fields, the conformance matrix, the signals and the runbook. Part II: self-healing within boundaries. |
+
+## 2026-10-25 — the CLI is the service interface, and the pipeline reads no ambient control flags (ADR-0156)
+
+| Document | What it records |
+|---|---|
+| [research/llm-isolation-2026-10.md](research/llm-isolation-2026-10.md) §6 | Research: the CLI surface and the control flags, with re-verified file:line evidence (F4.1 to F5.6). Current practice (P4.1 to P4.6), and the audit facts that were wrong. |
+| [plans/llm-isolation-2026-10.md](plans/llm-isolation-2026-10.md) §6.1, §6.2, §12 | Plan: the component state of X1, X2 and X6, and the follow-up X6b. Three designs with scores, the decisions D21 to D31 and the components X17a to X19c. |
+| [architecture/adr/0156-the-cli-is-the-service-interface-and-the-pipeline-reads-no-ambient-control-flags.md](architecture/adr/0156-the-cli-is-the-service-interface-and-the-pipeline-reads-no-ambient-control-flags.md) | Decision: the invariants I-15 (the CLI is the service contract) and I-16 (no ambient control). |
+| [architecture/cli-contract.md](architecture/cli-contract.md) | Spec of record: the envelope, the exit-code table, the availability classes and the core verbs. |
+| [architecture/llm-isolation.md](architecture/llm-isolation.md) §26 to §28 | Spec Part III: the design of X17 and X18, and of X19 (ADR-0154 I-17, the CLI-neutral task assignment). |
+| [architecture/control-flags.md](architecture/control-flags.md) | Reference: the five classes of the environment readers outside the registry. |
+
+## 2026-10-26 — each verb has an agent class, and a cell reads its classes from one verb (ADR-0156 amendment, X17e)
+
+| Document | What it records |
+|---|---|
+| [architecture/cli-contract.md](architecture/cli-contract.md) §4.1 to §4.5, §5 | Spec of record: the agent classes `A`, `R` and `D`, the verb `agent capabilities --json`, the request kinds, the credential check, the signals and three quality readings. The column "agent" of §5 is checked on `origin/main` at `5c010d7a4`. |
+| [architecture/adr/0156-the-cli-is-the-service-interface-and-the-pipeline-reads-no-ambient-control-flags.md](architecture/adr/0156-the-cli-is-the-service-interface-and-the-pipeline-reads-no-ambient-control-flags.md) | Decision: rules 17 to 22 amend I-15 with the agent class of each verb. |
+| [architecture/llm-isolation.md](architecture/llm-isolation.md) §26, §28 | Spec: the field "tool surface" of the neutral TaskAssignment, the CLI-neutral persona text and the component X17e. |
+| [plans/llm-isolation-2026-10.md](plans/llm-isolation-2026-10.md) §12.6 | Plan: the component X17e and its dependencies on the X4 items of #1126. |
+
+## 2026-10-26 — the rule registry gets a runtime index that each CLI family reads on demand (ADR-0145 amendment)
+
+| Document | What it records |
+|---|---|
+| [research/guidance-layers-2026-10.md](research/guidance-layers-2026-10.md) §5 | Research: the instruction file of Claude Code, Gemini CLI, Antigravity, Codex and Ollama, the `AGENTS.md` standard and load on demand (S12 to S18). The X10 `AGENTS.md` is over the Codex cap of 32 KiB (F5.2). |
+| [plans/guidance-layers-2026-10.md](plans/guidance-layers-2026-10.md) §9 | Plan: the extraction inventory of each rule source and of the 143 memory rules. Four scored designs, decisions D12 to D19, components G8 to G10 and the first L0 batch. |
+| [architecture/guidance-layers.md](architecture/guidance-layers.md) §10 | Spec: `guidance/index.md`, `guidance/index.json`, the L0 region of `AGENTS.md` and the verb `evolve guidance index` with its exit codes. Family facts stay in the driver layer. |
+| [architecture/adr/0145-each-rule-has-one-home-and-loads-by-audience-path-action-or-failure.md](architecture/adr/0145-each-rule-has-one-home-and-loads-by-audience-path-action-or-failure.md) | Decision: points 8 to 10 add the runtime index. |
+
+## 2026-10-26 — each phase cell gets a small assignment and a layered index that it opens on demand (ADR-0154 I-4)
+
+| Document | What it records |
+|---|---|
+| [architecture/cell-context-index.md](architecture/cell-context-index.md) | Spec of record: the context layers L0 to L3, the entry fields and the budgets. It also defines the `evolve context` verbs, the access log and the action `context-tune`. |
+| [plans/cell-context-index-2026-10.md](plans/cell-context-index-2026-10.md) | Plan: five scored designs, the decisions D1 to D12 and the components CX1 to CX7. |
+| [research/cell-context-index-2026-10.md](research/cell-context-index-2026-10.md) | Research: the measured prompts and deliverables, and current practice on just-in-time context and progressive disclosure. |
+| [architecture/llm-isolation.md](architecture/llm-isolation.md) §8.4, §8.5 | Spec: the pointers to the new design. |
+
+## 2026-10-26 — Agensh: what a team of 1,024 agents with no orchestrator teaches a loop with one controller
+
+| Document | What it records |
+|---|---|
+| [research/agensh-2026-10.md](research/agensh-2026-10.md) | Research: the Agensh paper (arXiv:2609.26781) and repository, its worker loop, board, router and results, and the limits of its evidence. We reject the self-claim and the direct messages (I-1, I-3, I-4). Five options are adopted as proposals (R1 to R5), and the integrator seat is deferred. |
+
+## 2026-10-26 — eight tests flaked in 14 days of CI, and each cause has a test-design rule
+
+| Document | What it records |
+|---|---|
+| [research/flaky-tests-2026-10.md](research/flaky-tests-2026-10.md) | Research: the ranked flakes with their runs, rates and costs, and the reds that are real defects. It also gives the classes and the rules that prevent them. |
+
+## 2026-10-27 — the loop works its own code: a narrow fence and held proposals
+
+| Document | What it records |
+|---|---|
+| [research/narrow-fence-2026-10.md](research/narrow-fence-2026-10.md) | Research: the supply census of the live inbox and the entries of the fence that hold no gate. It also covers how other systems control change to their own control plane. |
+| [plans/narrow-fence-2026-10.md](plans/narrow-fence-2026-10.md) | Plan: three designs with scores, the decisions, the components and the before and after supply. |
+| [architecture/adr/0157-the-loop-works-its-own-code-a-narrow-fence-and-held-proposals.md](architecture/adr/0157-the-loop-works-its-own-code-a-narrow-fence-and-held-proposals.md) | Decision: the fence by guarantee class, the list of each protected file and pin, and the held landing. |
+| [architecture/narrow-fence-and-held-proposals.md](architecture/narrow-fence-and-held-proposals.md) | Design: the fence, the held proposal, the approval and what the operator sees. |
+
+## 2026-10-27 — the inbox gets a deterministic intake and an event-driven curator
+
+| Document | What it records |
+|---|---|
+| [research/inbox-curator-2026-10.md](research/inbox-curator-2026-10.md) | Research: the overlap measure on the live inbox, the named tests of the 4 stale items, and the current practice for duplicate and stale issues. |
+| [architecture/inbox-curator.md](architecture/inbox-curator.md) | Spec: the add-time intake, the three triggers of the curator, the boundary backstop, the verb and the policy block. |
+
+## 2026-10-27 — cycle 2035 spent 160 LLM minutes on repair rounds that were bound to fail, and the policy that stops this waste
+
+| Document | What it records |
+|---|---|
+| [incidents/2026-10-27-cycle-2035-repair-loop.md](incidents/2026-10-27-cycle-2035-repair-loop.md) | Case study: the timeline, the spend of each phase, why the repair rounds did not converge, what the audits missed and the root causes. |
+| [research/cost-aware-repair-2026-10.md](research/cost-aware-repair-2026-10.md) | Research: the local evidence and the current practice for retry budgets, fail fast, the reviewer fix, self-repair limits and vacuous tests. |
+| [plans/cost-aware-repair-2026-10.md](plans/cost-aware-repair-2026-10.md) | Plan: six scored strategies, the eleven components and their order. |
+| [architecture/adr/0158-a-repair-round-runs-only-for-a-finding-the-lane-can-fix-and-the-auditor-applies-a-small-prescribed-fix.md](architecture/adr/0158-a-repair-round-runs-only-for-a-finding-the-lane-can-fix-and-the-auditor-applies-a-small-prescribed-fix.md) | Decision: the lane-fixability stop, the audit-fix rung, the cycle spend limit, the policy keys and the metrics. |
+
+## 2026-10-27 — which phase, seat and step uses the subscription tokens, and the telemetry that shows it
+
+| Document | What it records |
+|---|---|
+| [research/token-telemetry-2026-10.md](research/token-telemetry-2026-10.md) | Research: what the try record holds, the collectors of each driver and the largest consumers of waves 141 to 143. It also records what each CLI and the GenAI conventions supply, and the ranked gaps. |
+| [plans/token-telemetry-2026-10.md](plans/token-telemetry-2026-10.md) | Plan: five scored designs, the metrics, the nine components T1 to T9, their order and the reduction follow-ups. |
+
+## 2026-10-27 — what the Claude Code team's code review does, and what evolve-loop can adopt
+
+| Document | What it records |
+|---|---|
+| [research/code-review-at-anthropic-2026-10.md](research/code-review-at-anthropic-2026-10.md) | Research: the article by Osmani, Lunt and Wang (2026-10-15) on a verified, risk-tiered review flow. It reports a round cap of three, diff-only re-review, a verifier vote and the numbers 16% to 54% and 8.9% to 1.5%. The report compares each practice with the audit phase, ADR-0126 and ADR-0158, and ranks seven adoptions by saved LLM minutes. |
+
+## 2026-11-01 — the causes of the CI wall variance, and a ratchet for a noisy runner
+
+| Document | What it records |
+|---|---|
+| [research/ci-wall-variance-2026-11.md](research/ci-wall-variance-2026-11.md) | Research: the two macOS host classes, the CPU speed of each host and the wait type of each large test. It also gives the ranked causes and a ratchet on normalized package CPU. |
+
+## 2026-11-03 — the Claude Code changelog 2.1.316 read as data
+
+| Document | What it records |
+|---|---|
+| [research/claude-code-changelog-2.1.316-review.md](research/claude-code-changelog-2.1.316-review.md) | Research: the Claude Code changelog for version 2.1.316 read as untrusted data. No persona changes under ADR-0133 before the M2 baseline. |
+
+## 2026-11-03 — architecture decisions D1 to D4
+
+| Document | What it records |
+|---|---|
+| [research/architecture-decisions-2026-11.md](research/architecture-decisions-2026-11.md) | Research: four decision studies with findings, scored options and winners. Cell secret isolation, inbox staleness, four design-only items, and tree binding for ledgers and generated PRs. |
+| [plans/architecture-decisions-2026-11.md](plans/architecture-decisions-2026-11.md) | Plan: the operator picks of 2026-11-03 as components AD1-1 to AD4-5. It gives the build order, the proving tests, the route of each and the Windows sandbox open item. |
+
+## 2026-11-03 — review routing: which change class gets which review seats
+
+| Document | What it records |
+|---|---|
+| [research/review-routing-2026-11.md](research/review-routing-2026-11.md) | Research: the commit gate checks two seat names, passes WARN with open HIGH, and keeps no review record on main. Option A wins: one protected registry for the gate, CI and the lanes. |
+| [plans/review-routing-2026-11.md](plans/review-routing-2026-11.md) | Plan: the change-class matrix (C0 to C13) and the components S0 to S11 with stage, test and route. |
+
+## 2026-11-04 — agent harness practice in 2026 and what the loop takes from it
+
+| Document | What it records |
+|---|---|
+| [research/harness-practices-2026-11.md](research/harness-practices-2026-11.md) | Research: the high-star 2026 agent projects, merge systems, supervision, proof of a fix, flaky tests, token cost, and a comparison with our design. |
+| [plans/harness-practices-2026-11.md](plans/harness-practices-2026-11.md) | Plan: keep the integration train and build nine components, led by a mechanical regression proof, with the console train in the integration plan. |
+| [architecture/adr/0159-the-loop-keeps-its-integration-train-and-takes-six-practices-from-the-2026-harness-projects.md](architecture/adr/0159-the-loop-keeps-its-integration-train-and-takes-six-practices-from-the-2026-harness-projects.md) | Decision: no outside system replaces ADR-0147, and six practices close the failures of this period. |
+| [architecture/regression-proof-and-supervision.md](architecture/regression-proof-and-supervision.md) | Spec of record: the regression proof gate, the journey registry, derived liveness and the terminal refusal. |
+
+## One trust root for the inbox queue (2026-11-05)
+
+[Plan](plans/queue-authority-from-host-facts-2026-11.md) and [ADR-0160](architecture/adr/0160-the-host-lineage-record-is-the-one-trust-root-for-what-a-cycle-may-do-to-the-queue.md). After five blocked rounds, the design moves authority from a file that a cell can write to the host lineage record. One reader serves about 30 sites, a typed reason keeps agent text out of each route, and the mover refuses at the sink.
+
+## 2026-11-05 — the queue trust root: the host record decides what a cycle may do to the inbox queue (ADR-0160)
+
+| Document | What it records |
+|---|---|
+| [research/queue-trust-root-2026-11.md](research/queue-trust-root-2026-11.md) | Research: six blocked review rounds, the agent-writable files that give authority over the queue, and the faults that the review of PR 1 found. It adds outside work and one stated gap. Findings F1.1 to F1.14, P2.1 to P2.7, refinements R1 to R11. |
+| [plans/queue-authority-from-host-facts-2026-11.md](plans/queue-authority-from-host-facts-2026-11.md) | Plan: six designs with scores, and the winner, one trust root. Decisions D1 to D18 and components K1 to B2 with red tests. It corrects an old claim: PR 1 closes the pin file, and PR 3 closes the PASS path. |
+| [architecture/adr/0160-the-host-lineage-record-is-the-one-trust-root-for-what-a-cycle-may-do-to-the-queue.md](architecture/adr/0160-the-host-lineage-record-is-the-one-trust-root-for-what-a-cycle-may-do-to-the-queue.md) | Decision (Proposed): the host record is the only source of which items a cycle owns. It has one reader, a typed route reason, a mover refusal and a brake. |
+| [architecture/queue-trust-root.md](architecture/queue-trust-root.md) | Spec of record: the host record, its one reader and guard, and the drift signal. It also covers the write boundary, the typed route reason, the mover refusal and the breaker. |
+
+## 2026-11-05 — pipeline blockers of wave 155: design check, six test rows and accurate signals
+
+| Document | What it records |
+|---|---|
+| [research/pipeline-blockers-2026-11.md](research/pipeline-blockers-2026-11.md) | Research: the eleven blockers of wave 155, the 38 review findings of seven blocked fixes, and outside practice on error signals. |
+| [plans/pipeline-blockers-2026-11.md](plans/pipeline-blockers-2026-11.md) | Plan: a design card, six test rows, a signal contract, a redesign past three blocks and two debug verbs. |
+| [architecture/adr/0161-a-pipeline-blocker-fix-meets-six-test-rows-and-a-signal-states-its-cause-and-next-step.md](architecture/adr/0161-a-pipeline-blocker-fix-meets-six-test-rows-and-a-signal-states-its-cause-and-next-step.md) | Decision: thirteen rules for the fix of a pipeline blocker and for the content of a signal. |
+| [architecture/signal-accuracy.md](architecture/signal-accuracy.md) | Spec of record: the six parts of a signal, the source of a class, the one-reader rule, the logout cause and the debug verbs. |
+| [incidents/2026-11-05-wave-155-false-signals-and-the-logout.md](incidents/2026-11-05-wave-155-false-signals-and-the-logout.md) | Incident: false counts and classes, a logout read as quota, and seven blocked fixes. |
+
+## 2026-11-05 — a read-only debug CLI for the console and for agents
+
+| Document | What it records |
+|---|---|
+| [research/debug-cli-2026-11.md](research/debug-cli-2026-11.md) | Research: why scratch scripts fail, what four architecture rounds found in the code, and current practice for an agent-facing CLI. |
+| [plans/debug-cli-2026-11.md](plans/debug-cli-2026-11.md) | Plan: a family that composes the owners, nine decisions and thirteen test-first components. |
+| [architecture/adr/0162-the-console-reads-through-a-tested-read-only-debug-family-and-writes-no-scratch-scripts.md](architecture/adr/0162-the-console-reads-through-a-tested-read-only-debug-family-and-writes-no-scratch-scripts.md) | Decision: the console reads through tested read-only verbs and writes no scratch script. |
+| [architecture/debug-cli.md](architecture/debug-cli.md) | Spec of record: the verbs, exit codes, items, source kinds, cycle states, the rule for `next` and the read-only proof. |
+
+## 2026-11-05 — why the Claude Code login fails, and how a seat stops ending it
+
+| Document | What it records |
+|---|---|
+| [research/claude-login-split-2026-11.md](research/claude-login-split-2026-11.md) | Research: 264 auth errors in 7 clusters since 11-02, and an older console pattern. A sandboxed seat cannot write the Keychain. |
+| [plans/seat-login-isolation-2026-11.md](plans/seat-login-isolation-2026-11.md) | Plan: five scored designs. A seat loses its path to the stored login. The operator chose design C. |
+| [architecture/seat-login.md](architecture/seat-login.md) | Spec: the token file is the stage, `Resolve` at each door, the seat directory, the denies and the test rows. |
+| [architecture/adr/0163-a-seat-holds-a-narrow-token-in-its-own-directory-and-the-token-file-is-the-stage.md](architecture/adr/0163-a-seat-holds-a-narrow-token-in-its-own-directory-and-the-token-file-is-the-stage.md) | ADR-0163: a seat holds a narrow token in its own directory. Rejected: a stage record, a gateway, API keys. |
+
+## 2026-11-06 — contradictions in the design documents, and gaps to the code
+
+| Document | What it records |
+|---|---|
+| [research/doc-contradictions-2026-11.md](research/doc-contradictions-2026-11.md) | Research: 10 contradictions, 7 code gaps and 7 practice checks. Three scored options. The winner is a decision registry with a conformance check. |
+| [architecture/constitution.md](architecture/constitution.md) | Spec: the ultimate goal, local optimization, the duties and the limits of each agent. |
+| [architecture/loop-goal.md](architecture/loop-goal.md) | Spec: each ADR and plan mapped to a part of the goal. |
+| [architecture/adr/0164-all-decisions-serve-one-goal-and-one-amendment-resolves-their-conflicts.md](architecture/adr/0164-all-decisions-serve-one-goal-and-one-amendment-resolves-their-conflicts.md) | ADR-0164: one goal, 14 decisions that resolve the conflicts. Rejected: edit in place, one sweep. |
+| [history/decision-reconciliation-2026-11.md](history/decision-reconciliation-2026-11.md) | History: the progress of the reasoning, the actions, the errors and the hashes that pin the evidence. |
+
+## 2026-11-09 — gc removes each worktree and branch that nothing needs
+
+| Document | What it records |
+|---|---|
+| [plans/gc-closes-the-legacy-gap-2026-11.md](plans/gc-closes-the-legacy-gap-2026-11.md) | Plan: a dry run kept each of 217 dev worktrees. A manual cleanup then removed 261 worktrees and 998 branches. gc saves a proof of recovery first, and then keeps only the live items. |
+
+## 2026-11-10 — every gate gives one verdict for one tree, at the phase that can fix it
+
+| Document | What it records |
+|---|---|
+| [research/gate-contract-2026-11.md](research/gate-contract-2026-11.md) | Research: the duplicate ratchet gave two verdicts for one tree, and the lessons of ADR-0084 and ADR-0117 did not reach it. Bazel hermeticity, merge queues, content-key baselines and tree closing. |
+| [architecture/adr/0165-every-gate-is-a-typed-unit-with-a-conformance-contract.md](architecture/adr/0165-every-gate-is-a-typed-unit-with-a-conformance-contract.md) | ADR: a gate registry, a hermeticity guard, a parity harness, base-red attribution and a main-red stop. |
+| [plans/gate-contract-2026-11.md](plans/gate-contract-2026-11.md) | Plan: seven components, G1 to G7, each with an inbox item and a red proof. |
+| [architecture/gate-contract.md](architecture/gate-contract.md) | Spec: the registry entry, the six properties and their tests, and the main-red flow. |
+
+## 2026-11-10 — rules that the Gemini prompting guide note cites
+
+| Document | What it records |
+|---|---|
+| [plans/model-capability-practice-2026-10.md](plans/model-capability-practice-2026-10.md) | Plan: rule D7 (one persona per diet), rule D8 (four measures over 10 cycles before and after) and milestones M2 and M3. The Gemini note of 2026-11 ties its verdict to these rules. |
+| [research/practice-gemini-prompting-guide-completion-prefix-2026-11.md](research/practice-gemini-prompting-guide-completion-prefix-2026-11.md) | Note on the Gemini guide for item 1945a6f2. It adds one response prefix bullet to the agy notes. No core persona changes. |
+
+## 2026-11-10 — agy changelog page v2.30.0 note
+
+| Document | What it records |
+|---|---|
+| [research/practice-agy-cli-changelog-page-v2300-2026-11.md](research/practice-agy-cli-changelog-page-v2300-2026-11.md) | Note on the agy page releases v2.30.0, v2.29.1 and v2.29.0 for item 1b0c9251, read as data. They belong to the App panel. No persona changes. |
+
+## 2026-11-10 — agy changelog command 1.5.4 note
+
+| Document | What it records |
+|---|---|
+| [research/practice-agy-cli-changelog-command-1-5-4-2026-11.md](research/practice-agy-cli-changelog-command-1-5-4-2026-11.md) | Note on the agy command releases 1.5.4 and 1.5.3 for item 5a49deca, read as data. They are CLI product changes. No persona changes. |
+
+## 2026-11-10 — Claude model release notes, Fable 5.2 and Mythos 5.2
+
+| Document | What it records |
+|---|---|
+| [research/practice-claude-model-release-notes-fable-5-2-2026-11.md](research/practice-claude-model-release-notes-fable-5-2-2026-11.md) | Note on the Claude model release notes for item 9cd2c891, read as data. It covers the thinking prefix check of Fable 5.2 and Mythos 5.2. One notes bullet changes. No persona changes. |
+
+## 2026-11-10 — Claude prompting guide, Fable 5.2 and Mythos 5.2 effort
+
+| Document | What it records |
+|---|---|
+| [research/practice-claude-prompting-guide-effort-2026-11.md](research/practice-claude-prompting-guide-effort-2026-11.md) | Note on the Claude prompting guide for item bc673fd8, read as data. It covers effort and thinking on Fable 5.2 and Mythos 5.2. One notes bullet changes. No persona changes. |
+
+## 2026-11-10 — Claude Code changelog, releases 2.1.321 and 2.1.322
+
+| Document | What it records |
+|---|---|
+| [research/claude-code-changelog-2-1-322.md](research/claude-code-changelog-2-1-322.md) | Note on the Claude Code changelog for item 4de759d9, read as data. It covers the Fable 5.2 default model, Vertex fast mode and the sandbox, permission and Edit fixes. No persona and no model note changes. |
+
+## 2026-11-11 — the third Gemini prompting guide review
+
+| Document | What it records |
+|---|---|
+| [research/practice-gemini-prompting-guide-parameters-2026-11.md](research/practice-gemini-prompting-guide-parameters-2026-11.md) | Note on the Gemini guide for item 297686f7. No core persona changes, and the agy notes stay unchanged. |
+
+## 2026-11-11 — agy changelog page v2.31.0 note
+
+| Document | What it records |
+|---|---|
+| [research/practice-agy-cli-changelog-page-v2310-2026-11.md](research/practice-agy-cli-changelog-page-v2310-2026-11.md) | Note on the agy page release v2.31.0 for item 38501c49, read as data. It belongs to the App panel. No persona changes. |
+
+## 2026-11-11 — Claude model release notes, Security posture and Managed Agents
+
+| Document | What it records |
+|---|---|
+| [research/practice-claude-model-release-notes-security-posture-2f02c519-2026-11.md](research/practice-claude-model-release-notes-security-posture-2f02c519-2026-11.md) | Note on the Claude model release notes for item 2f02c519, read as data. It covers the Compliance API security posture lines and the Managed Agents research preview. No persona and no notes file changes. |
+
+## 2026-11-12 — agy changelog command 1.5.5 note
+
+| Document | What it records |
+|---|---|
+| [research/practice-agy-cli-changelog-command-1-5-5-2026-11.md](research/practice-agy-cli-changelog-command-1-5-5-2026-11.md) | Note on the agy command release 1.5.5 for item 104dfdd9, read as data. The /swarm preview stays unused. No persona changes. |
+
+## 2026-11-13 — pipeline health indexes in the Signal Center
+
+| Document | What it records |
+|---|---|
+| [plans/pipeline-health-indexes-2026-11.md](plans/pipeline-health-indexes-2026-11.md) | Why delivery fell on 2026-11-12, and the plan for PQ6 to PQ9, a typed idle cause and an expected-signal registry in the Signal Center. |
+
+## 2026-11-14 — agy changelog page /run-workflow note
+
+| Document | What it records |
+|---|---|
+| [research/practice-agy-cli-changelog-page-run-workflow-2026-11.md](research/practice-agy-cli-changelog-page-run-workflow-2026-11.md) | Note on the agy page lines /run-workflow, 1.5.8 and rewind for item 16ea3cc9, read as data. The command stays unused. No persona changes. |
+
+## 2026-11-14 — Claude release notes, Managed Agents note
+
+| Document | What it records |
+|---|---|
+| [research/practice-claude-model-release-notes-managed-agents-2026-11.md](research/practice-claude-model-release-notes-managed-agents-2026-11.md) | Note on the Claude release-note lines about Managed Agents webhooks and filters for item 18278f9c, read as data. The pipeline does not use that service. No persona changes. |
+
+## 2026-11-14 — Claude prompting guide, third report
+
+| Document | What it records |
+|---|---|
+| [research/practice-claude-prompting-guide-2026-11.md](research/practice-claude-prompting-guide-2026-11.md) | Section 8 answers item 526431cf. The stored excerpt has no added line, so no change is guessed. It reads the guide as data and gives six persona verdicts under ADR-0133. No persona file changes. |
+
+## 2026-11-15 — Incident records of 2026-11-02 to 2026-11-15
+
+| Document | What it records |
+|---|---|
+| [incidents/2026-11-14-a-shadow-feature-flipped-to-enforce-had-no-enforce-path.md](incidents/2026-11-14-a-shadow-feature-flipped-to-enforce-had-no-enforce-path.md) | Incident: a shadow feature was flipped to enforce, and its enforce path did not exist. |
+| [incidents/2026-11-15-lane-commits-turned-main-red-on-lint-and-derived-files.md](incidents/2026-11-15-lane-commits-turned-main-red-on-lint-and-derived-files.md) | Incident: lane commits turned main red on lint and on a stale derived file, twice. |
+| [incidents/2026-11-14-a-relaunch-chain-advanced-on-a-timed-out-wave-stop.md](incidents/2026-11-14-a-relaunch-chain-advanced-on-a-timed-out-wave-stop.md) | Incident: a merge-and-relaunch chain advanced on a timed-out wave stop. |
+| [incidents/2026-11-14-ship-spent-88-percent-of-its-lane-time-on-failed-attempts.md](incidents/2026-11-14-ship-spent-88-percent-of-its-lane-time-on-failed-attempts.md) | Incident: ship spent 88% of its lane time on failed attempts. |
+| [incidents/2026-11-14-the-composed-gate-carry-declined-on-test-leaks.md](incidents/2026-11-14-the-composed-gate-carry-declined-on-test-leaks.md) | Incident: the composed-tree gate of the identity carry was red on every tree because tests leaked files. |
+| [incidents/2026-11-14-shipped-work-stayed-open-in-the-inbox.md](incidents/2026-11-14-shipped-work-stayed-open-in-the-inbox.md) | Incident: shipped work stayed open in the inbox, and lanes and design seats spent cycles on it. |
+| [incidents/2026-11-14-tdd-copied-a-predicate-helper-in-four-cycles.md](incidents/2026-11-14-tdd-copied-a-predicate-helper-in-four-cycles.md) | Incident: the TDD seat copied a predicate helper, and the handoff floor failed four cycles. |
+| [incidents/2026-11-14-the-lane-window-never-grew-past-four.md](incidents/2026-11-14-the-lane-window-never-grew-past-four.md) | Incident: a fleet of 8 ran 4 lanes because the adaptive window never grows. |
+| [incidents/2026-11-14-composed-gates-loaded-the-host-to-75-at-four-lanes.md](incidents/2026-11-14-composed-gates-loaded-the-host-to-75-at-four-lanes.md) | Incident: the composed-tree gates loaded the host to 75 at four lanes. |
+| [incidents/2026-11-14-an-agy-footer-change-halted-the-loop.md](incidents/2026-11-14-an-agy-footer-change-halted-the-loop.md) | Incident: an agy CLI update changed its footer, and the loop halted. |
+| [incidents/2026-11-02-a-claude-update-showed-a-bypass-dialog-to-every-seat.md](incidents/2026-11-02-a-claude-update-showed-a-bypass-dialog-to-every-seat.md) | Incident: a Claude Code update showed a bypass dialog to every project-scoped seat, and a stale binary brought it back. |
+| [incidents/2026-11-03-the-go-build-cache-filled-the-disk.md](incidents/2026-11-03-the-go-build-cache-filled-the-disk.md) | Incident: the Go build cache filled the disk and other tools failed in strange ways. |
+| [incidents/2026-11-11-merging-main-into-console-prs-blocked-the-train.md](incidents/2026-11-11-merging-main-into-console-prs-blocked-the-train.md) | Incident: merging main into console PRs blocked the integration train. |
+
+## 2026-11-15 — agy changelog page v2.32.0 and Gemini 4 Hydrogen note
+
+| Document | What it records |
+|---|---|
+| [research/practice-agy-cli-changelog-page-v2-32-0-2026-11.md](research/practice-agy-cli-changelog-page-v2-32-0-2026-11.md) | Note on the agy page lines v2.32.0 Dynamic Workflows, themes, Gemini 4 Hydrogen, and CLI 1.5.8 for item f276c375, read as data. Dynamic Workflows stays unused. No persona changes. |
+
+## 2026-11-15 — agy changelog command v1.5.9 note
+
+| Document | What it records |
+|---|---|
+| [research/practice-agy-cli-changelog-command-1-5-9-2026-11.md](research/practice-agy-cli-changelog-command-1-5-9-2026-11.md) | Note on `agy changelog` release `1.5.9` (`run_workflow`, `pluginControls`, Auto mode, `/resume`, `.mp4`, fixes) for item `a5725609`, read as untrusted data. `run_workflow` stays unused. No persona changes. |
+
+## 2026-11-15 — shadow stages prove themselves on chained evidence
+
+| Document | What it records |
+|---|---|
+| [research/shadow-stage-evidence-2026-11.md](research/shadow-stage-evidence-2026-11.md) | Research: seven shadow faults of cycles 2356 to 2390 with evidence. Outside practice on shadow promotion, canary judgment, tamper-evident logs, provenance, test caching and merge queues. |
+| [plans/shadow-stage-evidence-2026-11.md](plans/shadow-stage-evidence-2026-11.md) | Plan: three evidence stores and five scan-skip keys on one score table. It recommends a per-cycle digest in the ledger and one default-deny purity predicate for the scan-skip key. It maps K1 to K5 and F1 to F7 to phases. |
+| [architecture/adr/0167-shadow-stages-prove-themselves-on-chained-evidence.md](architecture/adr/0167-shadow-stages-prove-themselves-on-chained-evidence.md) | ADR-0167, Proposed: five contract rules, the integrity rules, a flip only on a verified verdict, and a protected registry. It extends ADR-0165 and amends ADR-0157 decision 8. |
+
+## 2026-11-15 — pipeline health readings at the start of wave 174
+
+| Document | What it records |
+|---|---|
+| [research/pipeline-health-readings/2026-11-15/readings.md](research/pipeline-health-readings/2026-11-15/readings.md) | PQ, CQ, lane-use and idle-cause readings of waves 172 to 174, the shadow projected stops, and five questions for a later study. The raw JSON of the quality, latency and status verbs is in the same folder. |
+
+## 2026-11-15 — agy changelog command snapshot 2026-11-14T05:48:36Z note
+
+| Document | What it records |
+|---|---|
+| [research/practice-agy-cli-changelog-command-cefc57a2-2026-11.md](research/practice-agy-cli-changelog-command-cefc57a2-2026-11.md) | Note on `agy changelog` snapshot `2026-11-14T05:48:36Z` (`1.5.9` `.mp4`, `1.4.4` `/diff`, MCP `root_conversation_id`, Auto mode sandbox) for item `cefc57a2`, read as untrusted data. MCP stays unused. No persona changes. |
+
+## 2026-11-15 — Claude release notes snapshot 2026-11-13T19:47:32Z note
+
+| Document | What it records |
+|---|---|
+| [research/practice-claude-model-release-notes-c433b054-202611.md](research/practice-claude-model-release-notes-c433b054-202611.md) | Note on Claude release notes snapshot `2026-11-13T19:47:32Z` (empty added-line excerpt and November 12 self-hosted Managed Agents) for item `c433b054`, read as untrusted data. `skills/model-notes-claude/COMPACT.md` and all personas stay unchanged. |
+
+## 2026-11-16 — issue records: the entry skill, the analysis skill and the alert link
+
+| Document | What it records |
+|---|---|
+| [research/issue-record-skills-2026-11.md](research/issue-record-skills-2026-11.md) | The local evidence and the outside practice (Agent Skills, postmortem skills, Google SRE, causal analysis) for a record of each issue. |
+| [plans/issue-record-skill-2026-11.md](plans/issue-record-skill-2026-11.md) | The plan for the skills `issue-record` and `issue-analyze`, the L0 rule and the later stub verb that the Signal Center feeds. |
+| [incidents/2026-11-16-tests-leak-evolve-ledgers-under-go.md](incidents/2026-11-16-tests-leak-evolve-ledgers-under-go.md) | The first record of the skill: tests left ledgers under `go/`, and the composed-tree gate of each lane failed. |
+
+## 2026-11-16 — self-evolving loops: room for the loop to change itself
+
+| Document | What it records |
+|---|---|
+| [research/self-evolving-loop-autonomy-2026-11.md](research/self-evolving-loop-autonomy-2026-11.md) | Why 221 of 268 inbox items are console routes, and what outside systems do about self-improvement and earned autonomy. It gives refinements R1 to R6. |
+
+## 2026-11-16 — pipeline health readings at the end of wave 174
+
+| Document | What it records |
+|---|---|
+| [research/pipeline-health-readings/2026-11-16/readings.md](research/pipeline-health-readings/2026-11-16/readings.md) | The second snapshot of the series: PQ, CQ, lane-use, idle-cause and lane-time readings of the wave 174 boundary. It compares them with the 2026-11-15 snapshot and keeps nine questions. The raw JSON of the quality, latency and status verbs is in the same folder. |
+
+## 2026-11-16 — gate, ship and retry waste in the lanes
+
+| Document | What it records |
+|---|---|
+| [research/gate-ship-retry-waste-2026-11.md](research/gate-ship-retry-waste-2026-11.md) | Where lane time went in waves 173-175: gates and ship took 62%, and retry loops took 38% in wave 174. Merge-queue practice, and eight refinements. |
+
+## 2026-11-17 — Claude watermark and sampling parameters note
+
+| Document | What it records |
+|---|---|
+| [research/practice-claude-model-release-notes-7ad7926a-202611162241.md](research/practice-claude-model-release-notes-7ad7926a-202611162241.md) | Note on Claude release notes snapshot `2026-11-15T11:10:48Z` (text watermark on four models and non-default sampling parameters) for item `7ad7926a`, read as untrusted data. All personas stay unchanged. The claude model notes gain one bullet. |
+
+## 2026-11-17 — Console work: build only what a lane cannot build
+
+| Document | What it records |
+|---|---|
+| [research/console-build-or-route-2026-11.md](research/console-build-or-route-2026-11.md) | Wave 177 census: 180 of 288 items had a console route with no checked fact, 1 item was admissible, and the lanes ran at 18%. Practice from the Theory of Constraints, Team Topologies, Google SRE, SLSA and agent orchestration. |
+| [plans/console-build-or-route-2026-11.md](plans/console-build-or-route-2026-11.md) | Plan: the console builds an item only for a protected path, a console-only act or an integrity defect of operating-policy §1.1. It starts no feature build while the supply starves or while more than one batch of its PRs is open. |
+
+## 2026-11-17 — concurrent edits: one entry, one file, so that parallel lanes do not meet in the same lines
+
+| Document | What it records |
+|---|---|
+| [research/concurrent-edit-layout-2026-11.md](research/concurrent-edit-layout-2026-11.md) | Research: a 30-day census of 12,747 touches. 7 central lists take 330 touches, 2 generated aggregates take 164, and 2 big packages take 2,654 and serialize admission. 7 of the 9 conflicts of 2026-11-17 were independent additions. Current practice: fragment files, self-registration, disjoint modules, structural merge as a help. Findings E1.1 to F2.11, P3.1 to P3.11, refinements R1 to R6. Amended: lanes had no code conflict in the 149 runs of cycles 2300 to 2462; all 21 cell waits are on `cmd/evolve`. |
+| [plans/concurrent-edit-layout-2026-11.md](plans/concurrent-edit-layout-2026-11.md) | Plan: four designs scored; one entry for each file wins. Decisions D1 to D8, components C1 to C8 with red tests. C6 makes the cell of K5 in the console-build plan smaller, and K5 stays. Amended: C1, C4 and C8 are withdrawn, and C6 goes first. |
+
+## 2026-11-17 — The pipeline files the inbox items that phase agents request
+
+| Document | What it records |
+|---|---|
+| [plans/agent-request-inbox-add-2026-11.md](plans/agent-request-inbox-add-2026-11.md) | Plan: the request channel refused 11 `inbox-add` requests, and no item was filed. Four designs scored; a deterministic intake with no LLM judge wins. Decisions D1 to D13 add an executor for each kind and one shared intake. They add a stage for each kind, with `enforce` as the default. Each item that is not filed gets an ERROR signal, and each decision signal gets its reason. |
+
+## 2026-11-17 — The build floor measures the coverage of a bridge change
+
+| Document | What it records |
+|---|---|
+| [plans/bridge-floor-coverage-2026-11.md](plans/bridge-floor-coverage-2026-11.md) | Plan: the tmux tests of `internal/bridge` carry the build constraint `!notmux`, and only the floor adds the tag `notmux`. The floor then measures the bridge tests that need no tmux. It refuses a partly covered or new function, and names each old function that only the tier covers. Three rounds of architecture review. |
+
+## 2026-11-18 — Claude linked billing note
+
+| Document | What it records |
+|---|---|
+| [research/practice-claude-model-release-notes-linked-billing-5cd04824-202611171847.md](research/practice-claude-model-release-notes-linked-billing-5cd04824-202611171847.md) | Note on Claude release notes snapshot `2026-11-16T22:41:47Z` (linked billing and a cut-off managed hosting line) for item `5cd04824`, read as untrusted data. All personas and the claude model notes stay unchanged. |
+
+## 2026-11-18 — Incident reports in the knowledge base
+
+| Document | What it records |
+|---|---|
+| [research/incident-knowledge-base-2026-11.md](research/incident-knowledge-base-2026-11.md) | Research: 101 records have no frontmatter, no Go reader and no copy of their evidence. Run directories go after 14 days. Current practice: contributing factors, typed actions with an owner, a measured effectiveness check, a SHA-256 evidence manifest and a searchable store. Refinements R1 to R7. |
+| [plans/incident-knowledge-base-2026-11.md](plans/incident-knowledge-base-2026-11.md) | Plan: five designs scored; records on the self-heal intake win. The decisions add frontmatter, ten sections and a committed evidence bundle with ledger-line anchors. They also add `evolve issue` verbs, self-heal levels as policy data, new detectors, graph nodes and a measured effectiveness verdict. |
+
+## 2026-11-18 — Tests that cannot fail, tests that pin code text, and fakes that differ
+
+| Document | What it records |
+|---|---|
+| [research/test-quality-audit-2026-11.md](research/test-quality-audit-2026-11.md) | Research: a census of 33,528 test functions, with a command for each repeatable figure. The census finds tests with no assertion and self-asserting `apicover_named` files. It also finds skips that hide load errors, single-file source pins, source-text-only `acs` predicates and four fakes that differ from the real tool. One of the four is a production defect in the bridge. It gives refinements R1 to R8. |
+| [plans/test-quality-audit-2026-11.md](plans/test-quality-audit-2026-11.md) | Plan: an analyzer with a baseline ratchet in shards and a metric fix for `apicover`. It adds verified fakes with contract suites, and test-only fix items with a recorded mutation check. Components T1 to T10 and P1. |
+
+## 2026-11-19 — Claude security posture and AWS fragment note
+
+| Document | What it records |
+|---|---|
+| [research/practice-claude-model-release-notes-security-posture-aws-7177779e-202611190048.md](research/practice-claude-model-release-notes-security-posture-aws-7177779e-202611190048.md) | Note on Claude release notes snapshot `2026-11-17T18:47:38Z` (Compliance API security posture endpoint and cut-off Claude API AWS fragment) for item `7177779e`, read as untrusted data. All personas and the claude model notes stay unchanged. |
+
+## 2026-11-19 — Claude prompt guide chrome diff note
+
+| Document | What it records |
+|---|---|
+| [research/practice-claude-prompting-guide-2c5f9a4d-202611190048.md](research/practice-claude-prompting-guide-2c5f9a4d-202611190048.md) | Note on Claude prompt guide snapshot `2026-11-15T11:10:47Z` (search shortcut key cap chrome and live guide check) for item `2c5f9a4d`, read as untrusted data. All personas and the claude model notes stay unchanged. |
+
+## 2026-11-20 — Cycle recycle step and gc check process
+
+| Document | What it records |
+|---|---|
+| [plans/cycle-recycle-and-gc-check-2026-11.md](plans/cycle-recycle-and-gc-check-2026-11.md) | Plan for a mandatory recycle step at the end of each cycle. The step writes a thin archive, then releases the cycle resources. It also adds a gc check registry. Each check has a rule, a justification and an action. The facts come from the disk-full event of 2026-11-20. |
+
+## 2026-11-21 — One verb decides if the running wave is healthy
+
+| Document | What it records |
+|---|---|
+| [plans/wave-checkin-verb-2026-11.md](plans/wave-checkin-verb-2026-11.md) | Plan for `evolve wave checkin`. A pure evaluator reads a snapshot of the wave records and gives CONTINUE, BRAKE or FIX-LOCAL. The plan scores three designs and closes the gaps A3, A4 and the ship rate of the check-in SOP. It shows that three SOP thresholds give BRAKE on the healthy wave 184. |
+
+## 2026-11-22 — Finish the partly built features, closest to done first
+
+| Document | What it records |
+|---|---|
+| [plans/feature-finish-line-2026-11.md](plans/feature-finish-line-2026-11.md) | Plan: a queue of the 52 plans with open pieces, in the order closest to done first. It holds the five kinds of an open piece, the wave sets, the switch list and the orphan list. The operator decisions of 2026-11-22 put the shadow-contract chain K2 to K5 first and approved the 14 orphans. |
+
+## 2026-11-22 — Sealed shadow evidence and a protected contract (K2 and K4)
+
+| Document | What it records |
+|---|---|
+| [plans/shadow-contract-k2-k4-2026-11.md](plans/shadow-contract-k2-k4-2026-11.md) | Plan (PR #1674): the design of K2, the evidence seal, and of K4 and K4b, the protected contract and its migration. It compares three axes of candidates, sets decisions D1 to D18 and orders the chain K2, K4, K3, K5. |
+
+## 2026-11-22 — A stage flips to enforce on a green shadow record (K5)
+
+| Document | What it records |
+|---|---|
+| [plans/shadow-contract-k5-stage-flip-2026-11.md](plans/shadow-contract-k5-stage-flip-2026-11.md) | Plan: the design of K5. A green key flips at a wave boundary with no operator step. It sets the green rule, the enforce-path proof, the ship class, the rollback and the build order. |
+
+## 2026-11-23 — One verb lands a console change and refuses on a skipped step
+
+| Document | What it records |
+|---|---|
+| [plans/console-land-verb-2026-11.md](plans/console-land-verb-2026-11.md) | Plan for `evolve pr submit`. It runs the steps B5 to B7 of the console check-in SOP in order and refuses on a skipped or stale step. It reuses the evaluator pattern of `wave checkin` and leaves `evolve land` unchanged. The plan scores four designs and finds that `record-pr` already waits for the host head, so the verb adds only a local head compare. |
+
+## 2026-11-23 — gc re-packs full-history salvage bundles with no loss
+
+| Document | What it records |
+|---|---|
+| [plans/gc-salvage-scope-2026-11.md](plans/gc-salvage-scope-2026-11.md) | Plan for `evolve gc --only salvage`. A survey shows 144 full-history bundles that hold 150.7 GiB. The plan scores three designs and builds the K6 migration of the recycle plan. It also closes the last full-history writer. |
+
+<!-- GENERATED:research-index END -->

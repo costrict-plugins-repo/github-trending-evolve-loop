@@ -1,0 +1,76 @@
+package ship
+
+import (
+	"context"
+	"fmt"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+	"github.com/mickeyyaya/evolve-loop/go/internal/phaseio"
+)
+
+func shipOnce(t *testing.T, req core.PhaseRequest) string {
+	t.Helper()
+	repo := makeRepo(t)
+	mustWrite(t, filepath.Join(repo, "fixture.txt"), "fixture\nphaseio slice4\n")
+	seedAudit(t, repo, "PASS", map[string]string{"cycle": fmt.Sprint(req.Cycle)})
+	addRemote(t, repo)
+	req.ProjectRoot = repo
+	req.Workspace = filepath.Join(repo, ".evolve", "runs", fmt.Sprintf("cycle-%d", req.Cycle))
+	req.RunID, req.AuditRound = "test-run", 1
+	if req.Env == nil {
+		req.Env = map[string]string{}
+	}
+	req.Env["EVOLVE_PLUGIN_ROOT"] = repo
+	p := New(Config{Runner: execRunner})
+	resp, err := p.Run(context.Background(), req)
+	if err != nil {
+		t.Fatalf("ship Run errored: %v (diags=%v)", err, resp.Diagnostics)
+	}
+	if resp.Verdict != core.VerdictPASS {
+		t.Fatalf("want VerdictPASS, got %q (diags=%v)", resp.Verdict, resp.Diagnostics)
+	}
+	return strings.TrimSpace(runGitOut(t, repo, "log", "-1", "--format=%s"))
+}
+
+func TestShip_CommitMessage_TypedVsMap(t *testing.T) {
+	t.Parallel()
+	typedEnvelope := func(msg string) phaseio.PhaseInput {
+		return phaseio.NewPhaseInput(phaseio.PhaseInputInit{
+			Phase:       "ship",
+			CycleInputs: phaseio.NewCycleInputs(phaseio.CycleInputsInit{CommitMessage: msg}),
+		})
+	}
+
+	t.Run("map_path", func(t *testing.T) {
+		subject := shipOnce(t, core.PhaseRequest{
+			Cycle:   7,
+			Context: map[string]string{"commit_message": "feat: from the map"},
+		})
+		if !strings.Contains(subject, "feat: from the map") {
+			t.Errorf("map path: subject = %q, want the Context message", subject)
+		}
+	})
+
+	t.Run("typed_path_enforce", func(t *testing.T) {
+		subject := shipOnce(t, core.PhaseRequest{
+			Cycle: 7,
+			Input: typedEnvelope("feat: from the envelope"),
+		})
+		if !strings.Contains(subject, "feat: from the envelope") {
+			t.Errorf("typed path: subject = %q, want the typed envelope message", subject)
+		}
+	})
+
+	t.Run("typed_empty_falls_to_default", func(t *testing.T) {
+		subject := shipOnce(t, core.PhaseRequest{
+			Cycle: 42,
+			Input: typedEnvelope(""),
+		})
+		if !strings.Contains(subject, "evolve-cycle 42") {
+			t.Errorf("empty typed message: subject = %q, want synthesized 'evolve-cycle 42'", subject)
+		}
+	})
+}

@@ -1,0 +1,44 @@
+package core
+
+import (
+	"fmt"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/gittest"
+	"github.com/mickeyyaya/evolve-loop/go/internal/gotooltest"
+)
+
+var seatWorkspace string
+
+func TestMain(m *testing.M) {
+	restore, err := gittest.IsolateHostCredentials()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "TestMain: isolate host credentials: %v\n", err)
+		os.Exit(1)
+	}
+	backoffSleep = func(time.Duration) {}
+	defaultShipWindowTicker = func(time.Duration) (<-chan time.Time, func()) { return nil, func() {} }
+	if err := gotooltest.LimitProcess(); err != nil {
+		fmt.Fprintf(os.Stderr, "TestMain: %v\n", err)
+		os.Exit(1)
+	}
+	ws, err := os.MkdirTemp("", "core-seat-ws-")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "TestMain: %v\n", err)
+		os.Exit(1)
+	}
+	seatWorkspace = ws
+	code := m.Run()
+	if err := os.RemoveAll(ws); err != nil {
+		fmt.Fprintln(os.Stderr, "core tests: remove seat workspace:", err)
+	}
+	if err := gittest.RemoveTemplates(); err != nil {
+		fmt.Fprintln(os.Stderr, "core tests: remove git templates:", err)
+	}
+	if err := restore(); err != nil {
+		fmt.Fprintln(os.Stderr, "core tests: restore host credentials:", err)
+	}
+	os.Exit(code)
+}

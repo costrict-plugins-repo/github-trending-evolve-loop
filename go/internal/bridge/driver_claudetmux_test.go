@@ -1,0 +1,268 @@
+package bridge
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"os"
+	"strings"
+	"testing"
+	"time"
+)
+
+type fakeTmux struct {
+	existing          map[string]bool
+	sentKeys          []string
+	sentSeq           []string
+	paneSeq           []string
+	paneIdx           int
+	captureScrollback []int
+	newSessErr        error
+	lastPane          string
+	pasteContext      string
+}
+
+func (f *fakeTmux) HasSession(_ context.Context, name string) bool { return f.existing[name] }
+
+func (f *fakeTmux) NewSession(_ context.Context, name string, _, _ int) error {
+	if f.newSessErr != nil {
+		return f.newSessErr
+	}
+	if f.existing == nil {
+		f.existing = map[string]bool{}
+	}
+	f.existing[name] = true
+	return nil
+}
+
+func (f *fakeTmux) NewSessionEnv(ctx context.Context, name string, width, height int, _ string, _ []string) error {
+	return f.NewSession(ctx, name, width, height)
+}
+
+func (f *fakeTmux) SessionEnvFingerprint(_ context.Context, _ string) (string, error) {
+	return "", nil
+}
+
+func (f *fakeTmux) SendKeys(_ context.Context, _, keys string, enter bool) error {
+	f.sentKeys = append(f.sentKeys, keys)
+	f.sentSeq = append(f.sentSeq, fmt.Sprintf("%s|%v", keys, enter))
+	return nil
+}
+
+func (f *fakeTmux) CapturePane(_ context.Context, _ string, scrollback int) (string, error) {
+	f.captureScrollback = append(f.captureScrollback, scrollback)
+	v := ""
+	if len(f.paneSeq) > 0 {
+		if f.paneIdx < len(f.paneSeq) {
+			v = f.paneSeq[f.paneIdx]
+			f.paneIdx++
+		} else {
+			v = f.paneSeq[len(f.paneSeq)-1]
+		}
+	}
+	f.lastPane = v
+	return v, nil
+}
+
+func (f *fakeTmux) LoadBuffer(_ context.Context, _, _ string) error { return nil }
+func (f *fakeTmux) PasteBuffer(_ context.Context, _ string) error {
+	f.sentSeq = append(f.sentSeq, "paste-buffer")
+	f.pasteContext = f.lastPane
+	return nil
+}
+func (f *fakeTmux) KillSession(_ context.Context, name string) error {
+	delete(f.existing, name)
+	return nil
+}
+
+func (f *fakeTmux) sentContains(sub string) bool {
+	for _, k := range f.sentKeys {
+		if strings.Contains(k, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+func runTmux(t *testing.T, fx launchFixture, tmux *fakeTmux, lookup map[string]string, extra ...string) (int, string) {
+	t.Helper()
+	eng := NewEngine(Deps{
+		Tmux:            tmux,
+		Sleep:           func(time.Duration) {},
+		LookupEnv:       mapLookup(lookup),
+		CaptureBaseline: zeroBaselineCapture})
+	var stdout, stderr bytes.Buffer
+	code := eng.LaunchArgs(context.Background(), fx.args("claude-tmux", extra...), nil, &stdout, &stderr)
+	return code, stderr.String()
+}
+
+func TestClaudeTmux_SafetyGate_RequiresAllowBypass(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t, "claude-tmux", "")
+	tmux := &fakeTmux{}
+	code, stderr := runTmux(t, fx, tmux, nil)
+	if code != ExitSafetyGate {
+		t.Fatalf("exit = %d, want %d (ExitSafetyGate)", code, ExitSafetyGate)
+	}
+	if !strings.Contains(stderr, "safety gate: --allow-bypass is required") {
+		t.Fatalf("stderr should carry the safety-gate message; got %q", stderr)
+	}
+	if len(tmux.sentKeys) != 0 {
+		t.Fatalf("driver must not touch tmux when the safety gate fires")
+	}
+}
+
+func TestClaudeTmux_PermissionModeRelaxesGate(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t, "claude-tmux", "plan")
+	code, stderr := runTmux(t, fx, &fakeTmux{}, nil)
+	if strings.Contains(stderr, "safety gate: --allow-bypass is required") {
+		t.Fatalf("safety gate must NOT fire when permission_mode is set; got %q", stderr)
+	}
+	if code == ExitSafetyGate {
+		t.Fatalf("must not return ExitSafetyGate with permission_mode set")
+	}
+}
+
+func TestClaudeTmux_ClaudeCmd_PermissionModePlan(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t, "claude-tmux", "plan")
+	tmux := &fakeTmux{}
+	runTmux(t, fx, tmux, nil)
+	if !tmux.sentContains("claude --strict-mcp-config --model haiku --permission-mode plan") {
+		t.Fatalf("claude_cmd should use --permission-mode plan; sentKeys=%v", tmux.sentKeys)
+	}
+	if tmux.sentContains("--dangerously-skip-permissions") {
+		t.Fatalf("claude_cmd must NOT use --dangerously-skip-permissions in plan mode; sentKeys=%v", tmux.sentKeys)
+	}
+}
+
+func TestClaudeTmux_ClaudeCmd_BypassWhenNoPermissionMode(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t, "claude-tmux", "")
+	tmux := &fakeTmux{}
+	runTmux(t, fx, tmux, nil, "--allow-bypass")
+	if !tmux.sentContains("--dangerously-skip-permissions") {
+		t.Fatalf("claude_cmd should use --dangerously-skip-permissions; sentKeys=%v", tmux.sentKeys)
+	}
+	if tmux.sentContains("--permission-mode") {
+		t.Fatalf("claude_cmd must NOT use --permission-mode here; sentKeys=%v", tmux.sentKeys)
+	}
+}
+
+func TestClaudeTmux_ClaudeCmd_PlanWinsOverBypass(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t, "claude-tmux", "plan")
+	tmux := &fakeTmux{}
+	runTmux(t, fx, tmux, nil, "--allow-bypass")
+	if !tmux.sentContains("--permission-mode plan") {
+		t.Fatalf("plan must win over bypass; sentKeys=%v", tmux.sentKeys)
+	}
+	if tmux.sentContains("--dangerously-skip-permissions") {
+		t.Fatalf("bypass must be dropped when permission_mode is set; sentKeys=%v", tmux.sentKeys)
+	}
+}
+
+func TestClaudeTmux_CostLeak_AnthropicAPIKey(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t, "claude-tmux", "plan")
+	tmux := &fakeTmux{}
+	code, stderr := runTmux(t, fx, tmux, map[string]string{"ANTHROPIC_API_KEY": "sk-x"})
+	if code != ExitCostLeak {
+		t.Fatalf("exit = %d, want ExitCostLeak", code)
+	}
+	if !strings.Contains(stderr, "ANTHROPIC_API_KEY") {
+		t.Fatalf("stderr should name ANTHROPIC_API_KEY; got %q", stderr)
+	}
+	if len(tmux.sentKeys) != 0 {
+		t.Fatalf("driver must not touch tmux on a credential leak")
+	}
+}
+
+func TestClaudeTmux_HappyPath_ArtifactAppears(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t, "claude-tmux", "")
+	if err := os.WriteFile(fx.artifact, []byte("<!-- challenge-token: "+fx.token+" -->\nDONE\n"), 0o644); err != nil {
+		t.Fatalf("seed artifact: %v", err)
+	}
+	tmux := &fakeTmux{paneSeq: []string{tmuxPromptMarkerDefault}}
+	code, stderr := runTmux(t, fx, tmux, nil, "--allow-bypass")
+	if code != ExitOK {
+		t.Fatalf("exit = %d, want ExitOK; stderr=%q", code, stderr)
+	}
+	if !tmux.sentContains("/exit") {
+		t.Fatalf("ephemeral session should be closed with /exit; sentKeys=%v", tmux.sentKeys)
+	}
+}
+
+func TestClaudeTmux_TrustDialogDismissedBeforePromptDelivery(t *testing.T) {
+	t.Parallel()
+	dialogs := []struct {
+		name string
+		pane string
+	}{
+		{"v2.1.193 numbered Yes-default", "Quick safety check: Is this a project you created or one you trust?\n" +
+			"❯ 1. Yes, I trust this folder\n  2. No, exit\nEnter to confirm · Esc to cancel"},
+		{"v2.1.252 unnumbered No-default", "Quick safety check: Is this a project you created or one you trust?\n" +
+			"❯ No, exit\n  Yes, I trust this folder\n Enter to confirm · Esc to cancel"},
+	}
+	for _, d := range dialogs {
+		t.Run(d.name, func(t *testing.T) {
+			fx := newFixture(t, "claude-tmux", "")
+			if err := os.WriteFile(fx.artifact, []byte("<!-- challenge-token: "+fx.token+" -->\nDONE\n"), 0o644); err != nil {
+				t.Fatalf("seed artifact: %v", err)
+			}
+			tmux := &fakeTmux{paneSeq: []string{d.pane, tmuxPromptMarkerDefault, tmuxPromptMarkerDefault, tmuxPromptMarkerDefault}}
+			code, stderr := runTmux(t, fx, tmux, nil, "--allow-bypass")
+			if code != ExitOK {
+				t.Fatalf("exit = %d, want ExitOK; stderr=%q", code, stderr)
+			}
+			if !strings.Contains(stderr, "[auto-respond] sent keys") {
+				t.Fatalf("expected the auto-responder to fire on the trust dialog during boot; stderr=%q", stderr)
+			}
+			pasteIdx := -1
+			for i, sent := range tmux.sentSeq {
+				if sent == "paste-buffer" {
+					pasteIdx = i
+					break
+				}
+			}
+			if pasteIdx < 0 {
+				t.Fatalf("prompt was never delivered (no paste-buffer); sentSeq=%v", tmux.sentSeq)
+			}
+			dismissedBeforePaste := false
+			for _, sent := range tmux.sentSeq[:pasteIdx] {
+				if strings.HasSuffix(sent, "|true") {
+					dismissedBeforePaste = true
+					break
+				}
+			}
+			if !dismissedBeforePaste {
+				t.Fatalf("trust dialog was not auto-dismissed before prompt delivery; sentSeq=%v", tmux.sentSeq)
+			}
+			if strings.Contains(tmux.pasteContext, "trust this folder") {
+				t.Fatalf("prompt pasted while the trust dialog was still on screen — paste lost; pasteContext=%q", tmux.pasteContext)
+			}
+		})
+	}
+}
+
+func TestClaudeTmux_REPLBootTimeout(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t, "claude-tmux", "")
+	tmux := &fakeTmux{}
+	code, _ := runTmux(t, fx, tmux, nil, "--allow-bypass")
+	if code != ExitREPLBootTimeout {
+		t.Fatalf("exit = %d, want %d (ExitREPLBootTimeout)", code, ExitREPLBootTimeout)
+	}
+}
+
+func TestClaudeTmux_ArtifactTimeout(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t, "claude-tmux", "")
+	tmux := &fakeTmux{paneSeq: []string{tmuxPromptMarkerDefault}}
+	code, _ := runTmux(t, fx, tmux, nil, "--allow-bypass")
+	if code != ExitArtifactTimeout {
+		t.Fatalf("exit = %d, want %d (ExitArtifactTimeout)", code, ExitArtifactTimeout)
+	}
+}

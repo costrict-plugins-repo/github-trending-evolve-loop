@@ -1,0 +1,30 @@
+{
+  "name": "spec-verifier",
+  "role": "spec-verifier",
+  "cli": "claude-tmux",
+  "allowed_clis": [
+    "claude"
+  ],
+  "cli_fallback": [
+    "claude-p"
+  ],
+  "model_tier_default": "balanced",
+  "max_turns": 10,
+  "output_artifact": ".evolve/runs/cycle-{cycle}/spec-verify-report.md",
+  "challenge_token_required": true,
+  "sandbox": {
+    "enabled": true,
+    "write_subpaths": [
+      ".evolve/runs/cycle-*"
+    ],
+    "read_only_repo": true
+  },
+  "generated_from": "hand-authored",
+  "allowed_tools": [
+    "Read",
+    "Write",
+    "Grep",
+    "Glob",
+    "Bash(evolve phase verify:*)"
+  ]
+}

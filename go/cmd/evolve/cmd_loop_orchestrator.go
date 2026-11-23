@@ -1,0 +1,208 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/admission"
+	"github.com/mickeyyaya/evolve-loop/go/internal/clihealth"
+	"github.com/mickeyyaya/evolve-loop/go/internal/events/reader"
+	"github.com/mickeyyaya/evolve-loop/go/internal/events/wake"
+	"github.com/mickeyyaya/evolve-loop/go/internal/fleet"
+	"github.com/mickeyyaya/evolve-loop/go/internal/loopchain"
+	"github.com/mickeyyaya/evolve-loop/go/internal/orchestrator"
+	"github.com/mickeyyaya/evolve-loop/go/internal/paths"
+	"github.com/mickeyyaya/evolve-loop/go/internal/policy"
+)
+
+const laneTimeWindow = 50
+
+func newLaneLeases(projectRoot string, oc policy.OrchestratorConfig, publish orchestrator.Publish, warn io.Writer) (*orchestrator.Leases, orchestrator.LeaseConfig) {
+	runs := laneRunsDir(projectRoot)
+	laneRuns, err := orchestrator.LaneRuns(runs, laneTimeWindow)
+	if err != nil {
+		fmt.Fprintf(warn, "[loop] WARN: orchestrator: no lane times (%v); the lease deadline is the %d-minute floor\n", err, oc.DeadlineFloorMinutes)
+	}
+	floor := time.Duration(oc.DeadlineFloorMinutes) * time.Minute
+	deadlineAll := orchestrator.DeadlineByBasis(laneRuns, "all", floor)
+	deadlineShipped := orchestrator.DeadlineByBasis(laneRuns, "shipped", floor)
+	deadline := deadlineAll
+	if oc.DeadlineBasis == "shipped" {
+		deadline = deadlineShipped
+	}
+	cfg := orchestrator.LeaseConfig{
+		Stage:    oc.Stage,
+		Deadline: deadline,
+		Stall:    time.Duration(oc.StallMinutes) * time.Minute,
+	}
+	fmt.Fprintf(warn, "[loop] orchestrator: lane lease (stage %s): deadline %s from %d lane time(s), stall %s, deadline_all=%s, deadline_shipped=%s\n", cfg.Stage, cfg.Deadline, len(laneRuns), cfg.Stall, deadlineAll, deadlineShipped)
+	return orchestrator.NewLeases(cfg, orchestrator.SystemClock{}, orchestrator.RunsHeartbeat(runs), publish), cfg
+}
+
+func laneRunsDir(projectRoot string) string {
+	return filepath.Dir(paths.RunWorkspace(projectRoot, 0))
+}
+
+func laneLocator(projectRoot string) func(orchestrator.Lane) (int, bool) {
+	return orchestrator.RunsLocator(laneRunsDir(projectRoot))
+}
+
+func (b *loopBatchCoordinator) laneLeases(oc policy.OrchestratorConfig) *orchestrator.Leases {
+	if b.leases == nil {
+		b.leases = map[string]*orchestrator.Leases{}
+	}
+	if l, ok := b.leases[oc.Stage]; ok {
+		return l
+	}
+	l, _ := newLaneLeases(b.cfg.ProjectRoot, oc, b.deps.Signals.Emit, b.stderr)
+	b.leases[oc.Stage] = l
+	return l
+}
+
+func (b *loopBatchCoordinator) shadowLease(oc policy.OrchestratorConfig, launch fleet.LaunchFn) fleet.LaunchFn {
+	oc.Stage = orchestrator.StageShadow
+	return b.laneLeases(oc).Watch(launch, nil)
+}
+
+func (b *loopBatchCoordinator) poolHalted() bool {
+	return b.ctx.Err() != nil || loopchain.BrakeEngaged(b.cfg.EvolveDir)
+}
+
+func (b *loopBatchCoordinator) dispatchBenched() bool {
+	for _, e := range clihealth.NewStore(b.cfg.ProjectRoot, nil).Active() {
+		if e.BlocksDispatch() {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *loopBatchCoordinator) orchestratorPool(fc policy.FleetConfig, launch fleet.LaunchFn, iteration int) orchestrator.Pool {
+	holders, families := orchestrator.NewReachHolders(), orchestrator.NewFamilyHolds()
+	return orchestrator.Pool{
+		Target: fc.Count, Concurrency: fc.Concurrency, MaxLanes: fc.Orchestrator.RunMaxLanes,
+		MinLanes:      fc.MinLanes,
+		Admit:         b.cellAdmission(fc.Orchestrator, iteration, holders.Record, families.Record),
+		Holders:       holders,
+		FamilyHolds:   families,
+		Freshen:       b.wave().Freshen(),
+		Launch:        launch,
+		Leases:        b.laneLeases(fc.Orchestrator),
+		Claims:        b.wave().Claims(),
+		Reap:          b.laneReap(),
+		Locate:        laneLocator(b.cfg.ProjectRoot),
+		Publish:       b.deps.Signals.Emit,
+		Halted:        b.poolHalted,
+		Benched:       b.dispatchBenched,
+		Stage:         fc.Orchestrator.Stage,
+		Window:        b.laneWindow(fc),
+		LiveWidthFile: liveWidthFile(b.cfg.EvolveDir),
+	}
+}
+
+func (b *loopBatchCoordinator) cellAdmission(oc policy.OrchestratorConfig, iteration int, onOptimistic func(admission.ShadowAdmission), onWait func(admission.Decision)) orchestrator.Admit {
+	graph, err := b.moduleGraph(oc, iteration)
+	if err != nil {
+		fmt.Fprintf(b.stderr, "[loop] WARN: orchestrator: pool %d admits by the file rule; the module graph did not load: %v\n", iteration, err)
+		return nil
+	}
+	return orchestrator.AdmitByCell(admission.Admitter{
+		Graph: graph, Text: b.wave().InboxText(iteration),
+		Optimistic: oc.OptimisticAdmission(), FileCells: oc.FileCells(), OnShadow: orchestrator.RecordShadow(b.deps.Signals.Emit),
+		OnOptimistic: onOptimistic, OnWait: onWait,
+	})
+}
+
+func (b *loopBatchCoordinator) orchestratedRun(fc policy.FleetConfig, launch fleet.LaunchFn, iteration int) poolRunFn {
+	return func(ctx context.Context, backlog []fleet.Todo, resupply poolSupplyFn) []fleet.Result {
+		pool := b.orchestratorPool(fc, launch, iteration)
+		pool.Resupply = b.orchestratorResupply(resupply, iteration)
+		intake := orchestrator.NewIntake(max(pool.Target, 1))
+		if pool.Admit != nil {
+			pool.Intake = intake
+		}
+		stopOversight := b.startOversight(ctx, fc, pool, intake)
+		defer stopOversight()
+		defer b.startHostPressure(ctx, fc, hostSeat{window: pool.Window, intake: intake})()
+		return pool.Run(ctx, backlog)
+	}
+}
+
+func (b *loopBatchCoordinator) startOversight(ctx context.Context, fc policy.FleetConfig, pool orchestrator.Pool, intake *orchestrator.Intake) func() {
+	src, err := b.openOversightSource()
+	if err != nil {
+		fmt.Fprintf(b.stderr, "[loop] WARN: orchestrator: oversight: %v\n", err)
+		return func() {}
+	}
+	over := &orchestrator.Oversight{
+		Stage:   fc.Orchestrator.Stage,
+		Events:  src,
+		Leases:  pool.Leases,
+		Intake:  intake,
+		Landing: pool.Window,
+		Locate:  pool.Locate,
+		Resize:  b.oversightResize(fc),
+		Publish: b.deps.Signals.Emit,
+	}
+	overCtx, cancel := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = over.Run(overCtx)
+	}()
+	return func() {
+		cancel()
+		wg.Wait()
+	}
+}
+
+func (b *loopBatchCoordinator) openOversightSource() (orchestrator.Source, error) {
+	return b.openOversightSourceWith(func() (reader.Waiter, error) { return wake.New(nil) })
+}
+
+func (b *loopBatchCoordinator) openOversightSourceWith(newWaiter func() (reader.Waiter, error)) (orchestrator.Source, error) {
+	if b.oversightSource != nil {
+		return b.oversightSource()
+	}
+	waiter, err := newWaiter()
+	if err != nil {
+		return nil, err
+	}
+	return orchestrator.Subscribe(b.cfg.EvolveDir, "now", reader.Ports{Waiter: waiter, Now: time.Now})
+}
+
+func (b *loopBatchCoordinator) oversightResize(fc policy.FleetConfig) func() (int, []string) {
+	return func() (int, []string) {
+		var paused []string
+		for _, e := range clihealth.NewStore(b.cfg.ProjectRoot, nil).Active() {
+			if e.BlocksDispatch() {
+				paused = append(paused, e.Family)
+			}
+		}
+		return fc.SizedWidth(), paused
+	}
+}
+
+func (b *loopBatchCoordinator) orchestratorResupply(resupply poolSupplyFn, iteration int) func([]fleet.Todo) []fleet.Todo {
+	return func(held []fleet.Todo) []fleet.Todo {
+		todos, err := resupply(held)
+		if err != nil {
+			fmt.Fprintf(b.stderr, "[loop] WARN: orchestrator: pool %d resupply: %v; the free slot waits for the next lane exit\n", iteration, err)
+			return nil
+		}
+		return todos
+	}
+}
+
+func (b *loopBatchCoordinator) laneWindow(fc policy.FleetConfig) *orchestrator.Window {
+	oc := fc.Orchestrator
+	sized := fc.SizedWidth()
+	w := orchestrator.NewWindow(orchestrator.WindowConfig{Start: oc.WindowStart, Min: oc.WindowMin, Sized: sized}, b.deps.Signals.Emit)
+	fmt.Fprintf(b.stderr, "[loop] orchestrator: adaptive window (stage %s): %d of %d lane(s), min %d\n", oc.Stage, w.Size(), sized, oc.WindowMin)
+	return w
+}

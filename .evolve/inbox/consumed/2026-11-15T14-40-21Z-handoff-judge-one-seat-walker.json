@@ -1,0 +1,32 @@
+{
+  "acceptance": [
+    "Design doc, architecture review, then build: bridgechain takes a candidate filter (Specification) and the judge passes handoff.Independents through it; the routed driver is carried in the seat; the 3 mutant-kill tests; profile cli agrees with cli_routing.agents.handoff-judge; a test that policy.TierNames equals modelcatalog.CanonicalTiers.",
+    "The new tests are red without the change"
+  ],
+  "consumed": {
+    "at": "2026-11-18T19:32:51Z",
+    "cycle": "",
+    "via": "ship"
+  },
+  "created_at": "2026-11-15T14:40:21Z",
+  "docs": [
+    "docs/architecture/phase-handoff-contract.md"
+  ],
+  "evidence": "Branch dev/cl-c1 (handoff-h10-independent-judge, not shipped) was blocked by the architecture review in round 3: the judge walks its own seats (ChainAttempt) beside bridgechain.Walking, so it skips the exit-85 bench and LaunchWithFreshSession; 3 surviving mutants (empty Worktree fallback, multi-line ask text, judge_tier empty).",
+  "files": [
+    "go/internal/bridgechain/bridgechain.go",
+    "go/cmd/evolve/handoff_judge.go",
+    "go/internal/core/handoff_judge.go"
+  ],
+  "fix": "Design doc, architecture review, then build: bridgechain takes a candidate filter (Specification) and the judge passes handoff.Independents through it; the routed driver is carried in the seat; the 3 mutant-kill tests; profile cli agrees with cli_routing.agents.handoff-judge; a test that policy.TierNames equals modelcatalog.CanonicalTiers.",
+  "id": "handoff-judge-one-seat-walker",
+  "kind": "fix",
+  "origin": "console",
+  "priority_class": "correctness",
+  "route": "lane",
+  "routed_at": "2026-11-17T17:24:24Z",
+  "routed_reason": "operator 2026-11-18 approved plan K4: the curator found no protected fix surface and no pipeline kind behind the console route; earlier reason: lane triage (cycle 2431) escalate_block: protected-surface: .evolve/profiles/handoff-judge.json — control-plane changes go through the console route (operator-gated), not lane top_n",
+  "summary": "Branch dev/cl-c1 (handoff-h10-independent-judge, not shipped) was blocked by the architecture review in round 3: the judge walks its own seats (ChainAttempt) beside bridgechain.Walking, so it skips the exit-85 bench and LaunchWithFreshSession; 3 surviving mutants (empty Worktree fallback, multi-line ask text, judge_tier empty).",
+  "title": "Handoff judge: one seat walker with an independence filter (redesign after 3 blocked rounds)",
+  "weight": 0.7
+}

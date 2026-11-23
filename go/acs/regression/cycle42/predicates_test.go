@@ -1,0 +1,79 @@
+//go:build acs
+
+package cycle42
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/mickeyyaya/evolve-loop/go/pkg/acsassert"
+)
+
+func repoRoot(t *testing.T) string {
+	t.Helper()
+	stdout, _, code, err := acsassert.SubprocessOutput("git", "rev-parse", "--show-toplevel")
+	if err != nil || code != 0 {
+		t.Skipf("not in a git work tree: code=%d err=%v", code, err)
+	}
+	return strings.TrimSpace(stdout)
+}
+
+func roadmapPath(t *testing.T) string {
+	t.Helper()
+	p := filepath.Join(repoRoot(t), "docs", "architecture", "token-reduction-roadmap.md")
+	if _, err := os.Stat(p); err != nil {
+		t.Skipf("token-reduction-roadmap.md missing (expected during fresh clone): %v", err)
+	}
+	return p
+}
+
+func TestC42_003_PNew13Done(t *testing.T) {
+	doc := roadmapPath(t)
+	acsassert.FileMatchesRegex(t, doc, `P-NEW-13.*DONE \(cycle 42\)`)
+
+	raw, err := os.ReadFile(doc)
+	if err != nil {
+		t.Fatalf("read %s: %v", doc, err)
+	}
+	if strings.Contains(string(raw), "Target cycle") && strings.Contains(string(raw), "43+") {
+		for _, line := range strings.Split(string(raw), "\n") {
+			if strings.Contains(line, "Target cycle") && strings.Contains(line, "43+") {
+				t.Errorf("P-NEW-13 field table Target cycle still shows '43+' — should be DONE: %s", line)
+			}
+		}
+	}
+}
+
+func TestC42_004_PNew16Done(t *testing.T) {
+	doc := roadmapPath(t)
+	acsassert.FileMatchesRegex(t, doc, `P-NEW-16.*DONE \(cycle 42\)`)
+}
+
+func TestC42_005_P6CitationFix(t *testing.T) {
+	doc := roadmapPath(t)
+	raw, err := os.ReadFile(doc)
+	if err != nil {
+		t.Fatalf("read %s: %v", doc, err)
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.Contains(line, "PSMAS") && strings.Contains(line, "2510.26585") {
+			t.Errorf("PSMAS still cited with arXiv:2510.26585 — found: %s", line)
+		}
+	}
+	acsassert.FileContains(t, doc, "2604.17400")
+}
+
+func TestC42_006_PNew17Exists(t *testing.T) {
+	root := repoRoot(t)
+	doc := filepath.Join(root, "docs", "architecture", "token-reduction-roadmap.md")
+	kb := filepath.Join(root, "docs", "research", "cache-ttl-march-2026-impact.md")
+
+	if _, err := os.Stat(doc); err != nil {
+		t.Skipf("roadmap missing: %v", err)
+	}
+	acsassert.FileContains(t, doc, "P-NEW-17")
+	acsassert.FileMatchesRegex(t, doc, `P-NEW-17.*RESEARCH|P-NEW-17.*PENDING|P-NEW-17.*cycle 43`)
+	acsassert.FileExists(t, kb)
+}

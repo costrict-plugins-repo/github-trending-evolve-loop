@@ -1,0 +1,37 @@
+{
+  "name": "close-checklist",
+  "archetype": "control",
+  "agent": "evolve-close-checklist",
+  "inputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/scout-report.md"
+    ],
+    "signals": []
+  },
+  "outputs": {
+    "files": [
+      ".evolve/runs/cycle-{cycle}/close-checklist-report.md"
+    ],
+    "signals": [
+      "close.blocking_count"
+    ]
+  },
+  "classify": {
+    "require_sections": [
+      "Tasks",
+      "Blocking Items",
+      "Sign-off"
+    ]
+  },
+  "routing": {
+    "insert_when": [
+      {
+        "field": "scout.goal_type",
+        "op": "==",
+        "value": "accounting-close"
+      }
+    ]
+  },
+  "after": "triage",
+  "optional": true
+}

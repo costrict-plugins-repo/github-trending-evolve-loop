@@ -1,0 +1,422 @@
+package ledger
+
+import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/mickeyyaya/evolve-loop/go/internal/adapters/flock"
+	"github.com/mickeyyaya/evolve-loop/go/internal/atomicwrite"
+	"github.com/mickeyyaya/evolve-loop/go/internal/core"
+)
+
+const (
+	segmentsDirName = "ledger-segments"
+	segmentMode     = 0o600
+)
+
+const SealKind = "segment_seal"
+
+var ErrSealResidue = errors.New("ledger seal residue — re-run `evolve ledger seal` to complete")
+
+func (l *FileLedger) Seal(_ context.Context, keepTail int) error {
+	if keepTail < 1 {
+		keepTail = 1
+	}
+	sealRelease, err := flock.Lock(l.lockPath + ".seal")
+	if err != nil {
+		return fmt.Errorf("ledger seal: %w", err)
+	}
+	defer sealRelease()
+
+	anchor, err := l.sealAndAnchor(keepTail)
+	if anchor == nil {
+		return err
+	}
+	l.observe(*anchor, err)
+	if err != nil {
+		return fmt.Errorf("ledger seal: anchor append: %w", err)
+	}
+	return nil
+}
+
+func (l *FileLedger) sealAndAnchor(keepTail int) (*core.LedgerEntry, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	release, err := flock.Lock(l.lockPath)
+	if err != nil {
+		return nil, fmt.Errorf("ledger seal: %w", err)
+	}
+	defer release()
+	anchor, err := l.sealLocked(keepTail)
+	if err != nil || anchor == nil {
+		return nil, err
+	}
+	return anchor, l.appendChainedLocked(chainInto(anchor))
+}
+
+func (l *FileLedger) sealLocked(keepTail int) (*core.LedgerEntry, error) {
+	evolveDir := filepath.Dir(l.ledgerPath)
+	segDir := filepath.Join(evolveDir, segmentsDirName)
+
+	raw, err := os.ReadFile(l.ledgerPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("ledger seal: read: %w", err)
+	}
+	lines := splitLines(raw)
+
+	segs, err := segmentFiles(segDir)
+	if err != nil {
+		return nil, err
+	}
+	if len(segs) > 0 {
+		segLines, segSHA, err := readSegment(segs[len(segs)-1])
+		if err != nil {
+			return nil, err
+		}
+		if len(segLines) > 0 && len(lines) > 0 && bytes.Equal(segLines[0], lines[0]) {
+			if len(lines) < len(segLines) || !linesEqual(segLines, lines[:len(segLines)]) {
+				return nil, fmt.Errorf("ledger seal: residue segment %s does not match the live prefix — manual inspection required", segs[len(segs)-1])
+			}
+			if err := l.rewriteLive(lines[len(segLines):]); err != nil {
+				return nil, err
+			}
+			return l.anchorFor(segs[len(segs)-1], segSHA, len(segLines))
+		}
+		if missing, segSHA, n, err := l.unanchoredSegment(segs, lines); err != nil {
+			return nil, err
+		} else if missing != "" {
+			return l.anchorFor(missing, segSHA, n)
+		}
+	}
+
+	if len(lines) <= keepTail {
+		return nil, nil
+	}
+	n := len(lines) - keepTail
+	prefix := raw[:prefixLen(raw, n)]
+
+	next := len(segs) + 1
+	segPath := filepath.Join(segDir, fmt.Sprintf("seg-%04d.jsonl.gz", next))
+	if err := writeSegment(segPath, prefix); err != nil {
+		return nil, err
+	}
+	if err := l.rewriteLive(lines[n:]); err != nil {
+		return nil, err
+	}
+	return l.anchorFor(segPath, sha256Hex(prefix), n)
+}
+
+func (l *FileLedger) anchorFor(segPath, uncompressedSHA string, lineCount int) (*core.LedgerEntry, error) {
+	rel, err := filepath.Rel(filepath.Dir(l.ledgerPath), segPath)
+	if err != nil {
+		return nil, fmt.Errorf("ledger seal: rel: %w", err)
+	}
+	return &core.LedgerEntry{
+		Role:           "operator",
+		Kind:           SealKind,
+		ArtifactPath:   filepath.ToSlash(rel),
+		ArtifactSHA256: uncompressedSHA,
+		Message:        fmt.Sprintf("sealed %d lines into %s (uncompressed sha256 anchored)", lineCount, filepath.Base(segPath)),
+	}, nil
+}
+
+func (l *FileLedger) unanchoredSegment(segs []string, liveLines [][]byte) (path, sha string, lineCount int, err error) {
+	type segData struct {
+		lines [][]byte
+		sha   string
+	}
+	evolveDir := filepath.Dir(l.ledgerPath)
+	anchored := map[string]bool{}
+	cache := make([]segData, len(segs))
+	for i, s := range segs {
+		lines, segSHA, rerr := readSegment(s)
+		if rerr != nil {
+			return "", "", 0, rerr
+		}
+		cache[i] = segData{lines, segSHA}
+		for _, line := range lines {
+			var e core.LedgerEntry
+			if json.Unmarshal(line, &e) == nil && e.Kind == SealKind {
+				anchored[e.ArtifactPath] = true
+			}
+		}
+	}
+	for _, line := range liveLines {
+		var e core.LedgerEntry
+		if json.Unmarshal(line, &e) == nil && e.Kind == SealKind {
+			anchored[e.ArtifactPath] = true
+		}
+	}
+	for i, s := range segs {
+		rel, rerr := filepath.Rel(evolveDir, s)
+		if rerr != nil {
+			return "", "", 0, fmt.Errorf("ledger seal: rel: %w", rerr)
+		}
+		if !anchored[filepath.ToSlash(rel)] {
+			d := cache[i]
+			return s, d.sha, len(d.lines), nil
+		}
+	}
+	return "", "", 0, nil
+}
+
+type sealedSegment struct {
+	rel   string
+	sha   string
+	lines [][]byte
+}
+
+var segmentRel = filepath.Rel
+
+func (l *FileLedger) readChain() ([]sealedSegment, [][]byte, error) {
+	evolveDir := filepath.Dir(l.ledgerPath)
+	segPaths, err := segmentFiles(filepath.Join(evolveDir, segmentsDirName))
+	if err != nil {
+		return nil, nil, err
+	}
+	liveRaw, err := hooks.readF(l.ledgerPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, nil, fmt.Errorf("ledger read: %w", err)
+	}
+	segs := make([]sealedSegment, 0, len(segPaths))
+	for _, s := range segPaths {
+		segLines, segSHA, err := readSegment(s)
+		if err != nil {
+			return nil, nil, err
+		}
+		rel, err := segmentRel(evolveDir, s)
+		if err != nil {
+			return nil, nil, fmt.Errorf("ledger verify: rel: %w", err)
+		}
+		segs = append(segs, sealedSegment{rel: filepath.ToSlash(rel), sha: segSHA, lines: segLines})
+	}
+	return segs, splitLines(liveRaw), nil
+}
+
+func (l *FileLedger) gatherAllLines() ([][]byte, error) {
+	segs, live, err := l.readChain()
+	if err != nil {
+		return nil, err
+	}
+	return chainOrder(segs, live), nil
+}
+
+func chainOrder(segs []sealedSegment, live [][]byte) [][]byte {
+	var full [][]byte
+	for _, s := range segs {
+		full = append(full, s.lines...)
+	}
+	return append(full, live...)
+}
+
+func (l *FileLedger) VerifyDeep(ctx context.Context) error {
+	_, err := l.VerifyDeepScope(ctx)
+	return err
+}
+
+func (l *FileLedger) VerifyDeepScope(_ context.Context) (VerifiedScope, error) {
+	var segs []sealedSegment
+	var live [][]byte
+	var tip tipRead
+	if err := l.readSnapshot(func() (err error) {
+		segs, live, err = l.readChain()
+		tip = l.readTipFile()
+		return err
+	}); err != nil {
+		return VerifiedScope{}, err
+	}
+	return l.verifyChain(segs, live, tip.check)
+}
+
+func (l *FileLedger) verifyChain(segs []sealedSegment, live [][]byte, checkTip func(lastSeq int, lastSha string) error) (VerifiedScope, error) {
+	for _, s := range segs {
+		if len(s.lines) > 0 && len(live) > 0 && bytes.Equal(s.lines[0], live[0]) {
+			return VerifiedScope{}, fmt.Errorf("%w: segment %s written but live file not truncated", ErrSealResidue, filepath.Base(s.rel))
+		}
+	}
+	full := chainOrder(segs, live)
+
+	anchorSHA, anchorSeq := effectiveAnchorSHA(full, l.loadAnchorSHA())
+	lastSeq, lastSha, sawV837, err := walkChain(full, anchorSHA, indexCompositionEvidence(l.evidence(), full))
+	if err != nil {
+		return VerifiedScope{}, err
+	}
+
+	anchors := map[string]string{}
+	for _, line := range full {
+		var e core.LedgerEntry
+		if json.Unmarshal(line, &e) == nil && e.Kind == SealKind {
+			anchors[e.ArtifactPath] = e.ArtifactSHA256
+		}
+	}
+	for _, s := range segs {
+		segAnchorSHA, ok := anchors[s.rel]
+		if !ok {
+			return VerifiedScope{}, fmt.Errorf("%w: segment %s has no segment_seal anchor", ErrSealResidue, s.rel)
+		}
+		if segAnchorSHA != s.sha {
+			return VerifiedScope{}, fmt.Errorf("%w: segment %s content does not match its anchor (have %s want %s)", core.ErrLedgerChainBroken, s.rel, s.sha, segAnchorSHA)
+		}
+	}
+
+	scope := VerifiedScope{AnchorLineSHA: anchorSHA, AnchorSeq: anchorSeq}
+	if !sawV837 {
+		return scope, nil
+	}
+	if err := checkTip(lastSeq, lastSha); err != nil {
+		return VerifiedScope{}, err
+	}
+	return scope, nil
+}
+
+func (l *FileLedger) sealedPredecessor(live [][]byte) ([]byte, error) {
+	segs, err := segmentFiles(filepath.Join(filepath.Dir(l.ledgerPath), segmentsDirName))
+	if err != nil {
+		return nil, err
+	}
+	for i := len(segs) - 1; i >= 0; i-- {
+		segLines, _, err := readSegment(segs[i])
+		if err != nil {
+			return nil, err
+		}
+		stillLive := len(segLines) > 0 && len(live) > 0 && bytes.Equal(segLines[0], live[0])
+		if len(segLines) > 0 && !stillLive {
+			return segLines[len(segLines)-1], nil
+		}
+	}
+	return nil, nil
+}
+
+func segmentFiles(segDir string) ([]string, error) {
+	entries, err := os.ReadDir(segDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("ledger segments read: %w", err)
+	}
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), "seg-") || !strings.HasSuffix(e.Name(), ".jsonl.gz") {
+			continue
+		}
+		out = append(out, filepath.Join(segDir, e.Name()))
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func writeSegment(path string, raw []byte) error {
+	return writeSegmentVia(&bytes.Buffer{}, path, raw)
+}
+
+type segmentBuffer interface {
+	io.Writer
+	Bytes() []byte
+}
+
+func writeSegmentVia(gz segmentBuffer, path string, raw []byte) error {
+	if err := gzipSegment(gz, raw); err != nil {
+		return err
+	}
+	if err := atomicwrite.Durable(path, gz.Bytes(), segmentMode); err != nil {
+		return fmt.Errorf("ledger seal: %w", err)
+	}
+	return nil
+}
+
+func gzipSegment(dst io.Writer, raw []byte) error {
+	zw := gzip.NewWriter(dst)
+	if _, err := zw.Write(raw); err != nil {
+		return fmt.Errorf("ledger seal: gzip write: %w", err)
+	}
+	if err := zw.Close(); err != nil {
+		return fmt.Errorf("ledger seal: gzip close: %w", err)
+	}
+	return nil
+}
+
+func readSegment(path string) ([][]byte, string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, "", fmt.Errorf("ledger segment open: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, "", fmt.Errorf("ledger segment %s gunzip: %w", filepath.Base(path), err)
+	}
+	raw, err := io.ReadAll(zr)
+	if err != nil {
+		return nil, "", fmt.Errorf("ledger segment %s read: %w", filepath.Base(path), err)
+	}
+	if err := zr.Close(); err != nil {
+		return nil, "", fmt.Errorf("ledger segment %s gunzip close: %w", filepath.Base(path), err)
+	}
+	return splitLines(raw), sha256Hex(raw), nil
+}
+
+func (l *FileLedger) rewriteLive(lines [][]byte) error {
+	var buf bytes.Buffer
+	for _, line := range lines {
+		buf.Write(line)
+		buf.WriteByte('\n')
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(l.ledgerPath), "ledger.jsonl.*.tmp")
+	if err != nil {
+		return fmt.Errorf("ledger seal: live rewrite tmp: %w", err)
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write(buf.Bytes()); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("ledger seal: live rewrite: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("ledger seal: live rewrite sync: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("ledger seal: live rewrite close: %w", err)
+	}
+	if err := os.Rename(tmpPath, l.ledgerPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("ledger seal: live rename: %w", err)
+	}
+	return nil
+}
+
+func prefixLen(raw []byte, n int) int {
+	off := 0
+	for i := 0; i < n; i++ {
+		idx := bytes.IndexByte(raw[off:], '\n')
+		if idx < 0 {
+			return len(raw)
+		}
+		off += idx + 1
+	}
+	return off
+}
+
+func linesEqual(a, b [][]byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !bytes.Equal(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}

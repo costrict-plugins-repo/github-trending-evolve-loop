@@ -1,0 +1,129 @@
+{
+  "name": "tdd-engineer",
+  "role": "tdd-engineer",
+  "cli": "claude-tmux",
+  "model_tier_default": "balanced",
+  "_model_tier_overrides_note": "cycle-974: removed inert 's_complex_with_cache'=deep (zero production consumers). deep overrides are within [balanced,deep].",
+  "model_tier_overrides": {
+    "ultrathink_strategy": "deep",
+    "m_complex_5plus_files": "deep",
+    "audit_retry_2plus": "deep"
+  },
+  "cross_family_with": "builder",
+  "_model_family_rationale": "Balanced tier by default for test authoring, with opus retained for ultrathink, complex, retry, and cache-sensitive overrides. Decision updated by cycle 337 per model-routing-policy.md.",
+  "allowed_tools": [
+    "Read",
+    "Grep",
+    "Glob",
+    "Edit",
+    "Write",
+    "MultiEdit",
+    "NotebookEdit",
+    "Bash",
+    "WebSearch",
+    "WebFetch",
+    "Bash(scripts/research/kb-search.sh:*)",
+    "Bash(evolve phase verify:*)"
+  ],
+  "disallowed_tools": [
+    "Edit(skills/**)",
+    "Edit(agents/**)",
+    "Edit(scripts/cli_adapters/**)",
+    "Edit(scripts/guards/**)",
+    "Edit(scripts/run-cycle.sh)",
+    "Edit(scripts/subagent-run.sh)",
+    "Edit(scripts/ship.sh)",
+    "Edit(scripts/cycle-state.sh)",
+    "Edit(scripts/release/**)",
+    "Edit(.claude-plugin/**)",
+    "Edit(.evolve/state.json)",
+    "Edit(.evolve/ledger.jsonl)",
+    "Edit(.evolve/profiles/**)",
+    "Edit(CLAUDE.md)",
+    "Edit(README.md)",
+    "Edit(CHANGELOG.md)",
+    "Write(skills/**)",
+    "Write(agents/**)",
+    "Write(scripts/cli_adapters/**)",
+    "Write(scripts/guards/**)",
+    "Write(scripts/run-cycle.sh)",
+    "Write(scripts/subagent-run.sh)",
+    "Write(scripts/ship.sh)",
+    "Write(scripts/cycle-state.sh)",
+    "Write(scripts/release/**)",
+    "Write(.claude-plugin/**)",
+    "Write(.evolve/state.json)",
+    "Write(.evolve/ledger.jsonl)",
+    "Write(.evolve/profiles/**)",
+    "Write(CLAUDE.md)",
+    "Write(README.md)",
+    "Write(CHANGELOG.md)",
+    "Bash(git push:*)",
+    "Bash(git commit:*)",
+    "Bash(git config:*)",
+    "Bash(jq -i:*)",
+    "Bash(jq --in-place:*)"
+  ],
+  "add_dir": [
+    "{worktree_path}"
+  ],
+  "max_budget_usd": 1.5,
+  "max_turns": 60,
+  "output_artifact": ".evolve/runs/cycle-{cycle}/test-report.md",
+  "challenge_token_required": true,
+  "isolation": "worktree",
+  "settings_scope": "project",
+  "extra_flags_by_cli": {
+    "claude-tmux": [
+      "--strict-mcp-config",
+      "--exclude-dynamic-system-prompt-sections",
+      "--disable-slash-commands"
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "write_subpaths": [
+      "{worktree_path}/tests",
+      "{worktree_path}/.evolve/evals",
+      "{worktree_path}/scripts/*-test.sh",
+      "{worktree_path}/scripts/test-*.sh",
+      "{worktree_path}/go/acs/cycle*",
+      "{worktree_path}/acs/cycle-*",
+      ".evolve/runs/cycle-*"
+    ],
+    "read_only_repo": false,
+    "deny_subpaths": [
+      ".git",
+      ".claude-plugin",
+      ".evolve/state.json",
+      ".evolve/ledger.jsonl",
+      ".evolve/profiles",
+      "agents",
+      "skills"
+    ],
+    "allow_network": true
+  },
+  "parallel_eligible": false,
+  "context_anchors": [
+    "scout-report.md:acceptance_criteria"
+  ],
+  "model_tier_envelope": {
+    "min": "balanced",
+    "default": "balanced",
+    "max": "deep"
+  },
+  "allowed_clis": [
+    "claude"
+  ],
+  "_note": "Restricted to claude — RED-phase test writing is safety-critical.",
+  "research_quota": {
+    "web_search": 3,
+    "web_fetch": 5,
+    "kb_search": 20
+  },
+  "stream_output": true,
+  "generated_from": "hand-authored",
+  "cli_fallback": [
+    "claude-p"
+  ]
+}

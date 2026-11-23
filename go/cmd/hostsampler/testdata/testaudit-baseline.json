@@ -1,0 +1,9 @@
+{
+  "rows": [
+    {
+      "package": "cmd/hostsampler",
+      "test": "TestMain_TwoSecondRunWritesOneRecordPerSecondAndStopsOnSIGTERM",
+      "rule": "sleep-sync"
+    }
+  ]
+}

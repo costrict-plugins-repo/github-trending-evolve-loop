@@ -1,0 +1,42 @@
+{
+  "acceptance": [
+    "Red test first: `TestAgentSandboxContract_N8b_ACellGhCallSaysNotLoggedInAndReadsNoHostConfig`, `..._N8c_ACellGitHasNoCredentialHelper`.",
+    "100% statement coverage on each changed function; zero code comments.",
+    "The spec and package note of the changed package state the change in STE."
+  ],
+  "campaign": "architecture-decisions-2026-11",
+  "created_at": "2026-11-03T00:33:08Z",
+  "files": [
+    "go/internal/bridge"
+  ],
+  "fix": "The cell tool view: `GH_CONFIG_DIR`, `GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG_GLOBAL`, `GIT_TERMINAL_PROMPT`, `GIT_SSH_COMMAND` as data in `cfg.Realization.Env`. The bridge writes `<ws>/.cell/gitconfig`",
+  "id": "arch-decisions-ad1-3-the-cell-tool-view-gh-config-dir-git",
+  "intake_override": {
+    "reason": "console: bridge is protected",
+    "console_route": true
+  },
+  "kind": "feature",
+  "origin": "console",
+  "priority_class": "security",
+  "released_continuations": [
+    {
+      "worktree": "~/ai/claude/evolve-loop/runtime/.evolve/worktrees/cycle-cd3ae73e-2429",
+      "branch": "cycle-cd3ae73e-2429",
+      "snapshot_sha": "b853f2a4e8ffa6dee4b94b186775acfc6c484663",
+      "base_sha": "fd03a5b3d9f8606984db139911e9c3539b8d9896",
+      "findings_path": "~/ai/claude/evolve-loop/runtime/.evolve/runs/cycle-2429/audit-fail-reason.json",
+      "cycle": 2429,
+      "released_at": "2026-11-19T20:51:59Z",
+      "reason": "older than 100 cycles",
+      "released_by": "evolve gc (continuation max age)"
+    }
+  ],
+  "route": "console-manual",
+  "routed_at": "2026-11-16T14:40:03Z",
+  "routed_cycle": 2434,
+  "routed_reason": "lane triage (cycle 2434) dropped: stale: blocked by unfixed pipeline ship defect at HEAD cecc133ba (go/internal/changedpkgs/changedpkgs.go:13-26 maps _test.go-only changes to internal/bridge and go/internal/phases/ship/repocontract_importers.go:15 keeps importerBackstopTimeout=20m, deterministically killing cycles 2401 and 2429 at 80 targets in 20m0s); hold until backstop fix lands on main and re-ship cycle-cd3ae73e-2429 salvage 2931418d95 per inst-L2429a",
+  "source": "operator decisions 2026-11-03; plan docs/plans/architecture-decisions-2026-11.md component AD1-3",
+  "summary": "Component AD1-3 of the 2026-11-03 architecture decisions plan. The cell tool view: `GH_CONFIG_DIR`, `GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG_GLOBAL`, `GIT_TERMINAL_PROMPT`, `GIT_SSH_COMMAND` as data in `cfg.Realization.Env`. The bridge writes `<ws>/.cell/gitconfig` Stage: follows `isolation.i2.stage`. Size: M. Route: console: bridge is protected. Plan: docs/plans/architecture-decisions-2026-11.md; research: docs/research/architecture-decisions-2026-11.md.",
+  "title": "AD1-3: The cell tool view: GH_CONFIG_DIR, GIT_CONFIG_NOSYSTEM, GIT_CONFIG_GLOBAL, GIT_TERMINAL_PROMPT, GIT_SSH_COMMAND as data in cfg.Realization.Env",
+  "weight": 0.8
+}

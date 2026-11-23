@@ -1,0 +1,641 @@
+package cyclehealth
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func writeArtifacts(t *testing.T, ws string) {
+	t.Helper()
+	body := strings.Repeat("x", 200)
+	for _, name := range []string{"scout-report.md", "build-report.md", "audit-report.md"} {
+		if err := os.WriteFile(filepath.Join(ws, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func writeLedger(t *testing.T, ws string, cycle int) {
+	t.Helper()
+	entries := []ledgerEntry{
+		{Cycle: cycle, Role: "scout", Phase: "scout", Timestamp: 1000, Token: "tok-s", EntryHash: "h1"},
+		{Cycle: cycle, Role: "builder", Phase: "build", Timestamp: 1100, Token: "tok-b", PrevHash: "h1", EntryHash: "h2"},
+		{Cycle: cycle, Role: "auditor", Phase: "audit", Timestamp: 1200, Token: "tok-a", PrevHash: "h2", EntryHash: "h3"},
+	}
+	var lines []string
+	for _, e := range entries {
+		b, _ := json.Marshal(e)
+		lines = append(lines, string(b))
+	}
+	if err := os.WriteFile(filepath.Join(ws, "ledger.jsonl"), []byte(strings.Join(lines, "\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readReport(t *testing.T, ws string) Report {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(ws, "cycle-health.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var r Report
+	if err := json.Unmarshal(b, &r); err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+func freshWorkspace(t *testing.T, cycle int) string {
+	t.Helper()
+	ws := t.TempDir()
+	writeArtifacts(t, ws)
+	writeLedger(t, ws, cycle)
+	return ws
+}
+
+func TestCheck_HealthyCycle_NoAnomalies(t *testing.T) {
+	ws := freshWorkspace(t, 1)
+	r, err := Check(Options{Cycle: 1, Workspace: ws, NowFn: func() time.Time { return time.Unix(2000, 0) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.OverallFatal {
+		t.Errorf("OverallFatal=true; anomalies=%+v", r.Anomalies)
+	}
+	if len(r.Anomalies) != 0 {
+		t.Errorf("anomalies=%+v, want none", r.Anomalies)
+	}
+	disk := readReport(t, ws)
+	if disk.Cycle != 1 {
+		t.Errorf("report.Cycle=%d, want 1", disk.Cycle)
+	}
+}
+
+func TestCheck_MissingArtifact_Fatal(t *testing.T) {
+	ws := freshWorkspace(t, 1)
+	if err := os.Remove(filepath.Join(ws, "scout-report.md")); err != nil {
+		t.Fatal(err)
+	}
+	r, _ := Check(Options{Cycle: 1, Workspace: ws})
+	if !r.OverallFatal {
+		t.Errorf("expected OverallFatal=true on missing artifact; got %+v", r.Anomalies)
+	}
+	found := false
+	for _, a := range r.Anomalies {
+		if a.Signal == "workspace_artifacts" && strings.Contains(a.Message, "scout-report.md") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected workspace_artifacts anomaly for scout-report.md; got %+v", r.Anomalies)
+	}
+}
+
+func TestCheck_ShortArtifact_Fatal(t *testing.T) {
+	ws := freshWorkspace(t, 1)
+	if err := os.WriteFile(filepath.Join(ws, "build-report.md"), []byte("short"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r, _ := Check(Options{Cycle: 1, Workspace: ws})
+	found := false
+	for _, a := range r.Anomalies {
+		if a.Signal == "artifact_substance" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected artifact_substance anomaly; got %+v", r.Anomalies)
+	}
+}
+
+func TestCheck_MissingLedgerRole_Fatal(t *testing.T) {
+	ws := freshWorkspace(t, 1)
+	entries := []ledgerEntry{
+		{Cycle: 1, Role: "scout", Phase: "scout", Timestamp: 1000, EntryHash: "h1"},
+		{Cycle: 1, Role: "builder", Phase: "build", Timestamp: 1100, PrevHash: "h1", EntryHash: "h2"},
+	}
+	var lines []string
+	for _, e := range entries {
+		b, _ := json.Marshal(e)
+		lines = append(lines, string(b))
+	}
+	os.WriteFile(filepath.Join(ws, "ledger.jsonl"), []byte(strings.Join(lines, "\n")), 0o644)
+
+	r, _ := Check(Options{Cycle: 1, Workspace: ws})
+	found := false
+	for _, a := range r.Anomalies {
+		if a.Signal == "ledger_completeness" && strings.Contains(a.Message, "auditor") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected ledger_completeness for auditor; got %+v", r.Anomalies)
+	}
+}
+
+func TestCheck_FutureTimestamp_Fatal(t *testing.T) {
+	ws := freshWorkspace(t, 1)
+	r, _ := Check(Options{
+		Cycle: 1, Workspace: ws,
+		NowFn: func() time.Time { return time.Unix(500, 0) },
+	})
+	found := false
+	for _, a := range r.Anomalies {
+		if a.Signal == "ledger_timestamps" && strings.Contains(a.Message, "future") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected ledger_timestamps anomaly; got %+v", r.Anomalies)
+	}
+}
+
+func TestCheck_HashChainBroken_Fatal(t *testing.T) {
+	ws := freshWorkspace(t, 1)
+	entries := []ledgerEntry{
+		{Cycle: 1, Role: "scout", Phase: "scout", Timestamp: 1000, EntryHash: "h1"},
+		{Cycle: 1, Role: "builder", Phase: "build", Timestamp: 1100, PrevHash: "BROKEN", EntryHash: "h2"},
+		{Cycle: 1, Role: "auditor", Phase: "audit", Timestamp: 1200, PrevHash: "h2", EntryHash: "h3"},
+	}
+	var lines []string
+	for _, e := range entries {
+		b, _ := json.Marshal(e)
+		lines = append(lines, string(b))
+	}
+	os.WriteFile(filepath.Join(ws, "ledger.jsonl"), []byte(strings.Join(lines, "\n")), 0o644)
+
+	r, _ := Check(Options{Cycle: 1, Workspace: ws, NowFn: func() time.Time { return time.Unix(2000, 0) }})
+	found := false
+	for _, a := range r.Anomalies {
+		if a.Signal == "hash_chain" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected hash_chain anomaly; got %+v", r.Anomalies)
+	}
+}
+
+func TestCheck_ChecksumMismatch_Fatal(t *testing.T) {
+	ws := freshWorkspace(t, 1)
+	body := strings.Repeat("x", 200)
+	h := sha256.Sum256([]byte(body))
+	sha := hex.EncodeToString(h[:])
+	entries := []ledgerEntry{
+		{Cycle: 1, Role: "scout", Phase: "scout", Timestamp: 1000, EntryHash: "h1", SHA: sha},
+		{Cycle: 1, Role: "builder", Phase: "build", Timestamp: 1100, PrevHash: "h1", EntryHash: "h2", SHA: "wronghash"},
+		{Cycle: 1, Role: "auditor", Phase: "audit", Timestamp: 1200, PrevHash: "h2", EntryHash: "h3"},
+	}
+	var lines []string
+	for _, e := range entries {
+		b, _ := json.Marshal(e)
+		lines = append(lines, string(b))
+	}
+	os.WriteFile(filepath.Join(ws, "ledger.jsonl"), []byte(strings.Join(lines, "\n")), 0o644)
+
+	r, _ := Check(Options{Cycle: 1, Workspace: ws, NowFn: func() time.Time { return time.Unix(2000, 0) }})
+	found := false
+	for _, a := range r.Anomalies {
+		if a.Signal == "artifact_checksums" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected artifact_checksums anomaly; got %+v", r.Anomalies)
+	}
+}
+
+func TestCheck_ChallengeTokenReused_Fatal(t *testing.T) {
+	ws := freshWorkspace(t, 1)
+	entries := []ledgerEntry{
+		{Cycle: 1, Role: "scout", Phase: "scout", Timestamp: 1000, Token: "dup-token", EntryHash: "h1"},
+		{Cycle: 1, Role: "builder", Phase: "build", Timestamp: 1100, Token: "dup-token", PrevHash: "h1", EntryHash: "h2"},
+		{Cycle: 1, Role: "auditor", Phase: "audit", Timestamp: 1200, PrevHash: "h2", EntryHash: "h3"},
+	}
+	var lines []string
+	for _, e := range entries {
+		b, _ := json.Marshal(e)
+		lines = append(lines, string(b))
+	}
+	os.WriteFile(filepath.Join(ws, "ledger.jsonl"), []byte(strings.Join(lines, "\n")), 0o644)
+
+	r, _ := Check(Options{Cycle: 1, Workspace: ws, NowFn: func() time.Time { return time.Unix(2000, 0) }})
+	found := false
+	for _, a := range r.Anomalies {
+		if a.Signal == "challenge_tokens" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected challenge_tokens anomaly; got %+v", r.Anomalies)
+	}
+}
+
+func TestCheck_VelocityGap_Warn(t *testing.T) {
+	ws := freshWorkspace(t, 1)
+	entries := []ledgerEntry{
+		{Cycle: 1, Role: "scout", Phase: "scout", Timestamp: 1000, EntryHash: "h1"},
+		{Cycle: 1, Role: "builder", Phase: "build", Timestamp: 5000, PrevHash: "h1", EntryHash: "h2"},
+		{Cycle: 1, Role: "auditor", Phase: "audit", Timestamp: 5500, PrevHash: "h2", EntryHash: "h3"},
+	}
+	var lines []string
+	for _, e := range entries {
+		b, _ := json.Marshal(e)
+		lines = append(lines, string(b))
+	}
+	os.WriteFile(filepath.Join(ws, "ledger.jsonl"), []byte(strings.Join(lines, "\n")), 0o644)
+
+	r, _ := Check(Options{Cycle: 1, Workspace: ws, NowFn: func() time.Time { return time.Unix(10000, 0) }})
+	found := false
+	for _, a := range r.Anomalies {
+		if a.Signal == "velocity" && a.Severity == SeverityWarn {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected velocity warn anomaly; got %+v", r.Anomalies)
+	}
+}
+
+func TestCheck_CanaryFromOtherCycle_Warn(t *testing.T) {
+	ws := freshWorkspace(t, 1)
+	if err := os.WriteFile(filepath.Join(ws, "canary-cycle-99"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r, _ := Check(Options{Cycle: 1, Workspace: ws, NowFn: func() time.Time { return time.Unix(2000, 0) }})
+	found := false
+	for _, a := range r.Anomalies {
+		if a.Signal == "canary_files" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected canary_files anomaly; got %+v", r.Anomalies)
+	}
+}
+
+func TestCheck_DuplicateLedgerEntry_Fatal(t *testing.T) {
+	ws := freshWorkspace(t, 1)
+	entries := []ledgerEntry{
+		{Cycle: 1, Role: "scout", Phase: "scout", Timestamp: 1000, EntryHash: "dup-hash"},
+		{Cycle: 1, Role: "builder", Phase: "build", Timestamp: 1100, PrevHash: "dup-hash", EntryHash: "dup-hash"},
+		{Cycle: 1, Role: "auditor", Phase: "audit", Timestamp: 1200, PrevHash: "dup-hash", EntryHash: "h3"},
+	}
+	var lines []string
+	for _, e := range entries {
+		b, _ := json.Marshal(e)
+		lines = append(lines, string(b))
+	}
+	os.WriteFile(filepath.Join(ws, "ledger.jsonl"), []byte(strings.Join(lines, "\n")), 0o644)
+
+	r, _ := Check(Options{Cycle: 1, Workspace: ws, NowFn: func() time.Time { return time.Unix(2000, 0) }})
+	found := false
+	for _, a := range r.Anomalies {
+		if a.Signal == "duplicate_ledger" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected duplicate_ledger anomaly; got %+v", r.Anomalies)
+	}
+}
+
+func TestCheck_MissingCycle_Error(t *testing.T) {
+	_, err := Check(Options{Workspace: t.TempDir()})
+	if err == nil {
+		t.Error("Check with Cycle=0: want error")
+	}
+}
+
+func TestCheck_MissingWorkspace_Error(t *testing.T) {
+	_, err := Check(Options{Cycle: 1})
+	if err == nil {
+		t.Error("Check with empty Workspace: want error")
+	}
+}
+
+func TestCheck_OverallFatal_TrueOnAnyFatal(t *testing.T) {
+	ws := freshWorkspace(t, 1)
+	os.Remove(filepath.Join(ws, "audit-report.md"))
+	r, _ := Check(Options{Cycle: 1, Workspace: ws, NowFn: func() time.Time { return time.Unix(2000, 0) }})
+	if !r.OverallFatal {
+		t.Errorf("OverallFatal=false despite missing required artifact")
+	}
+}
+
+func TestSignalNames_ReturnsThirteen(t *testing.T) {
+	names := signalNames()
+	if len(names) != 13 {
+		t.Errorf("signalNames len=%d, want 13; got %v", len(names), names)
+	}
+	for _, want := range []string{"self_heal_events", "dossier_commitment"} {
+		found := false
+		for _, n := range names {
+			if n == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("signalNames missing %s; got %v", want, names)
+		}
+	}
+}
+
+func writeSelfHealLedger(t *testing.T, ws string, cycle int, extra ...ledgerEntry) {
+	t.Helper()
+	entries := []ledgerEntry{
+		{Cycle: cycle, Role: "scout", Phase: "scout", Timestamp: 1000, Token: "tok-s", EntryHash: "h1"},
+		{Cycle: cycle, Role: "builder", Phase: "build", Timestamp: 1100, Token: "tok-b", PrevHash: "h1", EntryHash: "h2"},
+		{Cycle: cycle, Role: "auditor", Phase: "audit", Timestamp: 1200, Token: "tok-a", PrevHash: "h2", EntryHash: "h3"},
+	}
+	entries = append(entries, extra...)
+	var lines []string
+	for _, e := range entries {
+		b, _ := json.Marshal(e)
+		lines = append(lines, string(b))
+	}
+	if err := os.WriteFile(filepath.Join(ws, "ledger.jsonl"), []byte(strings.Join(lines, "\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func selfHealAnomalies(r Report) []Anomaly {
+	var out []Anomaly
+	for _, a := range r.Anomalies {
+		if a.Signal == "self_heal_events" {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+func TestCheck_SelfHealEvents_PhaseRetry_Warn(t *testing.T) {
+	ws := freshWorkspace(t, 1)
+	writeSelfHealLedger(t, ws, 1, ledgerEntry{
+		Cycle: 1, Role: "builder", Phase: "build", Timestamp: 1300, Kind: "phase_retry",
+	})
+	r, err := Check(Options{Cycle: 1, Workspace: ws, NowFn: func() time.Time { return time.Unix(2000, 0) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := selfHealAnomalies(r)
+	if len(got) != 1 {
+		t.Fatalf("self_heal_events count=%d, want 1; anomalies=%+v", len(got), r.Anomalies)
+	}
+	if got[0].Severity != SeverityWarn {
+		t.Errorf("self_heal_events severity=%s, want warn (never fatal)", got[0].Severity)
+	}
+	if r.OverallFatal {
+		t.Errorf("self_heal_events must not be fatal; OverallFatal=true, anomalies=%+v", r.Anomalies)
+	}
+	if !strings.Contains(got[0].Message, "build") {
+		t.Errorf("expected retried phase 'build' in message; got %q", got[0].Message)
+	}
+}
+
+func TestCheck_SelfHealEvents_Backfill_Warn(t *testing.T) {
+	ws := freshWorkspace(t, 1)
+	writeSelfHealLedger(t, ws, 1, ledgerEntry{
+		Cycle: 1, Role: "auditor", Phase: "audit", Timestamp: 1300, Kind: "backfill",
+	})
+	r, err := Check(Options{Cycle: 1, Workspace: ws, NowFn: func() time.Time { return time.Unix(2000, 0) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := selfHealAnomalies(r)
+	if len(got) != 1 {
+		t.Fatalf("self_heal_events count=%d, want 1; anomalies=%+v", len(got), r.Anomalies)
+	}
+	if got[0].Severity != SeverityWarn {
+		t.Errorf("self_heal_events severity=%s, want warn", got[0].Severity)
+	}
+	if !strings.Contains(got[0].Message, "audit") {
+		t.Errorf("expected backfilled phase 'audit' in message; got %q", got[0].Message)
+	}
+}
+
+func TestCheck_SelfHealEvents_ContractCorrection_Warn(t *testing.T) {
+	ws := freshWorkspace(t, 1)
+	writeSelfHealLedger(t, ws, 1, ledgerEntry{
+		Cycle: 1, Role: "builder", Phase: "build", Timestamp: 1300, Kind: "contract_correction",
+	})
+	r, err := Check(Options{Cycle: 1, Workspace: ws, NowFn: func() time.Time { return time.Unix(2000, 0) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := selfHealAnomalies(r)
+	if len(got) != 1 {
+		t.Fatalf("self_heal_events count=%d, want 1; anomalies=%+v", len(got), r.Anomalies)
+	}
+	if got[0].Severity != SeverityWarn {
+		t.Errorf("self_heal_events severity=%s, want warn (never fatal)", got[0].Severity)
+	}
+	if r.OverallFatal {
+		t.Errorf("self_heal_events must not be fatal; OverallFatal=true, anomalies=%+v", r.Anomalies)
+	}
+	if !strings.Contains(got[0].Message, "build") {
+		t.Errorf("expected corrected phase 'build' in message; got %q", got[0].Message)
+	}
+}
+
+func TestCheck_SelfHealEvents_NoEvents_NoAnomaly(t *testing.T) {
+	ws := freshWorkspace(t, 1)
+	r, err := Check(Options{Cycle: 1, Workspace: ws, NowFn: func() time.Time { return time.Unix(2000, 0) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := selfHealAnomalies(r); len(got) != 0 {
+		t.Errorf("clean cycle emitted %d self_heal_events anomalies, want 0; got %+v", len(got), got)
+	}
+}
+
+func TestCheck_SelfHealEvents_OnePerEvent(t *testing.T) {
+	ws := freshWorkspace(t, 1)
+	writeSelfHealLedger(t, ws, 1,
+		ledgerEntry{Cycle: 1, Role: "builder", Phase: "build", Timestamp: 1300, Kind: "phase_retry"},
+		ledgerEntry{Cycle: 1, Role: "auditor", Phase: "audit", Timestamp: 1400, Kind: "backfill"},
+		ledgerEntry{Cycle: 1, Role: "builder", Phase: "build", Timestamp: 1500, Kind: "phase_retry"},
+	)
+	r, err := Check(Options{Cycle: 1, Workspace: ws, NowFn: func() time.Time { return time.Unix(2000, 0) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := selfHealAnomalies(r); len(got) != 3 {
+		t.Errorf("self_heal_events count=%d, want 3 (one per event); got %+v", len(got), got)
+	}
+}
+
+func TestCheck_SelfHealEvents_OtherCycle_Ignored(t *testing.T) {
+	ws := freshWorkspace(t, 1)
+	writeSelfHealLedger(t, ws, 1,
+		ledgerEntry{Cycle: 99, Role: "builder", Phase: "build", Timestamp: 1300, Kind: "phase_retry"},
+	)
+	r, err := Check(Options{Cycle: 1, Workspace: ws, NowFn: func() time.Time { return time.Unix(2000, 0) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := selfHealAnomalies(r); len(got) != 0 {
+		t.Errorf("cycle-99 self-heal entry leaked into cycle-1 report: %d anomalies; got %+v", len(got), got)
+	}
+}
+
+func TestCheck_PhaseLatency_SlowPhase_Warn(t *testing.T) {
+	ws := freshWorkspace(t, 1)
+
+	entries := []phaseTimingEntry{
+		{Phase: "build", DurationMS: 950000, Verdict: "PASS"},
+	}
+	data, _ := json.Marshal(entries)
+	if err := os.WriteFile(filepath.Join(ws, "phase-timing.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := Check(Options{Cycle: 1, Workspace: ws})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, a := range r.Anomalies {
+		if a.Signal == "phase_latency" {
+			found = true
+			if a.Severity != SeverityWarn {
+				t.Errorf("expected SeverityWarn for slow phase, got %s", a.Severity)
+			}
+			if !strings.Contains(a.Message, "build phase latency 950000ms") {
+				t.Errorf("unexpected anomaly message: %s", a.Message)
+			}
+		}
+	}
+	if !found {
+		t.Error("expected phase_latency warning anomaly, not found")
+	}
+
+	r, err = Check(Options{Cycle: 1, Workspace: ws, PhaseLatencyCeilingS: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range r.Anomalies {
+		if a.Signal == "phase_latency" {
+			t.Errorf("unexpected slow phase anomaly with high ceiling override: %v", a)
+		}
+	}
+}
+
+func TestCheck_PhaseLatency_MissingFile_NoAnomaly(t *testing.T) {
+	ws := freshWorkspace(t, 1)
+	r, err := Check(Options{Cycle: 1, Workspace: ws})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range r.Anomalies {
+		if a.Signal == "phase_latency" {
+			t.Errorf("unexpected phase_latency anomaly when file is missing: %v", a)
+		}
+	}
+}
+
+func TestSha256File_RoundTrip(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "x")
+	os.WriteFile(p, []byte("hello"), 0o644)
+	got, err := sha256File(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf("%x", sha256.Sum256([]byte("hello")))
+	if got != want {
+		t.Errorf("hash=%q, want %q", got, want)
+	}
+}
+
+func TestSha256File_MissingFile_Error(t *testing.T) {
+	if _, err := sha256File("/no/such/file"); err == nil {
+		t.Error("want error for missing file")
+	}
+}
+
+func TestShortHash(t *testing.T) {
+	if shortHash("abc") != "abc" {
+		t.Errorf("short input should pass through")
+	}
+	if shortHash("0123456789abcdef") != "01234567" {
+		t.Errorf("long input should truncate to 8")
+	}
+}
+
+func TestLoadLedger_FallsBackToParentDir(t *testing.T) {
+	parent := t.TempDir()
+	ws := filepath.Join(parent, "workspace")
+	if err := os.Mkdir(ws, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeArtifacts(t, ws)
+	entries := []ledgerEntry{
+		{Cycle: 1, Role: "scout", Phase: "scout", Timestamp: 1000, EntryHash: "h1"},
+		{Cycle: 1, Role: "builder", Phase: "build", Timestamp: 1100, PrevHash: "h1", EntryHash: "h2"},
+		{Cycle: 1, Role: "auditor", Phase: "audit", Timestamp: 1200, PrevHash: "h2", EntryHash: "h3"},
+	}
+	var lines []string
+	for _, e := range entries {
+		b, _ := json.Marshal(e)
+		lines = append(lines, string(b))
+	}
+	os.WriteFile(filepath.Join(parent, "ledger.jsonl"), []byte(strings.Join(lines, "\n")), 0o644)
+
+	r, _ := Check(Options{Cycle: 1, Workspace: ws, NowFn: func() time.Time { return time.Unix(2000, 0) }})
+	for _, a := range r.Anomalies {
+		if a.Signal == "ledger_completeness" {
+			t.Errorf("ledger should be found in parent dir; got %v", a)
+		}
+	}
+}
+
+func TestLoadLedger_Missing_NoFile(t *testing.T) {
+	ws := t.TempDir()
+	writeArtifacts(t, ws)
+	r, _ := Check(Options{Cycle: 1, Workspace: ws, NowFn: func() time.Time { return time.Unix(2000, 0) }})
+	found := false
+	for _, a := range r.Anomalies {
+		if a.Signal == "ledger_completeness" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected ledger_completeness fatal; got %+v", r.Anomalies)
+	}
+}
+
+func TestCheck_RunsThirteenSignals(t *testing.T) {
+	ws := freshWorkspace(t, 1)
+	r, err := Check(Options{Cycle: 1, Workspace: ws, NowFn: func() time.Time { return time.Unix(2000, 0) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.SignalsRun) != 13 {
+		t.Errorf("SignalsRun has %d entries, want 13: %v", len(r.SignalsRun), r.SignalsRun)
+	}
+	for _, want := range []string{"phase_latency", "self_heal_events", "dossier_commitment"} {
+		found := false
+		for _, s := range r.SignalsRun {
+			if s == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("signal %q missing from SignalsRun=%v", want, r.SignalsRun)
+		}
+	}
+	for _, s := range r.SignalsRun {
+		if s == "cost_envelope" {
+			t.Errorf("cost_envelope signal should have been removed; got %v", r.SignalsRun)
+		}
+	}
+}
